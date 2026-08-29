@@ -19,12 +19,15 @@ import base64
 import glob
 import json
 import os
+import queue
 import re
 import secrets
 import shutil
 import signal
+import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -100,10 +103,10 @@ RESULT_CAP = 6000    # cap per tool_result body
 # far exceed that — which would make readline() raise and (previously) kill the
 # session even though the app-server was still alive. Give it generous headroom.
 APPSERVER_STREAM_LIMIT = 64 * 1024 * 1024   # 64 MB per app-server line
+# upload ceiling for /api/import; large rollout files can exceed Tornado's default
+IMPORT_MAX = int(_env("IMPORT_MAX_MB", "1024") or "1024") * 1024 * 1024
 POLL_MS = 800        # transcript tail interval
 
-# ── reasoning effort (codex --effort / ReasoningEffort), per-turn ──
-CODEX_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 # ── approval presets exposed in the single "mode" picker → (approvalPolicy, sandbox) ──
 # approvalPolicy ∈ untrusted|on-failure|on-request|never ; sandbox ∈ read-only|workspace-write|danger-full-access
 MODE_PRESETS = {
@@ -174,6 +177,169 @@ def _set_usage(rl):
         _CODEX_USAGE = out
     return out
 
+
+# Live model catalog from the same Codex app-server protocol used for sessions.
+# A short last-known-good cache avoids spawning a probe for every browser while
+# still allowing newly released models to appear without a console deployment.
+_models_cache = {"success_t": 0.0, "attempt_t": 0.0, "v": None}
+_models_lock = threading.Lock()
+MODEL_CACHE_SEC = 300
+MODEL_RETRY_SEC = 30
+
+
+def _rpc_probe_response(messages, request_id, deadline):
+    """Wait for one response while ignoring interleaved server notifications."""
+    while time.monotonic() < deadline:
+        try:
+            line = messages.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty:
+            break
+        if line is None:
+            break
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        if msg.get("id") != request_id:
+            continue
+        if msg.get("error"):
+            raise RuntimeError("codex app-server request failed: %s" % msg["error"])
+        return msg.get("result") or {}
+    raise TimeoutError("timed out reading Codex model catalog")
+
+
+def _probe_codex_models(timeout=12):
+    """Ask the installed Codex CLI for its visible model catalog.
+
+    This intentionally goes through app-server `model/list` rather than a
+    separately maintained OpenAI model list: the result respects the installed
+    CLI, account access, configuration, and staged model rollouts.
+    """
+    if not CODEX_BIN or not os.path.exists(CODEX_BIN):
+        return None
+    proc = subprocess.Popen(
+        [CODEX_BIN, "app-server"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        cwd=HOME, text=True, bufsize=1)
+    messages = queue.Queue()
+
+    def read_stdout():
+        try:
+            for line in proc.stdout:
+                messages.put(line)
+        finally:
+            messages.put(None)
+
+    reader = threading.Thread(
+        target=read_stdout, name="codex-model-catalog", daemon=True)
+    reader.start()
+    deadline = time.monotonic() + timeout
+    request_id = 1
+
+    def send(method, params=None, notify=False):
+        nonlocal request_id
+        msg = {"jsonrpc": "2.0", "method": method, "params": params or {}}
+        rid = None
+        if not notify:
+            rid = request_id
+            request_id += 1
+            msg["id"] = rid
+        proc.stdin.write(json.dumps(msg, separators=(",", ":")) + "\n")
+        proc.stdin.flush()
+        return rid
+
+    try:
+        rid = send("initialize", {"clientInfo": {
+            "name": "codex-console", "version": "0.1.0", "title": "Codex Console"}})
+        _rpc_probe_response(messages, rid, deadline)
+        send("initialized", notify=True)
+
+        raw_models, seen = [], set()
+        cursor = None
+        for _ in range(20):  # defensive cap against a broken repeating cursor
+            params = {"includeHidden": False, "limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            rid = send("model/list", params)
+            page = _rpc_probe_response(messages, rid, deadline)
+            for model in page.get("data") or []:
+                if not isinstance(model, dict) or model.get("hidden"):
+                    continue
+                slug = str(model.get("model") or model.get("id") or "").strip()
+                if not slug or slug in seen:
+                    continue
+                seen.add(slug)
+                efforts = []
+                for effort in model.get("supportedReasoningEfforts") or []:
+                    if isinstance(effort, dict) and effort.get("reasoningEffort"):
+                        efforts.append(effort["reasoningEffort"])
+                raw_models.append({
+                    "id": slug,
+                    "name": model.get("displayName") or slug,
+                    "description": model.get("description") or "",
+                    "isDefault": bool(model.get("isDefault")),
+                    "reasoningEfforts": efforts,
+                    "defaultReasoningEffort": model.get("defaultReasoningEffort") or "",
+                })
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+        return raw_models or None
+    finally:
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=1)
+        reader.join(timeout=1)
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+
+
+def fetch_models(force=False):
+    """Return the current visible Codex catalog, or the last successful one."""
+    now = time.monotonic()
+    if (not force and _models_cache["v"] is not None
+            and now - _models_cache["success_t"] < MODEL_CACHE_SEC):
+        return _models_cache["v"]
+    if (not force and _models_cache["attempt_t"]
+            and now - _models_cache["attempt_t"] < MODEL_RETRY_SEC):
+        return _models_cache["v"]
+    # Do not tie up Tornado's shared executor behind a slow catalog probe. One
+    # caller refreshes; concurrent callers immediately receive the LKG (or []).
+    if not _models_lock.acquire(blocking=False):
+        return _models_cache["v"]
+    try:
+        now = time.monotonic()
+        if (not force and _models_cache["v"] is not None
+                and now - _models_cache["success_t"] < MODEL_CACHE_SEC):
+            return _models_cache["v"]
+        if (not force and _models_cache["attempt_t"]
+                and now - _models_cache["attempt_t"] < MODEL_RETRY_SEC):
+            return _models_cache["v"]
+        _models_cache["attempt_t"] = now
+        try:
+            models = _probe_codex_models()
+            if models:
+                _models_cache["success_t"] = time.monotonic()
+                _models_cache["v"] = models
+        except Exception:
+            pass
+        _models_cache["attempt_t"] = time.monotonic()
+        return _models_cache["v"]
+    finally:
+        _models_lock.release()
+
 # codex runs everything through the shell. Unwrap its `bash -lc '<inner>'` wrapper
 # for display, and label a plain single-file read as a Read so the cards aren't all
 # an indistinguishable "shell".
@@ -183,6 +349,7 @@ _SED_READ_RE = re.compile(r"""^\s*sed\s+-n\s+(['"])?\d+(?:,\d+)?p\1\s+\S""")
 _READ_SLICE_PIPE_RE = re.compile(
     r"""^\s*(?:cat|nl)\b[^|;&<>`$]*\|\s*sed\s+-n\s+(['"])?\d+(?:,\d+)?p\1\s*$""")
 _CONFIG_MODEL_RE = re.compile(r"^\s*model\s*=\s*(['\"])(.*?)\1\s*(?:#.*)?$")
+_CONFIG_CONTEXT_RE = re.compile(r"^\s*model_context_window\s*=\s*([0-9_]+)\s*(?:#.*)?$")
 def _codex_is_read_cmd(command):
     c = _txt(command).strip()
     if not c:
@@ -229,6 +396,28 @@ def _configured_default_model():
     except Exception:
         pass
     return ""
+
+
+def _configured_context_window():
+    """Best-effort context-window override from Codex config.toml.
+
+    Codex CLI `/status` reports this configured value. The app-server token usage
+    event may still expose the model/catalog window, so the Console keeps both
+    values and displays the larger configured window when present.
+    """
+    codex_home = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
+    try:
+        with open(os.path.join(codex_home, "config.toml"), "r", encoding="utf-8") as f:
+            for line in f:
+                if line.lstrip().startswith("["):
+                    break
+                m = _CONFIG_CONTEXT_RE.match(line)
+                if m:
+                    return int(m.group(1).replace("_", ""))
+    except Exception:
+        pass
+    return None
+
 
 def _display_model(selected="", resolved=""):
     resolved = _txt(resolved).strip()
@@ -389,12 +578,14 @@ def parse_claude(rec, idx):
 # the ones codex marks with an `event_msg`/`user_message`; these injected ones are
 # response_items only. Match by their stable opening markers.
 _CODEX_INJECT_MARKERS = (
-    "# AGENTS.md instructions for", "<permissions", "<environment_context",
+    "<permissions", "<environment_context",
     "<user_instructions", "<INSTRUCTIONS", "<system", "OMX native SessionStart",
 )
+_CODEX_AGENTS_RE = re.compile(r"^#\s*AGENTS\.md instructions\b", re.I)
 def _codex_injected(text):
     t = (text or "").lstrip()
-    return any(t.startswith(m) for m in _CODEX_INJECT_MARKERS)
+    return bool(_CODEX_AGENTS_RE.match(t)) or any(
+        t.startswith(m) for m in _CODEX_INJECT_MARKERS)
 
 
 def parse_codex(rec, idx):
@@ -527,7 +718,7 @@ def _peek_claude(path):
 
 
 def _peek_codex(path):
-    cwd, branch, title = "", "", ""
+    cwd, branch, title, is_subagent = "", "", "", False
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for i, line in enumerate(f):
@@ -543,6 +734,9 @@ def _peek_codex(path):
                     cwd = p.get("cwd", "") or cwd
                     g = p.get("git") or {}
                     branch = g.get("branch", "") or branch
+                    source = p.get("source")
+                    if isinstance(source, dict) and source.get("subagent"):
+                        is_subagent = True
                 # the REAL first user prompt: codex marks actual user input with an
                 # `event_msg`/`user_message` — the AGENTS.md / permissions / env-context
                 # blocks injected at thread start are response_items only, so this skips
@@ -561,7 +755,7 @@ def _peek_codex(path):
                     break
     except Exception:
         pass
-    return cwd, branch, title
+    return cwd, branch, title, is_subagent
 
 
 def list_sessions(limit=50):
@@ -572,17 +766,21 @@ def list_sessions(limit=50):
         paths.sort(key=lambda pc: os.path.getmtime(pc[0]), reverse=True)
     except Exception:
         pass
-    for path, source in paths[:limit]:
+    for path, source in paths:
         try:
             st = os.stat(path)
         except OSError:
             continue
-        cwd, branch, title = _peek_codex(path)
+        cwd, branch, title, is_subagent = _peek_codex(path)
+        if is_subagent:
+            continue
         items.append({
             "id": path, "source": source, "cwd": cwd, "branch": branch,
             "title": title or os.path.basename(path),
             "mtime": st.st_mtime, "size": st.st_size,
         })
+        if len(items) >= limit:
+            break
     return items
 
 
@@ -791,6 +989,260 @@ def fetch_usage():
     return dict(_CODEX_USAGE)
 
 
+# ─────────────────── history search index ───────────────────
+#
+# Codex rollouts contain huge tool outputs, encrypted reasoning blobs, environment
+# bootstrap, and AGENTS.md context. Searching raw JSONL would be noisy and slow, so
+# the index stores only conversation text plus the paths/commands tools acted on.
+
+INDEX_DB = os.path.join(HOME, ".cache", "codex-console", "history.db")
+CJK_RE = re.compile(r"[㐀-鿿぀-ヿ가-힯]")
+INDEX_REFRESH_SEC = 30
+INDEX_SCHEMA = 1
+THREAD_TXT_CAP = 20000
+_index_lock = threading.Lock()
+_index_state = {"t": 0.0, "err": ""}
+
+
+def _index_conn():
+    os.makedirs(os.path.dirname(INDEX_DB), exist_ok=True)
+    db = sqlite3.connect(INDEX_DB, timeout=30)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")
+    if db.execute("PRAGMA user_version").fetchone()[0] != INDEX_SCHEMA:
+        db.executescript("DROP TABLE IF EXISTS msgs; DROP TABLE IF EXISTS files;")
+        db.execute("PRAGMA user_version=%d" % INDEX_SCHEMA)
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS files(
+            fid INTEGER PRIMARY KEY, path TEXT UNIQUE,
+            off INTEGER DEFAULT 0, cc TEXT, cwd TEXT, title TEXT);
+        CREATE TABLE IF NOT EXISTS msgs(
+            fid INTEGER, uid TEXT, ts TEXT, role TEXT, txt TEXT);
+        CREATE INDEX IF NOT EXISTS msgs_fid ON msgs(fid);
+        CREATE INDEX IF NOT EXISTS files_cc ON files(cc);
+        CREATE INDEX IF NOT EXISTS files_cwd ON files(cwd);
+        CREATE UNIQUE INDEX IF NOT EXISTS msgs_uid ON msgs(fid, uid);
+    """)
+    return db
+
+
+def _tool_search_text(ev):
+    i = ev.get("input")
+    if isinstance(i, dict):
+        for k in ("file_path", "command", "pattern", "url"):
+            v = i.get(k)
+            if isinstance(v, str) and v.strip():
+                return v[:400]
+        return json.dumps(i, ensure_ascii=False)[:400]
+    if isinstance(i, str):
+        return i[:400]
+    return ""
+
+
+def _searchable_codex_record(rec, idx):
+    """Yield (role, text) pairs for one Codex rollout record."""
+    if rec.get("type") == "event_msg":
+        p = rec.get("payload") or {}
+        if p.get("type") == "user_message":
+            text = _strip_injected(_txt(p.get("message") or p.get("text") or p.get("content")))
+            if text.strip() and not _codex_injected(text):
+                yield "user", text
+        return
+    for ev in parse_codex(rec, idx):
+        k = ev.get("kind")
+        if k == "assistant_text":
+            text = ev.get("text") or ""
+            if text.strip():
+                yield "assistant", text
+        elif k == "tool_use":
+            text = _tool_search_text(ev)
+            if text.strip():
+                yield "tool", text
+
+
+def _rollout_meta_from_record(rec):
+    if rec.get("type") != "session_meta":
+        return "", "", ""
+    p = rec.get("payload") or {}
+    return p.get("id") or "", p.get("cwd") or "", p.get("timestamp") or rec.get("timestamp") or ""
+
+
+def reindex():
+    """Incrementally fold Codex rollout tails into the search index."""
+    if not _index_lock.acquire(blocking=False):
+        return {"skipped": "already running"}
+    try:
+        db = _index_conn()
+        known = {p: (fid, off) for fid, p, off
+                 in db.execute("SELECT fid, path, off FROM files")}
+        added = 0
+        alive = set()
+        paths = glob.glob(os.path.join(CODEX_ROOT, "**", "*.jsonl"), recursive=True)
+        for path in paths:
+            cwd, _branch, title, is_subagent = _peek_codex(path)
+            if is_subagent:
+                continue
+            alive.add(path)
+            try:
+                sz = os.path.getsize(path)
+            except OSError:
+                continue
+            fid, off = known.get(path, (None, 0))
+            if fid is not None and sz < off:
+                db.execute("DELETE FROM msgs WHERE fid=?", (fid,))
+                off = 0
+            if fid is not None and sz == off:
+                continue
+            try:
+                with open(path, "rb") as f:
+                    f.seek(off)
+                    data = f.read()
+            except OSError:
+                continue
+            cut = data.rfind(b"\n")
+            if cut < 0:
+                continue
+            chunk, consumed = data[:cut + 1], cut + 1
+            cc = _codex_cc_from_path(path)
+            rows = []
+            pos = 0
+            for raw in chunk.splitlines(True):
+                line_start = off + pos
+                pos += len(raw)
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line.decode("utf-8", "replace"))
+                except Exception:
+                    continue
+                m_cc, m_cwd, _m_ts = _rollout_meta_from_record(rec)
+                cc = m_cc or cc
+                cwd = m_cwd or cwd
+                ts = rec.get("timestamp") or ""
+                for seq, (role, txt) in enumerate(_searchable_codex_record(rec, line_start)):
+                    rows.append(("%d:%d" % (line_start, seq), ts, role, txt))
+            if fid is None:
+                cur = db.execute(
+                    "INSERT INTO files(path, off, cc, cwd, title) VALUES(?,?,?,?,?)",
+                    (path, 0, cc, cwd, title))
+                fid = cur.lastrowid
+            else:
+                db.execute("UPDATE files SET cc=COALESCE(NULLIF(cc,''),?),"
+                           " cwd=COALESCE(NULLIF(cwd,''),?),"
+                           " title=COALESCE(NULLIF(title,''),?) WHERE fid=?",
+                           (cc, cwd, title, fid))
+            if rows:
+                before = db.total_changes
+                db.executemany(
+                    "INSERT OR IGNORE INTO msgs(fid, uid, ts, role, txt) VALUES(?,?,?,?,?)",
+                    [(fid, uid, ts, role, txt) for uid, ts, role, txt in rows])
+                added += db.total_changes - before
+            db.execute("UPDATE files SET off=? WHERE fid=?", (off + consumed, fid))
+        for path, (fid, _off) in known.items():
+            if path not in alive:
+                db.execute("DELETE FROM msgs WHERE fid=?", (fid,))
+                db.execute("DELETE FROM files WHERE fid=?", (fid,))
+        db.commit()
+        n = db.execute("SELECT COUNT(*) FROM msgs").fetchone()[0]
+        db.close()
+        _index_state["t"] = time.time()
+        _index_state["err"] = ""
+        return {"added": added, "messages": n}
+    except Exception as e:
+        _index_state["err"] = str(e)
+        return {"error": str(e)}
+    finally:
+        _index_lock.release()
+
+
+def min_query_len(q):
+    return 1 if CJK_RE.search(q or "") else 2
+
+
+def _snippet(txt, q, span=160):
+    i = txt.lower().find(q.lower())
+    if i < 0:
+        return {"pre": txt[:span], "hit": "", "post": ""}
+    a = max(0, i - span // 2)
+    b = min(len(txt), i + len(q) + span)
+    return {"pre": ("..." if a else "") + txt[a:i],
+            "hit": txt[i:i + len(q)],
+            "post": txt[i + len(q):b] + ("..." if b < len(txt) else "")}
+
+
+def search_history(q, scope="all", cc="", cwd="", limit=200):
+    q = (q or "").strip()
+    need = min_query_len(q)
+    if len(q) < need:
+        return {"results": [], "note": "type at least %d character%s"
+                                       % (need, "" if need == 1 else "s")}
+    if time.time() - _index_state["t"] > INDEX_REFRESH_SEC:
+        reindex()
+    try:
+        db = _index_conn()
+    except Exception as e:
+        return {"results": [], "error": str(e)}
+    esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    where, args = ["m.txt LIKE ? ESCAPE '\\'"], ["%" + esc + "%"]
+    if scope == "session" and cc:
+        where.append("f.cc=?")
+        args.append(cc)
+    elif scope == "project" and cwd:
+        base = os.path.abspath(os.path.expanduser(cwd)).rstrip(os.sep)
+        pre = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where.append("(f.cwd=? OR f.cwd LIKE ? ESCAPE '\\')")
+        args.extend([base, pre + os.sep + "%"])
+    args.append(int(limit) + 1)
+    rows = db.execute(
+        "SELECT f.cc, f.cwd, f.title, m.ts, m.role, m.txt, m.rowid"
+        " FROM msgs m JOIN files f ON f.fid=m.fid WHERE " + " AND ".join(where) +
+        " ORDER BY m.ts DESC, m.rowid DESC LIMIT ?", args).fetchall()
+    db.close()
+    more = len(rows) > limit
+    names = load_names()
+    out = []
+    for r_cc, r_cwd, r_title, ts, role, txt, mid in rows[:limit]:
+        item = {"cc": r_cc, "cwd": r_cwd, "ts": ts, "role": role, "mid": mid,
+                "title": names.get(r_cc) or r_title or os.path.basename(r_cwd or "") or "session",
+                "name": os.path.basename(r_cwd or "")}
+        item.update(_snippet(txt, q))
+        out.append(item)
+    return {"results": out, "more": more}
+
+
+def load_thread(mid, before=40, after=40):
+    try:
+        db = _index_conn()
+        mid = int(mid)
+    except Exception as e:
+        return {"error": str(e), "messages": []}
+    r = db.execute("SELECT fid FROM msgs WHERE rowid=?", (mid,)).fetchone()
+    if not r:
+        db.close()
+        return {"error": "that message is no longer indexed", "messages": []}
+    fid = r[0]
+    cc, cwd, title = db.execute(
+        "SELECT cc, cwd, title FROM files WHERE fid=?", (fid,)).fetchone() or ("", "", "")
+    pre = db.execute("SELECT rowid, ts, role, txt FROM msgs WHERE fid=? AND rowid<=?"
+                     " ORDER BY rowid DESC LIMIT ?", (fid, mid, int(before) + 1)).fetchall()
+    post = db.execute("SELECT rowid, ts, role, txt FROM msgs WHERE fid=? AND rowid>?"
+                      " ORDER BY rowid LIMIT ?", (fid, mid, int(after))).fetchall()
+    lo, hi = db.execute("SELECT MIN(rowid), MAX(rowid) FROM msgs WHERE fid=?", (fid,)).fetchone()
+    total = db.execute("SELECT COUNT(*) FROM msgs WHERE fid=?", (fid,)).fetchone()[0]
+    db.close()
+    rows = list(reversed(pre)) + list(post)
+    msgs = []
+    for rid, ts, role, txt in rows:
+        cut = len(txt) > THREAD_TXT_CAP
+        msgs.append({"mid": rid, "ts": ts, "role": role,
+                     "txt": txt[:THREAD_TXT_CAP] + ("\n...(truncated)" if cut else "")})
+    return {"cc": cc, "cwd": cwd, "total": total, "messages": msgs,
+            "title": load_names().get(cc) or title or os.path.basename(cwd or "") or "session",
+            "atStart": bool(rows) and rows[0][0] == lo,
+            "atEnd": bool(rows) and rows[-1][0] == hi}
+
+
 _UUID_RE = re.compile(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                       r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
 
@@ -798,6 +1250,44 @@ def _codex_cc_from_path(path):
     """Extract a codex thread id (the trailing UUID) from a rollout filename."""
     m = _UUID_RE.search(os.path.basename(path or ""))
     return m.group(1) if m else os.path.splitext(os.path.basename(path or ""))[0]
+
+
+def transcript_thread_id(body):
+    """Read the Codex thread id claimed by an uploaded rollout."""
+    for line in body[: 2 << 20].decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        cc, _cwd, _ts = _rollout_meta_from_record(rec)
+        if cc:
+            return str(cc)
+    return ""
+
+
+def _rollout_timestamp(body):
+    for line in body[: 2 << 20].decode("utf-8", "replace").splitlines():
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        _cc, _cwd, ts = _rollout_meta_from_record(rec)
+        ts = ts or rec.get("timestamp") or ""
+        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})", ts)
+        if m:
+            y, mo, d, h, mi, s = m.groups()
+            return os.path.join(y, mo, d), "%s-%s-%sT%s-%s-%s" % (y, mo, d, h, mi, s)
+    g = time.gmtime()
+    return time.strftime("%Y/%m/%d", g), time.strftime("%Y-%m-%dT%H-%M-%S", g)
+
+
+def import_rollout_dest(cc, body):
+    date_dir, stamp = _rollout_timestamp(body)
+    dest_dir = os.path.join(CODEX_ROOT, date_dir)
+    return os.path.join(dest_dir, "rollout-%s-%s.jsonl" % (stamp, cc))
 
 
 def load_transcript_events(cc, cap=1000):
@@ -965,6 +1455,39 @@ def git_snapshot(cwd):
     return {"ok": True, "cwd": rp, "branch": branch, "files": files, "diff": full}
 
 
+def git_status_brief(cwd):
+    rp = os.path.realpath(cwd)
+    if not (rp == os.path.realpath(HOME) or rp.startswith(os.path.realpath(HOME) + os.sep)):
+        return {"ok": False, "error": "path outside home"}
+    if not os.path.isdir(rp):
+        return {"ok": False, "error": "not a directory"}
+    inside = _git(rp, ["rev-parse", "--is-inside-work-tree"]).strip()
+    if inside != "true":
+        return {"ok": False, "error": "not a git repo", "cwd": rp}
+    branch = _git(rp, ["rev-parse", "--abbrev-ref", "HEAD"]).strip()
+    head = _git(rp, ["rev-parse", "--short", "HEAD"]).strip()
+    root = _git(rp, ["rev-parse", "--show-toplevel"]).strip()
+    staged = unstaged = untracked = 0
+    files = []
+    for line in _git(rp, ["status", "--porcelain=v1"]).splitlines():
+        if len(line) < 4:
+            continue
+        x, y, name = line[0], line[1], line[3:]
+        if x == "?" and y == "?":
+            untracked += 1
+        else:
+            if x != " ":
+                staged += 1
+            if y != " ":
+                unstaged += 1
+        files.append({"status": line[:2].strip() or "?", "path": name})
+    return {
+        "ok": True, "cwd": rp, "root": root, "branch": branch, "head": head,
+        "dirty": bool(files), "staged": staged, "unstaged": unstaged,
+        "untracked": untracked, "files": files[:8], "file_count": len(files),
+    }
+
+
 # ───────────────────────── auth ─────────────────────────
 class AuthMixin:
     def _ok_auth(self):
@@ -1034,6 +1557,119 @@ class UsageHandler(AuthMixin, tornado.web.RequestHandler):
         self.write(json.dumps({"usage": u}))
 
 
+class ModelsHandler(AuthMixin, tornado.web.RequestHandler):
+    async def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        self.set_header("Cache-Control", "no-store")
+        loop = tornado.ioloop.IOLoop.current()
+        fresh = self.get_argument("fresh", "") == "1"
+        models = await loop.run_in_executor(None, fetch_models, fresh)
+        default_model = _configured_default_model()
+        if not default_model:
+            default_model = next(
+                (m.get("id") for m in (models or []) if m.get("isDefault")), "")
+        self.write(json.dumps({"models": models or [], "defaultModel": default_model}))
+
+
+class ExportHandler(AuthMixin, tornado.web.RequestHandler):
+    async def get(self):
+        if not self._ok_auth():
+            return
+        cc = self.get_argument("cc", "")
+        path = find_transcript(cc)
+        if not path:
+            self.set_status(404)
+            self.write("no transcript for that session")
+            return
+        self.set_header("Content-Type", "application/x-ndjson")
+        self.set_header("Content-Disposition", 'attachment; filename="%s.jsonl"' % cc)
+        self.set_header("Content-Length", str(os.path.getsize(path)))
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    break
+                self.write(chunk)
+                await self.flush()
+
+
+class ImportHandler(AuthMixin, tornado.web.RequestHandler):
+    def post(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+
+        def fail(msg, code=400):
+            self.set_status(code)
+            self.write(json.dumps({"ok": False, "error": msg}))
+
+        cwd = (self.get_body_argument("cwd", "") or "").strip()
+        if not cwd:
+            return fail("pick a project folder first")
+        cwd = os.path.realpath(os.path.abspath(os.path.expanduser(cwd)))
+        home = os.path.realpath(HOME)
+        if not (cwd == home or cwd.startswith(home + os.sep)) or not os.path.isdir(cwd):
+            return fail("not a folder under home: %s" % cwd)
+        files = self.request.files.get("file") or []
+        if not files:
+            return fail("no file uploaded")
+        up = files[0]
+        body = up.get("body") or b""
+        if not body:
+            return fail("empty file")
+        cc = transcript_thread_id(body)
+        if not cc:
+            cc = os.path.splitext(os.path.basename(up.get("filename") or ""))[0]
+        if not _valid_cc(cc):
+            return fail("not a codex rollout transcript (no thread id found)")
+        dest = import_rollout_dest(cc, body)
+        if os.path.exists(dest) or find_transcript(cc):
+            return fail("this session already exists", 409)
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            tmp = dest + ".part"
+            with open(tmp, "wb") as f:
+                f.write(body)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, dest)
+        except Exception as e:
+            return fail("write failed: %s" % e, 500)
+        _index_state["t"] = 0.0
+        self.write(json.dumps({"ok": True, "cc": cc, "cwd": cwd,
+                               "bytes": len(body), "path": dest}))
+
+
+class SearchHandler(AuthMixin, tornado.web.RequestHandler):
+    async def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        loop = tornado.ioloop.IOLoop.current()
+        res = await loop.run_in_executor(
+            None, search_history, self.get_argument("q", ""),
+            self.get_argument("scope", "all"), self.get_argument("cc", ""),
+            self.get_argument("cwd", ""), 200)
+        self.write(json.dumps(res))
+
+
+class ThreadHandler(AuthMixin, tornado.web.RequestHandler):
+    async def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        loop = tornado.ioloop.IOLoop.current()
+        try:
+            before = max(0, min(400, int(self.get_argument("before", "40") or 40)))
+            after = max(0, min(400, int(self.get_argument("after", "40") or 40)))
+        except Exception:
+            before, after = 40, 40
+        res = await loop.run_in_executor(
+            None, load_thread, self.get_argument("mid", "0"), before, after)
+        self.write(json.dumps(res))
+
+
 CHAT_SESSIONS = {}  # id -> ChatSession (live, independent of any browser connection)
 
 
@@ -1047,9 +1683,44 @@ def safe_cwd(cwd):
 def _sanitize_mode(m):
     return m if m in MODE_PRESETS else "full-access"   # default: no approval, full access
 
-EFFORTS = CODEX_EFFORTS
-def _sanitize_effort(e):
-    return e if e in EFFORTS else "xhigh"   # default: deepest reasoning effort
+_EFFORT_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+
+def _model_catalog_entry(model=""):
+    """Return the cached catalog entry for a model value, resolving `default`."""
+    models = _models_cache.get("v") or []
+    selected = _txt(model).strip()
+    if selected and selected != "default":
+        return next((m for m in models if m.get("id") == selected), None)
+    default_id = _configured_default_model()
+    return (next((m for m in models if m.get("id") == default_id), None)
+            or next((m for m in models if m.get("isDefault")), None))
+
+
+def _sanitize_effort(e, model=""):
+    """Validate an effort against the selected model's live catalog metadata.
+
+    Unsupported or missing values fall back to that model's advertised default.
+    When the catalog is unavailable, accept a safe protocol-shaped identifier so
+    newly introduced effort ids remain forward-compatible.
+    """
+    effort = _txt(e).strip().lower()
+    spec = _model_catalog_entry(model)
+    if spec:
+        allowed = [x for x in (spec.get("reasoningEfforts") or [])
+                   if isinstance(x, str) and _EFFORT_ID_RE.fullmatch(x)]
+        if effort in allowed:
+            return effort
+        default = _txt(spec.get("defaultReasoningEffort")).strip().lower()
+        if default in allowed:
+            return default
+        if "xhigh" in allowed:
+            return "xhigh"
+        if allowed:
+            return allowed[0]
+    if effort and _EFFORT_ID_RE.fullmatch(effort):
+        return effort
+    return "xhigh"
 
 
 class ChatSession:
@@ -1071,7 +1742,8 @@ class ChatSession:
         self.model = model or ""        # "" / "default" → codex config default
         self.display_model = _display_model(self.model)
         self.mode = _sanitize_mode(mode)  # approval preset (see _mode_policy)
-        self.effort = _sanitize_effort(effort)   # reasoning effort (per-turn)
+        effort_model = self.model if self.model and self.model != "default" else self.display_model
+        self.effort = _sanitize_effort(effort, effort_model)   # reasoning effort (per-turn)
         self.proc = None                # the `codex app-server` subprocess
         self.log = []                   # normalized-event history, for replay
         self.viewers = set()            # attached ChatSockets
@@ -1450,8 +2122,11 @@ class ChatSession:
         if cur is None:
             cur = last.get("totalTokens")
         if cur is not None and mx:
-            self.ctx = {"totalTokens": cur, "maxTokens": mx,
-                        "percentage": round(cur * 100.0 / mx, 1),
+            cfg_mx = _configured_context_window()
+            shown_mx = cfg_mx if cfg_mx and cfg_mx > mx else mx
+            self.ctx = {"totalTokens": cur, "maxTokens": shown_mx,
+                        "reportedMaxTokens": mx, "configuredMaxTokens": cfg_mx,
+                        "percentage": round(cur * 100.0 / shown_mx, 1),
                         "model": self.display_model or self.model or None}
             self._emit({"type": "context", "ctx": self.ctx})
         li = last.get("inputTokens")
@@ -1552,9 +2227,58 @@ class ChatSession:
     def turn_age(self):
         return (time.time() - self.turn_started) if (self.busy and self.turn_started) else 0
 
+    def _status_snapshot(self):
+        ap, sbx = _mode_policy(self.mode)
+        return {
+            "generated_at": time.time(),
+            "session": {
+                "id": self.id,
+                "thread_id": self.thread_id or self.cc_id or "",
+                "cwd": self.cwd,
+                "model": self.model or "default",
+                "display_model": self.display_model,
+                "effort": self.effort,
+                "mode": self.mode,
+                "approval_policy": ap,
+                "sandbox": sbx,
+                "busy": bool(self.busy),
+                "ended": bool(self.ended),
+                "compacting": bool(self.compacting),
+                "queued": len(self.queue),
+                "viewers": len(self.viewers),
+                "turn_age": round(self.turn_age(), 1),
+            },
+            "service": {
+                "bind": BIND,
+                "port": PORT,
+                "auth": bool(AUTH),
+                "recap": bool(RECAP_ENABLED),
+                "recap_idle_sec": RECAP_IDLE_SEC,
+                "configured_context_window": _configured_context_window(),
+                "codex": bool(HAVE_CODEX),
+            },
+            "context": self.ctx,
+            "usage": self.usage or _CODEX_USAGE or None,
+            "git": git_status_brief(self.cwd),
+        }
+
+    def _handle_local_command(self, text, images):
+        cmd = text.strip().split(None, 1)[0] if text.strip() else ""
+        if cmd != "/status":
+            return False
+        evs = [{"kind": "user_text", "text": _cap(text)}]
+        if images:
+            evs[0]["images"] = len(images)
+        evs.append({"kind": "status", "status": self._status_snapshot()})
+        self.last_activity = time.time()
+        self._push(evs)
+        return True
+
     def send_user(self, text, images=None):
         images = [im for im in (images or []) if im.get("data")]
         if (not text.strip() and not images) or not self.proc or self.ended:
+            return
+        if self._handle_local_command(text, images):
             return
         if self.busy:
             self._qid += 1
@@ -1635,7 +2359,7 @@ class ChatSession:
         ap, sbx = _mode_policy(self.mode)
         params = {"threadId": self.thread_id, "input": inp,
                   "approvalPolicy": ap, "sandboxPolicy": _sandbox_policy(sbx)}
-        if self.effort in CODEX_EFFORTS:
+        if self.effort:
             params["effort"] = self.effort
         if self.model and self.model != "default":
             params["model"] = self.model
@@ -1713,9 +2437,24 @@ class ChatSession:
     def set_model(self, model):
         self.model = model or "default"
         self.display_model = _display_model(self.model)
+        previous_effort = self.effort
+        effort_model = self.model if self.model != "default" else self.display_model
+        self.effort = _sanitize_effort(self.effort, effort_model)
         if self.cc_id:
-            save_pref(self.cc_id, model=self.model)
-        self._notice("⚙ model → %s (applies next turn)" % self.model)
+            save_pref(self.cc_id, model=self.model, effort=self.effort)
+        suffix = (" · effort → %s (model default)" % self.effort
+                  if self.effort != previous_effort else "")
+        self._notice("⚙ model → %s%s (applies next turn)" % (self.model, suffix))
+
+    def set_effort(self, effort):
+        effort_model = self.model if self.model != "default" else self.display_model
+        effort = _sanitize_effort(effort, effort_model)
+        if effort == self.effort:
+            return
+        self.effort = effort
+        if _valid_cc(self.cc_id):
+            save_pref(self.cc_id, effort=effort)
+        self._notice("⚙ effort → %s (applies next turn)" % effort)
 
     def set_mode(self, mode):
         self.mode = _sanitize_mode(mode)
@@ -1889,8 +2628,9 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                 self._say({"type": "error", "error": "invalid working directory"})
                 return
             sid = secrets.token_hex(6)
-            sess = ChatSession(sid, cwd, msg.get("model") or "", _sanitize_mode(msg.get("mode")),
-                               effort=_sanitize_effort(msg.get("effort")))
+            start_model = msg.get("model") or ""
+            sess = ChatSession(sid, cwd, start_model, _sanitize_mode(msg.get("mode")),
+                               effort=_sanitize_effort(msg.get("effort"), start_model))
             try:
                 await sess.start()
             except Exception as e:
@@ -1945,7 +2685,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                 pf = load_prefs().get(cc) or {}   # restore this session's own
                 r_mode = _sanitize_mode(pf.get("mode") or msg.get("mode"))
                 r_model = pf.get("model") or msg.get("model") or ""
-                r_effort = _sanitize_effort(pf.get("effort") or msg.get("effort"))
+                r_effort = _sanitize_effort(
+                    pf.get("effort") or msg.get("effort"), r_model)
                 sess = ChatSession(secrets.token_hex(6), cwd, r_model,
                                    r_mode, resume_cc=cc, effort=r_effort)
                 sess.preload()
@@ -1978,25 +2719,22 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
         elif mt == "set_mode" and self.session:
             self.session.set_mode(msg.get("mode") or "")
         elif mt == "configure":
-            # ⚙ per-session model/permission from the kebab Configure popover,
+            # ⚙ per-session model/permission/effort from the kebab Configure popover,
             # targeting a live session by id (the attached one or any other).
-            # Effort is NOT here — it stays on the pill's set_effort relaunch path.
             sess = CHAT_SESSIONS.get(msg.get("id"))
             if sess and not sess.ended:
                 if msg.get("model") is not None:
                     sess.set_model(msg.get("model") or "")
                 if msg.get("mode") is not None:
                     sess.set_mode(msg.get("mode") or "")
+                if msg.get("effort") is not None:
+                    sess.set_effort(msg.get("effort"))
         elif mt == "set_effort" and self.session:
             # Codex reasoning effort is a per-turn parameter, so changing it just
             # updates the session — it takes effect on the next turn (no relaunch).
-            eff = _sanitize_effort(msg.get("effort"))
             sess = self.session
-            if not sess.ended and eff != sess.effort:
-                sess.effort = eff
-                if _valid_cc(sess.cc_id):
-                    save_pref(sess.cc_id, effort=eff)
-                sess._notice("⚙ effort → %s (applies next turn)" % eff)
+            if not sess.ended:
+                sess.set_effort(msg.get("effort"))
         elif mt == "user" and self.session:
             self.session.send_user(msg.get("text", ""), msg.get("images"))
         elif mt == "unqueue" and self.session:
@@ -2190,6 +2928,12 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .think.hide{display:none}
 .notice{color:var(--mut);font-size:11.5px;margin:6px 0}
 .errline{color:var(--del);font-size:12px;font-family:ui-monospace,monospace;margin:4px 0;white-space:pre-wrap}
+.localstatus{border:1px solid var(--line);border-radius:8px;margin:8px 0 12px;background:var(--bg2);padding:9px 10px;font-size:12px;line-height:1.45}
+.localstatus .sh{display:flex;align-items:center;gap:8px;color:var(--fg);font-weight:650;margin-bottom:7px}
+.localstatus .sg{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:5px 14px}
+.localstatus .sk{color:var(--mut);margin-right:6px}
+.localstatus .sv{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}
+.localstatus .sf{margin-top:7px;color:var(--mut);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}
 .recap{color:var(--mut);font-size:12px;margin:7px 0;line-height:1.45}
 .recap .rk{font-weight:600;letter-spacing:.2px}
 .recap .rt{font-style:italic;opacity:.92}
@@ -2358,8 +3102,25 @@ pre code{background:none;border:none;padding:0}
 .acitem:hover .acname,.acitem.sel .acname,.acitem:hover .acpath,.acitem.sel .acpath{color:var(--onacc)}
 .acmore{padding:5px 8px;font-size:10px;color:var(--mut);font-style:italic}
 .sb-row2{display:flex;gap:6px}.sb-row2 select{flex:1;min-width:0}
+#mrefresh{flex:0 0 auto;width:28px;padding:0;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:5px;font-size:13px;cursor:pointer;line-height:1}
+#mrefresh:hover{color:var(--acc);border-color:var(--acc)}
+#mrefresh.busy{color:var(--acc);animation:mrspin .8s linear infinite;pointer-events:none}
+@keyframes mrspin{to{transform:rotate(360deg)}}
 .newbtn{background:var(--acc);color:var(--onacc);font-weight:700;border:none;border-radius:6px;padding:7px;font-size:13px;cursor:pointer}
 .newbtn:hover{filter:brightness(1.08)}
+#srchopen{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;
+  padding:6px 8px;background:var(--bg3);color:var(--dim);
+  border:1px solid var(--line);border-radius:6px;font-size:12px;cursor:pointer}
+#srchopen:hover{color:var(--fg);border-color:var(--acc)}
+#srchopen kbd{font:inherit;font-size:10.5px;color:var(--dim);border:1px solid var(--line);
+  border-radius:3px;padding:0 4px;background:var(--bg2)}
+.impline{display:flex;flex-direction:column;gap:5px;margin-top:1px}
+#impbtn{width:100%;background:var(--bg3);color:var(--acc);font-weight:700;
+  border:1px solid var(--acc);border-radius:6px;padding:7px;font-size:13px;cursor:pointer}
+#impbtn:hover{background:var(--acc);color:var(--onacc)}
+#impmsg{font-size:11px;color:var(--dim);line-height:1.35;word-break:break-word}
+#impmsg:empty{display:none}
+#impmsg.bad{color:var(--delfg)}
 .sb-sec{border-bottom:1px solid var(--line);padding:4px 0 6px}
 .sb-h{font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--mut);padding:6px 10px 4px;display:flex;align-items:center;gap:6px}
 .sb-h .cnt{background:var(--bg3);border-radius:8px;padding:0 6px;font-size:10px;color:var(--mut)}
@@ -2402,6 +3163,53 @@ pre code{background:none;border:none;padding:0}
 #cardMenu .cfgrow{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:5px 9px;font-size:12.5px;color:var(--mut)}
 #cardMenu .cfgrow .cfgsel{background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:3px 6px;font-size:12px;cursor:pointer}
 .fscope{font-size:10px;color:var(--mut);font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:130px}
+#srch{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.55);
+  display:flex;justify-content:center;align-items:flex-start;padding:8vh 16px 16px}
+#srch[hidden]{display:none}
+#srchpanel{width:min(900px,100%);max-height:78vh;display:flex;flex-direction:column;
+  background:var(--bg2);border:1px solid var(--line);border-radius:10px;
+  box-shadow:0 18px 60px rgba(0,0,0,.5);overflow:hidden}
+.srchtop{display:flex;gap:8px;padding:10px;border-bottom:1px solid var(--line);align-items:center}
+#srchq{flex:1;min-width:0;background:var(--bg3);color:var(--fg);border:1px solid var(--line);
+  border-radius:6px;padding:9px 11px;font-size:14px;outline:none}
+#srchq:focus{border-color:var(--acc)}
+#srchscope{flex:0 0 auto;background:var(--bg3);color:var(--fg);border:1px solid var(--line);
+  border-radius:6px;padding:8px;font-size:12px}
+#srchx{flex:0 0 auto;background:none;border:none;color:var(--dim);font-size:16px;cursor:pointer;padding:4px 8px}
+#srchx:hover{color:var(--fg)}
+#srchmeta{padding:7px 12px;font-size:11.5px;color:var(--dim);border-bottom:1px solid var(--line)}
+#srchres{overflow:auto;padding:4px 0}
+.sres{padding:9px 12px;border-bottom:1px solid var(--line);cursor:pointer}
+.sres:hover{background:var(--bg3)}
+.sres .sh1{display:flex;gap:8px;align-items:baseline;font-size:11.5px;color:var(--dim);margin-bottom:3px}
+.sres .sh1 b{color:var(--fg);font-weight:600;font-size:12.5px}
+.sres .sh1 .role{border:1px solid var(--line);border-radius:3px;padding:0 4px;font-size:10px}
+.sres .sh2{font-size:12.5px;line-height:1.5;color:var(--fg);word-break:break-word;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.sres .sh2 mark{background:var(--acc);color:var(--bg);border-radius:2px;padding:0 1px}
+#srchthread{display:flex;flex-direction:column;min-height:0;overflow:hidden}
+#srchthread[hidden]{display:none}
+.thhead{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line)}
+.thhead .thtitle{flex:1;min-width:0;font-size:12.5px;color:var(--fg);font-weight:600;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.thhead button{flex:0 0 auto;background:var(--bg3);color:var(--fg);border:1px solid var(--line);
+  border-radius:5px;padding:4px 9px;font-size:11.5px;cursor:pointer}
+.thhead button:hover{border-color:var(--acc);color:var(--acc)}
+#thopen{color:var(--acc);border-color:var(--acc)}
+#thopen:hover{background:var(--acc);color:var(--onacc)}
+#thbody{overflow:auto;padding:6px 0 12px}
+.thmsg{padding:7px 14px;border-left:3px solid transparent}
+.thmsg .thr{font-size:10.5px;color:var(--dim);margin-bottom:2px;letter-spacing:.03em}
+.thmsg .tht{font-size:12.5px;line-height:1.55;color:var(--fg);white-space:pre-wrap;word-break:break-word}
+.thmsg.user{border-left-color:var(--acc)}
+.thmsg.assistant{border-left-color:var(--line)}
+.thmsg.tool .tht{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;color:var(--dim)}
+.thmsg.target{background:var(--bg3)}
+.thmsg .tht mark{background:var(--acc);color:var(--bg);border-radius:2px;padding:0 1px}
+.thmore{display:block;width:calc(100% - 24px);margin:6px 12px;padding:5px;background:var(--bg3);
+  color:var(--dim);border:1px dashed var(--line);border-radius:5px;font-size:11.5px;cursor:pointer}
+.thmore:hover{color:var(--acc);border-color:var(--acc)}
+.thend{text-align:center;font-size:11px;color:var(--mut);padding:6px}
 #sb-backdrop{display:none}
 @media(max-width:860px){
   #sidebar{position:fixed;left:0;top:0;bottom:0;z-index:40;transform:translateX(-100%);transition:transform .2s;width:min(310px,86vw);box-shadow:2px 0 14px rgba(0,0,0,.5)}
@@ -2428,13 +3236,16 @@ pre code{background:none;border:none;padding:0}
   <aside id="sidebar">
     <div class="sb-brand">⬡ Codex Console</div>
     <div class="sb-new">
+      <button id="srchopen" title="search all conversation history"><span>🔍 Search history</span><kbd>⌘K</kbd></button>
       <select id="project" title="working directory for a new session"></select>
       <div class="cwdwrap" id="cwdwrap"><input id="cwd" placeholder="type a path…  ↑↓ to pick" autocomplete="off"><div id="cwdac"></div></div>
       <div class="sb-row2">
-        <select id="model" title="model"><option>gpt-5.5</option><option>gpt-5.5-codex</option><option>gpt-5-codex</option><option>gpt-5</option></select>
+        <select id="model" title="model"><option value="default">model: default</option></select>
+        <button id="mrefresh" title="refresh model list from Codex">↻</button>
         <select id="mode" title="approval policy"><option value="full-access" selected>🔓 Full access</option><option value="on-request">🔐 Approve</option><option value="auto">⚡ Auto (sandbox)</option><option value="read-only">👁 Read-only</option></select>
       </div>
       <button class="newbtn" id="newbtn">＋ New session</button>
+      <div class="impline"><input type="file" id="impfile" accept=".jsonl,application/x-ndjson" hidden><button id="impbtn" title="adopt a Codex rollout exported from another machine">Import session</button><span id="impmsg"></span></div>
     </div>
     <div class="sb-sec">
       <div class="sb-h">Live <span id="liveN" class="cnt">0</span></div>
@@ -2477,6 +3288,27 @@ pre code{background:none;border:none;padding:0}
   </aside>
   <div id="sbresize"></div>
   <div id="sb-backdrop"></div>
+  <div id="srch" hidden><div id="srchpanel">
+    <div class="srchtop">
+      <input id="srchq" type="text" placeholder="search every conversation..." autocomplete="off" spellcheck="false">
+      <select id="srchscope" title="how much history to search">
+        <option value="all">all history</option>
+        <option value="project">this folder + subfolders</option>
+        <option value="session">this conversation</option>
+      </select>
+      <button id="srchx" title="close (Esc)">✕</button>
+    </div>
+    <div id="srchmeta">Search Codex history: user prompts, assistant answers, and touched files or commands.</div>
+    <div id="srchres"></div>
+    <div id="srchthread" hidden>
+      <div class="thhead">
+        <button id="thback" title="back to results">← results</button>
+        <div class="thtitle"></div>
+        <button id="thopen" title="resume this conversation in the chat pane">Open session</button>
+      </div>
+      <div id="thbody"></div>
+    </div>
+  </div></div>
   <div id="mainCol">
     <div id="chat"><div class="wrap" id="stream"></div></div>
     <div id="composer">
@@ -2508,17 +3340,16 @@ const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send');
 let ws=null, running=false, ready=false, compacting=false, cwd='', tools={};
 let tokUp=0,tokOut=0,tokShow=false;   /* live streaming token counts shown in the pill */
 let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
-const EFFORTS=['minimal','low','medium','high','xhigh'];
-const MODEL_OPTIONS=[
-  ['gpt-5.5','gpt-5.5'],
-  ['gpt-5.4','gpt-5.4'],
-  ['gpt-5.4-mini','gpt-5.4-mini'],
-  ['gpt-5.3-codex-spark','gpt-5.3-codex-spark'],
-];
+const FALLBACK_EFFORTS=['minimal','low','medium','high','xhigh'];
+let MODELS=[];   /* live Codex app-server catalog: [{id,name,isDefault,...}] */
+let DEFAULT_MODEL_ID='';   /* resolved from config.toml, not catalog isDefault */
+let MODEL_OPTIONS=[['default','model: default']];
+let modelRetryT=0;
 const WEBFM_CONFIG_URL = __CODEX_CONSOLE_WEBFM_URL__;
 let curEffort=localStorage.getItem('al_effort')||'xhigh';
+let activeModel='default';
 let showThink=false;
-let liveCCs=new Set(), recentData=[], folderData=[], favData=[], HOMEDIR='';
+let liveSessions=[], liveCCs=new Set(), recentData=[], folderData=[], favData=[], HOMEDIR='';
 const EDIT_TOOLS=new Set(['Edit','MultiEdit','Write','NotebookEdit','apply_patch']);
 const SKEY='al_session';
 
@@ -2658,6 +3489,30 @@ function addAsst(text){const s=atBottom();const d=document.createElement('div');
 function addThink(text){const s=atBottom();const d=document.createElement('div');d.className='think'+(showThink?'':' hide');d.dataset.t=1;
   d.textContent=text;stream.appendChild(d);if(s)scroll();}
 function addNotice(t){const d=document.createElement('div');d.className='notice';d.textContent=t;stream.appendChild(d);}
+function addStatus(ev){const s=atBottom(),st=ev.status||{},se=st.session||{},sv=st.service||{},g=st.git||{};
+  const ctx=st.context||{},u=st.usage||{};
+  const state=se.ended?'ended':(se.compacting?'compacting':(se.busy?'busy '+fmtSecs((se.turn_age||0)*1000):'ready'));
+  let ctxText=ctx.percentage!=null?(ctx.percentage+'% · '+fmtTok(ctx.totalTokens)+' / '+fmtTok(ctx.maxTokens)):'unknown';
+  if(ctx.reportedMaxTokens&&ctx.reportedMaxTokens!==ctx.maxTokens)ctxText+=' · reported '+fmtTok(ctx.reportedMaxTokens);
+  const win=(o)=>o&&o.utilization!=null?Math.round(o.utilization)+'%':'unknown';
+  const usageText='5h '+win(u.five_hour)+' · weekly '+win(u.seven_day);
+  const gitText=g.ok?(g.branch+'@'+(g.head||'?')+' · '+(g.dirty?('dirty '+g.file_count+' files'):'clean')):(g.error||'unknown');
+  const rows=[
+    ['state',state],['cwd',se.cwd||cwd||''],['thread',se.thread_id||'not started'],
+    ['model',(se.display_model||se.model||'default')+(se.effort?(' · '+se.effort):'')],
+    ['approval',(se.mode||'')+' · '+(se.approval_policy||'')+' · '+(se.sandbox||'')],
+    ['queue/viewers',(se.queued||0)+' queued · '+(se.viewers||0)+' viewer'+((se.viewers||0)===1?'':'s')],
+    ['context',ctxText],['limits',usageText],
+    ['service',(sv.bind||'')+':'+(sv.port||'')+' · auth '+(sv.auth?'on':'off')+' · recap '+(sv.recap?'on':'off')+
+      (sv.configured_context_window?(' · config ctx '+fmtTok(sv.configured_context_window)):'')],
+    ['git',gitText],
+  ];
+  const gf=g.files||[],files=gf.map(f=>(f.status||'?')+' '+(f.path||'')).join(' · ');
+  const d=document.createElement('div');d.className='localstatus';
+  d.innerHTML='<div class="sh">/status</div><div class="sg">'+rows.map(([k,v])=>
+    '<div><span class="sk">'+esc(k)+'</span><span class="sv">'+esc(v||'')+'</span></div>').join('')+
+    '</div>'+(files?'<div class="sf">'+esc(files)+(g.file_count>gf.length?' · …':'')+'</div>':'');
+  stream.appendChild(d);if(s)scroll();}
 function addRecap(t){const s=atBottom();const d=document.createElement('div');d.className='recap';
   d.innerHTML='<span class="rk">※ recap:</span> <span class="rt"></span>';
   d.querySelector('.rt').textContent=t;stream.appendChild(d);if(s)scroll();}
@@ -2855,6 +3710,7 @@ function route(ev){
   if(!running&&(ev.kind==='assistant_text'||ev.kind==='thinking'||ev.kind==='tool_use'))setBusy(true);
   if(ev.kind==='user_text')addUser(ev.text,ev.images);
   else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;curCC=ev.session_id||curCC;
+    if(!replaying)activeModel=(ev.model&&ev.model!=='default'?ev.model:(ev.display_model||activeModel));
     const modelName=ev.display_model||ev.model||'';if(modelName)setResolvedModel(modelName);
     addNotice('● session ready · '+modelName+(ev.effort?' · '+ev.effort+' effort':'')+' · '+(ev.cwd||''));}
   else if(ev.kind==='assistant_text')addAsst(ev.text);
@@ -2872,6 +3728,7 @@ function route(ev){
   else if(ev.kind==='queued')addQueued(ev);
   else if(ev.kind==='dequeued'||ev.kind==='unqueued')removeQueued(ev.qid);
   else if(ev.kind==='notice')addNotice(ev.text);
+  else if(ev.kind==='status')addStatus(ev);
   else if(ev.kind==='recap')addRecap(ev.text);
 }
 
@@ -2880,22 +3737,22 @@ function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;$('#d
   localStorage.removeItem(SKEY);if(msg)addNotice(msg);}
 function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);loadDraft(sid);
-    ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');setEffortPill(m.effort);renderCtx(null);statset('ready');
+    activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');setEffortPill(m.effort);renderCtx(null);statset('ready');
     addNotice('new session « '+(m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');reqList();loadPast();}
   else if(m.type==='attached'){clearUI();pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
-    ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setEffortPill(m.effort);renderCtx(m.ctx);renderUsage(m.usage);statset(m.ended?'ended':'ready');
+    activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setEffortPill(m.effort);renderCtx(m.ctx);renderUsage(m.usage);statset(m.ended?'ended':'ready');
     replaying=true;m.events.forEach(route);replaying=false;
     compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);loadDraft(sid);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
     else{ta.disabled=false;sendBtn.disabled=false;addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
     scroll();requestAnimationFrame(scroll);reqList();loadPast();}
-  else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;ready=false;setBusy(false);setCurname('');renderCtx(null);statset('idle');
+  else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;ready=false;activeModel='default';setBusy(false);setCurname('');renderCtx(null);statset('idle');
     addNotice('that session is no longer running — pick it under “Resume from disk”, or ＋ New.');reqList();loadPast();}
   else if(m.type==='events')m.events.forEach(route);
   else if(m.type==='stderr')addErr(m.text);
   else if(m.type==='error'){pendingStart=false;addErr('⚠ '+m.error);}
   else if(m.type==='exit'){if(!pendingStart){markEnded('session process exited (code '+m.code+')');setCurname('');}reqList();loadPast();}
-  else if(m.type==='ended'){dropDraft(m.id);if(m.id&&m.id===sid){sid=null;setCurname('');markEnded('session ended');}reqList();loadPast();}
+  else if(m.type==='ended'){dropDraft(m.id);if(m.id&&m.id===sid){sid=null;activeModel='default';setCurname('');markEnded('session ended');}reqList();loadPast();}
   else if(m.type==='resumable_deleted'){addNotice(m.ok?'🗑 session moved to trash':('delete failed: '+(m.error||'?')));loadPast();}
   else if(m.type==='renamed'){if(m.ok){if(m.cc&&m.cc===curCC&&m.name)setCurname(m.name);addNotice('✎ renamed');reqList();loadPast();}else addNotice('rename failed');}
   else if(m.type==='sessions')renderLive(m.sessions);
@@ -2932,7 +3789,10 @@ function renderCtx(c){const el=$('#ctx');
   const pct=Math.round(c.percentage);
   el.className='ctx';el.style.display='inline-flex';
   el.innerHTML='<span class="ulabel">Context</span>'+cellBar(pct)+'<span>'+pct+'%</span>';
-  el.title='context '+(c.totalTokens||'?')+' / '+(c.maxTokens||'?')+' tokens ('+pct+'%)'+(c.model?' · '+c.model:'');
+  let title='context '+(c.totalTokens||'?')+' / '+(c.maxTokens||'?')+' tokens ('+pct+'%)'+(c.model?' · '+c.model:'');
+  if(c.configuredMaxTokens&&c.configuredMaxTokens!==c.reportedMaxTokens)title+=' · configured '+fmtTok(c.configuredMaxTokens);
+  if(c.reportedMaxTokens&&c.reportedMaxTokens!==c.maxTokens)title+=' · reported '+fmtTok(c.reportedMaxTokens);
+  el.title=title;
   setResolvedModel(c.model, c.maxTokens);}
 function fmtDur(ms){if(ms==null||ms<=0)return '0m';const m=Math.floor(ms/60000),h=Math.floor(m/60);
   return h>0?(h+'h '+(m%60)+'m'):(m+'m');}
@@ -2950,11 +3810,51 @@ function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour,w=u&&u.seven
       t+=(t?'\n':'')+lbl+': '+Math.round(o.utilization)+'% used'+(rem?(' · resets in '+rem):'');}});
   el.title=t;}
 function loadUsage(){fetch('api/usage').then(r=>r.json()).then(j=>renderUsage(j.usage)).catch(()=>{});}
-/* reasoning effort: a clickable pill on the right of the status row. Codex effort
-   is a per-turn parameter, so a change applies to the next turn (no relaunch);
-   the choice is also remembered for new sessions. */
+/* The installed Codex app-server is the model source of truth. Both model
+   pickers consume this shared catalog, so newly released/account-enabled models
+   appear without editing the console. `default` remains a universal offline
+   fallback; saved/current retired models are retained as synthetic options. */
+function rebuildModelOptions(){const d=(DEFAULT_MODEL_ID&&MODELS.find(m=>m.id===DEFAULT_MODEL_ID))||
+    (!DEFAULT_MODEL_ID&&MODELS.find(m=>m.isDefault));
+  const defaultName=(d&&d.name)||DEFAULT_MODEL_ID;
+  MODEL_OPTIONS=[['default','model: default'+(defaultName?(' · '+defaultName):'')],
+    ...MODELS.map(m=>[m.id,m.name||m.id])];}
+function modelOptionsFor(current){const opts=MODEL_OPTIONS.map(x=>x.slice());
+  if(current&&!opts.some(x=>x[0]===current))opts.push([current,current+' (not in catalog)']);
+  return opts;}
+function rebuildModelPicker(){const sel=$('#model');if(!sel)return;
+  const want=localStorage.getItem('al_model')||sel.value||'default';
+  rebuildModelOptions();const known=MODEL_OPTIONS.some(x=>x[0]===want),catalogReady=MODELS.length>0;
+  const opts=modelOptionsFor(catalogReady&&!known?'':want);sel.innerHTML='';
+  opts.forEach(([v,t])=>{const o=document.createElement('option');o.value=v;o.textContent=t;
+    const meta=MODELS.find(m=>m.id===v);if(meta&&meta.description)o.title=meta.description;sel.appendChild(o);});
+  if(catalogReady&&!known){const stale=document.createElement('option');stale.value=want;
+    stale.textContent=want+' (saved; unavailable)';stale.disabled=true;sel.appendChild(stale);
+    sel.value='default';localStorage.setItem('al_model','default');}
+  else if(opts.some(x=>x[0]===want))sel.value=want;}
+function retryModelLoad(){if(MODELS.length)return;clearTimeout(modelRetryT);
+  modelRetryT=setTimeout(loadModels,31000);}
+function loadModels(force){return fetch('api/models'+(force?'?fresh=1':''),{cache:'no-store'}).then(r=>r.json()).then(j=>{
+  if(j.models&&j.models.length){clearTimeout(modelRetryT);DEFAULT_MODEL_ID=j.defaultModel||'';MODELS=j.models;rebuildModelPicker();
+    if(!sid||!ready){curEffort=effortForModel(curEffort,$('#model').value);
+      localStorage.setItem('al_effort',curEffort);setEffortPill(curEffort);}}
+  else retryModelLoad();}).catch(retryModelLoad);}
+/* Per-model effort capabilities come from model/list. The fallback is used only
+   before that catalog arrives (or for a retired/custom model absent from it). */
+function modelMeta(value){if(value&&value!=='default')return MODELS.find(m=>m.id===value)||null;
+  if(DEFAULT_MODEL_ID)return MODELS.find(m=>m.id===DEFAULT_MODEL_ID)||null;
+  return MODELS.find(m=>m.isDefault)||null;}
+function effortOptionsFor(modelValue){const m=modelMeta(modelValue);
+  const values=m&&Array.isArray(m.reasoningEfforts)?m.reasoningEfforts.filter(Boolean):[];
+  return values.length?values:FALLBACK_EFFORTS;}
+function effortForModel(e,modelValue){const opts=effortOptionsFor(modelValue);if(opts.includes(e))return e;
+  const m=modelMeta(modelValue),d=m&&m.defaultReasoningEffort;
+  if(d&&opts.includes(d))return d;if(opts.includes('xhigh'))return 'xhigh';return opts[0]||'xhigh';}
+function currentEffortModel(){return sid&&ready?activeModel:($('#model').value||'default');}
+/* reasoning effort is per-turn. A change applies to the next turn and is also
+   remembered as the starting preference for future sessions. */
 function setEffortPill(e){if(e)curEffort=e;const el=$('#effort');if(el)el.textContent='🧠 '+curEffort;}
-function setEffort(e){if(!EFFORTS.includes(e)||e===curEffort)return;
+function setEffort(e){if(!effortOptionsFor(currentEffortModel()).includes(e)||e===curEffort)return;
   curEffort=e;localStorage.setItem('al_effort',e);setEffortPill(e);
   if(sid&&ready&&ws&&ws.readyState===1)wsSend({type:'set_effort',effort:e});}   /* applies next turn */
 /* show what the live session's model actually resolves to in the picker's default
@@ -2993,20 +3893,32 @@ function openCardMenu(anchor,items){const m=$('#cardMenu');m.innerHTML='';m._anc
   if(top+mh>window.innerHeight-6)top=Math.max(6,r.top-mh-4);
   m.style.left=left+'px';m.style.top=top+'px';}
 /* ⚙ Configure: change a live session's model / permission in place (hot-swap by
-   id — works for any live session) + effort. Effort is routed through the pill's
-   setEffort() so this control and the 🧠 pill stay in lockstep. Reuses the
-   #cardMenu popover shell (positioning + outside-click close). */
+   id — works for any live session) + model-aware effort. The attached session's
+   🧠 pill stays in lockstep; background cards update only their target session.
+   Reuses the #cardMenu popover shell (positioning + outside-click close). */
 function openConfigure(s,anchor){const m=$('#cardMenu');m.innerHTML='';m._anchor=anchor;
-  const mkSel=(opts,cur,fn)=>{const o=document.createElement('select');o.className='cfgsel';
-    opts.forEach(([v,t])=>{const x=document.createElement('option');x.value=v;x.textContent=t;if(v===cur)x.selected=true;o.appendChild(x);});
-    o.onchange=()=>fn(o.value);return o;};
+  const mkSel=(opts,cur)=>{const o=document.createElement('select');o.className='cfgsel';
+    opts.forEach(([v,t])=>{const x=document.createElement('option');x.value=v;x.textContent=t;if(v===cur)x.selected=true;o.appendChild(x);});return o;};
+  const refill=(o,opts,cur)=>{o.innerHTML='';opts.forEach(v=>{const x=document.createElement('option');
+    x.value=v;x.textContent=v;if(v===cur)x.selected=true;o.appendChild(x);});};
   const row=(label,sel)=>{const w=document.createElement('div');w.className='cfgrow';
     const l=document.createElement('span');l.textContent=label;w.appendChild(l);w.appendChild(sel);m.appendChild(w);};
-  row('Model',mkSel(MODEL_OPTIONS,(s.model&&s.model!=='default'?s.model:s.display_model)||MODEL_OPTIONS[0][0],
-    v=>{wsSend({type:'configure',id:s.id,model:v});setTimeout(reqList,200);}));
-  row('Approval',mkSel([['full-access','🔓 Full access'],['on-request','🔐 Approve'],['auto','⚡ Auto (sandbox)'],['read-only','👁 Read-only']],s.mode||'full-access',
-    v=>{wsSend({type:'configure',id:s.id,mode:v});setTimeout(reqList,200);}));
-  row('Effort',mkSel(EFFORTS.map(e=>[e,e]),curEffort,v=>{setEffort(v);closeCardMenu();}));
+  const currentModel=s.model||'default';
+  const initialEffortModel=currentModel!=='default'?currentModel:(s.display_model||currentModel);
+  const currentEffort=effortForModel(s.effort||'',initialEffortModel);
+  const modelSel=mkSel(modelOptionsFor(currentModel),currentModel);
+  const approvalSel=mkSel([['full-access','🔓 Full access'],['on-request','🔐 Approve'],['auto','⚡ Auto (sandbox)'],['read-only','👁 Read-only']],s.mode||'full-access');
+  const effortSel=mkSel(effortOptionsFor(initialEffortModel).map(e=>[e,e]),currentEffort);
+  modelSel.onchange=()=>{const model=modelSel.value,effort=effortForModel(effortSel.value,model);
+    refill(effortSel,effortOptionsFor(model),effort);
+    wsSend({type:'configure',id:s.id,model:model,effort:effort});
+    if(s.id===sid){activeModel=model;curEffort=effort;localStorage.setItem('al_effort',effort);setEffortPill(effort);}
+    setTimeout(reqList,200);};
+  approvalSel.onchange=()=>{wsSend({type:'configure',id:s.id,mode:approvalSel.value});setTimeout(reqList,200);};
+  effortSel.onchange=()=>{const effort=effortSel.value;wsSend({type:'configure',id:s.id,effort:effort});
+    if(s.id===sid){curEffort=effort;localStorage.setItem('al_effort',effort);setEffortPill(effort);}
+    setTimeout(reqList,200);closeCardMenu();};
+  row('Model',modelSel);row('Approval',approvalSel);row('Effort',effortSel);
   m.classList.add('on');
   const r=anchor.getBoundingClientRect(),mw=m.offsetWidth,mh=m.offsetHeight;
   let left,top;
@@ -3032,7 +3944,9 @@ function applySecCollapse(){let c={};try{c=JSON.parse(localStorage.getItem(SECKE
   ['secFav','secRecent','secFolder'].forEach(id=>{const el=$('#'+id);if(el)el.classList.toggle('collapsed',!!c[id]);});}
 
 function renderLive(list){const box=$('#liveList');
-  liveCCs=new Set(list.map(s=>s.cc).filter(Boolean));
+  liveSessions=list||[];
+  list=liveSessions;
+  liveCCs=new Set(liveSessions.map(s=>s.cc).filter(Boolean));
   $('#liveN').textContent=list.length;
   if(!list.length){box.innerHTML='<div class="sb-empty">none running — pick a project, ＋ New</div>';}
   else{box.innerHTML='';list.forEach(s=>{
@@ -3049,7 +3963,8 @@ function renderLive(list){const box=$('#liveList');
     r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();const kebab=ev.currentTarget;const items=[
       {label:'⚙ Configure',fn:()=>openConfigure(s,kebab)},
       {label:'✎ Rename',fn:()=>renameSession(s.cc,s.title||s.name)}];
-      if(s.cc)items.push({label:isFav(s.cc)?'★ Unfavorite':'☆ Favorite',fn:()=>toggleFav(s)});
+      if(s.cc){items.push({label:'⤓ Export transcript',fn:()=>exportSession(s.cc)});
+        items.push({label:isFav(s.cc)?'★ Unfavorite':'☆ Favorite',fn:()=>toggleFav(s)});}
       items.push({label:'✕ End session',danger:true,fn:()=>endSessionById(s.id,s.name)});
       toggleCardMenu(ev.currentTarget,items);};
     box.appendChild(r);});}
@@ -3086,6 +4001,7 @@ function pastRow(s,fav){const r=document.createElement('div');r.className='srow'
   r.querySelector('.smeta').onclick=()=>resumeSession(s);
   r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();toggleCardMenu(ev.currentTarget,[
     {label:'✎ Rename',fn:()=>renameSession(s.cc,s.title)},
+    {label:'⤓ Export transcript',fn:()=>exportSession(s.cc)},
     {label:fav?'★ Unfavorite':'☆ Favorite',fn:()=>toggleFav(s)},
     {label:'🗑 Delete (to trash)',danger:true,fn:()=>delResumable(s)}]);};
   return r;}
@@ -3103,6 +4019,140 @@ function delResumable(s){
   recentData=(recentData||[]).filter(x=>x.cc!==s.cc);
   folderData=(folderData||[]).filter(x=>x.cc!==s.cc);
   renderPast();}
+
+function exportSession(cc){
+  if(!cc){alert('This session has no transcript yet.');return;}
+  const a=document.createElement('a');a.href='api/export?cc='+encodeURIComponent(cc);
+  a.download=cc+'.jsonl';document.body.appendChild(a);a.click();a.remove();}
+
+let srchAbort=null, srchT=0, srchSeq=0, thState=null;
+function srchOpen(){return !$('#srch').hasAttribute('hidden');}
+function openSearch(){const w=$('#srch');w.removeAttribute('hidden');showResults();
+  const q=$('#srchq');q.focus();q.select();}
+function closeSearch(){$('#srch').setAttribute('hidden','');
+  if(srchAbort){srchAbort.abort();srchAbort=null;}}
+function searchFolder(){
+  const s=(liveSessions||[]).find(x=>x.id===sid);
+  return (s&&s.cwd)||currentFolder()||'';}
+function srchScopeArgs(){const sc=$('#srchscope').value;
+  if(sc==='session')return curCC?'&scope=session&cc='+encodeURIComponent(curCC):'&scope=all';
+  if(sc==='project'){const f=searchFolder();
+    return f?'&scope=project&cwd='+encodeURIComponent(f):'&scope=all';}
+  return '&scope=all';}
+function runSearch(){
+  const q=$('#srchq').value.trim(),res=$('#srchres'),meta=$('#srchmeta');
+  showResults();
+  if(srchAbort){srchAbort.abort();srchAbort=null;}
+  const need=/[㐀-鿿぀-ヿ가-힯]/.test(q)?1:2;
+  if(q.length<need){res.innerHTML='';
+    meta.textContent='Type at least '+need+' character'+(need===1?'':'s')+'.';return;}
+  const seq=++srchSeq;
+  meta.textContent='searching...';
+  srchAbort=new AbortController();
+  const t0=Date.now();
+  fetch('api/search?q='+encodeURIComponent(q)+srchScopeArgs(),{signal:srchAbort.signal})
+    .then(r=>r.json()).then(j=>{
+      if(seq!==srchSeq)return;
+      const list=j.results||[];
+      meta.textContent=list.length
+        ? list.length+(j.more?'+':'')+' match'+(list.length===1?'':'es')+' · '+((Date.now()-t0)/1000).toFixed(1)+'s'
+            +(j.more?' · showing the 200 most recent':'')
+        : (j.note||j.error||'no matches');
+      res.innerHTML='';
+      list.forEach(h=>{
+        const d=document.createElement('div');d.className='sres';
+        const proj=(h.cwd||'').split('/').slice(-2).join('/');
+        d.innerHTML='<div class="sh1"><b>'+esc(h.title||'session')+'</b>'+
+          '<span class="role">'+esc(h.role)+'</span><span>'+esc(proj)+'</span>'+
+          '<span>'+esc((h.ts||'').slice(0,16).replace('T',' '))+'</span></div>'+
+          '<div class="sh2">'+esc(h.pre)+'<mark>'+esc(h.hit)+'</mark>'+esc(h.post)+'</div>';
+        d.onclick=()=>openThread(h);
+        res.appendChild(d);});
+    }).catch(e=>{if(e.name!=='AbortError'&&seq===srchSeq)meta.textContent='search failed: '+e;});}
+function showResults(){$('#srchthread').setAttribute('hidden','');
+  $('#srchres').removeAttribute('hidden');}
+function highlightInto(el,txt,q){
+  el.textContent=txt;
+  if(!q)return;
+  const i=txt.toLowerCase().indexOf(q.toLowerCase());
+  if(i<0)return;
+  el.textContent='';
+  el.appendChild(document.createTextNode(txt.slice(0,i)));
+  const m=document.createElement('mark');m.textContent=txt.slice(i,i+q.length);
+  el.appendChild(m);
+  el.appendChild(document.createTextNode(txt.slice(i+q.length)));}
+function renderThread(j,q,targetMid){
+  const body=$('#thbody');body.innerHTML='';
+  $('.thtitle').textContent=(j.title||'session')+' · '+(j.cwd||'').split('/').slice(-2).join('/')+
+    ' · '+(j.total||0)+' messages';
+  if(!j.atStart){const b=document.createElement('button');b.className='thmore';
+    b.textContent='↑ load 60 earlier';
+    b.onclick=()=>loadThread(thState.mid,thState.before+60,thState.after,q,targetMid);
+    body.appendChild(b);}
+  else body.insertAdjacentHTML('beforeend','<div class="thend">— start of conversation —</div>');
+  let tgt=null;
+  (j.messages||[]).forEach(m=>{
+    const d=document.createElement('div');
+    d.className='thmsg '+m.role+(m.mid===targetMid?' target':'');
+    d.innerHTML='<div class="thr">'+esc(m.role)+' · '+esc((m.ts||'').slice(0,16).replace('T',' '))+'</div>';
+    const t=document.createElement('div');t.className='tht';
+    highlightInto(t,m.txt||'',m.mid===targetMid?q:'');
+    d.appendChild(t);body.appendChild(d);
+    if(m.mid===targetMid)tgt=d;});
+  if(!j.atEnd){const b=document.createElement('button');b.className='thmore';
+    b.textContent='↓ load 60 later';
+    b.onclick=()=>loadThread(thState.mid,thState.before,thState.after+60,q,targetMid);
+    body.appendChild(b);}
+  else body.insertAdjacentHTML('beforeend','<div class="thend">— end of conversation —</div>');
+  if(tgt)tgt.scrollIntoView({block:'center'});}
+function loadThread(mid,before,after,q,targetMid){
+  thState={mid:mid,before:before,after:after,q:q};
+  $('#thbody').innerHTML='<div class="thend">loading...</div>';
+  fetch('api/thread?mid='+encodeURIComponent(mid)+'&before='+before+'&after='+after)
+    .then(r=>r.json()).then(j=>{
+      if(j.error){$('#thbody').innerHTML='<div class="thend">'+esc(j.error)+'</div>';return;}
+      thState.cc=j.cc;thState.cwd=j.cwd;renderThread(j,q,targetMid);})
+    .catch(e=>{$('#thbody').innerHTML='<div class="thend">failed: '+esc(String(e))+'</div>';});}
+function openThread(h){
+  $('#srchres').setAttribute('hidden','');
+  $('#srchthread').removeAttribute('hidden');
+  loadThread(h.mid,40,40,$('#srchq').value.trim(),h.mid);}
+function wireSearch(){
+  const q=$('#srchq');if(!q)return;
+  $('#thback').onclick=showResults;
+  $('#thopen').onclick=()=>{const s=thState;if(!s||!s.cc)return;
+    closeSearch();resumeSession({cc:s.cc,cwd:s.cwd});};
+  q.addEventListener('input',()=>{clearTimeout(srchT);srchT=setTimeout(runSearch,260);});
+  q.addEventListener('keydown',e=>{if(e.key==='Enter'){clearTimeout(srchT);runSearch();}});
+  $('#srchscope').onchange=runSearch;
+  $('#srchx').onclick=closeSearch;
+  const ob=$('#srchopen');if(ob)ob.onclick=()=>{openSearch();if(window.innerWidth<=860)closeSidebar();};
+  $('#srch').onclick=e=>{if(e.target===$('#srch'))closeSearch();};
+  document.addEventListener('keydown',e=>{
+    if((e.ctrlKey||e.metaKey)&&(e.key==='k'||e.key==='K')){e.preventDefault();
+      srchOpen()?closeSearch():openSearch();return;}
+    if(e.key==='Escape'&&srchOpen()){e.preventDefault();e.stopPropagation();closeSearch();}
+  },true);}
+function impMsg(t,bad){const el=$('#impmsg');if(!el)return;
+  el.textContent=t||'';el.classList.toggle('bad',!!bad);
+  if(t&&!bad)setTimeout(()=>{if(el.textContent===t)el.textContent='';},6000);}
+function importTarget(){const p=$('#project').value;
+  return (($('#cwd').value||'').trim())||(p==='__custom__'?'':(p||''));}
+function wireImport(){
+  const btn=$('#impbtn'),inp=$('#impfile');if(!btn||!inp)return;
+  btn.onclick=()=>{if(!importTarget()){impMsg('pick a project folder above first',true);return;}
+    inp.click();};
+  inp.onchange=()=>{const f=inp.files&&inp.files[0];if(!f)return;
+    const dir=importTarget();
+    if(!dir){impMsg('pick a project folder above first',true);inp.value='';return;}
+    const fd=new FormData();fd.append('file',f);fd.append('cwd',dir);
+    impMsg('importing '+f.name+' ...');
+    fetch('api/import',{method:'POST',body:fd}).then(r=>r.json().then(j=>({ok:r.ok,j})))
+      .then(({ok,j})=>{
+        if(ok&&j.ok){impMsg('imported · resume it from the list below');loadPast();}
+        else impMsg(((j&&j.error)||'import failed'),true);})
+      .catch(e=>impMsg(String(e),true))
+      .finally(()=>{inp.value='';});};}
 
 function renderPast(){
   const favs=getFavs(),favCC=new Set(favs.map(f=>f.cc));
@@ -3153,8 +4203,10 @@ function resumeSession(s){if(!s||!s.cc)return;saveDraft();clearUI();pendingStart
 function newSession(){const proj=$('#project').value;const dir=proj==='__custom__'?$('#cwd').value.trim():proj;
   if(!dir){addErr('pick a project directory first');return;}
   /* keep any current session alive in the background — just spin up another */
+  const model=$('#model').value,effort=effortForModel(curEffort,model);
+  curEffort=effort;localStorage.setItem('al_effort',effort);setEffortPill(effort);
   saveDraft();clearUI();pendingStart=true;sid=null;
-  const start=()=>wsSend({type:'start',cwd:dir,model:$('#model').value,mode:$('#mode').value,effort:curEffort});
+  const start=()=>wsSend({type:'start',cwd:dir,model:model,mode:$('#mode').value,effort:effort});
   if(ws&&ws.readyState===1)start();else openWs(start);statset('starting…');
   if(window.innerWidth<=860)closeSidebar();}
 function endSessionById(id,name){if(!id)return;
@@ -3175,7 +4227,9 @@ function addImageFile(file){
   const r=new FileReader();
   r.onload=()=>{const url=''+r.result;pendingImages.push({media_type:file.type,data:url.split(',')[1]||'',url:url});renderAttach();};
   r.readAsDataURL(file);}
-function handlePaste(e){const items=(e.clipboardData||{}).items||[];let got=false;
+function handlePaste(e){const cd=e.clipboardData;if(!cd)return;
+  if((cd.getData('text/plain')||'').length>0)return;
+  const items=cd.items||[];let got=false;
   for(const it of items){if(it.kind==='file'&&it.type.indexOf('image/')===0){const f=it.getAsFile();if(f){addImageFile(f);got=true;}}}
   if(got)e.preventDefault();}
 /* per-session composer drafts — each session keeps its own unsent text (+ images),
@@ -3263,7 +4317,7 @@ window.addEventListener('paste',handlePaste);
 sendBtn.onclick=sendMsg;
 $('#stop').onclick=doInterrupt;
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'&&running&&!$('#cwdac').classList.contains('on')){e.preventDefault();doInterrupt();}});
+  if(e.key==='Escape'&&running&&!srchOpen()&&!$('#cwdac').classList.contains('on')){e.preventDefault();doInterrupt();}});
 $('#newbtn').onclick=newSession;
 /* color theme: apply + persist (the <head> script already set it pre-paint) */
 function applyTheme(t){if(t&&t!=='dark')document.documentElement.setAttribute('data-theme',t);
@@ -3273,9 +4327,9 @@ function applyTheme(t){if(t&&t!=='dark')document.documentElement.setAttribute('d
   applyTheme(t);})();
 $('#navtoggle').onclick=toggleSidebar;
 $('#sb-backdrop').onclick=closeSidebar;
-/* effort pill: click to pick thinking depth (low/medium/high/xhigh/max) */
+/* effort pill: model/list decides which depths this model supports. */
 $('#effort').onclick=ev=>{ev.stopPropagation();toggleCardMenu(ev.currentTarget,
-  EFFORTS.map(e=>({label:(e===curEffort?'● ':'○ ')+e,fn:()=>setEffort(e)})));};
+  effortOptionsFor(currentEffortModel()).map(e=>({label:(e===curEffort?'● ':'○ ')+e,fn:()=>setEffort(e)})));};
 setEffortPill(curEffort);
 /* desktop: drag the sidebar's right edge to resize (clamped + persisted) */
 const SBW_KEY='al_sbw',SBW_MIN=200,SBW_MAX=560;
@@ -3317,11 +4371,12 @@ window.addEventListener('scroll',closeCardMenu,true);
 /* model/mode pickers set the NEW-session default only (persisted). A running
    session is reconfigured per-session via the ⚙ Configure menu, so editing the
    new-session default no longer disturbs the current session. */
-$('#model').onchange=()=>localStorage.setItem('al_model',$('#model').value);
+$('#model').onchange=()=>{const model=$('#model').value;localStorage.setItem('al_model',model);
+  if(!sid||!ready){curEffort=effortForModel(curEffort,model);
+    localStorage.setItem('al_effort',curEffort);setEffortPill(curEffort);}};
 $('#mode').onchange=()=>localStorage.setItem('al_mode',$('#mode').value);
-{const sm=localStorage.getItem('al_model');if(sm&&sm!=='default'){const o=$('#model');for(const x of o.options)if(x.value===sm){o.value=sm;break;}}
- else if(sm==='default')localStorage.setItem('al_model',$('#model').value);
- const smd=localStorage.getItem('al_mode');if(smd){const o=$('#mode');for(const x of o.options)if(x.value===smd){o.value=smd;break;}}}
+rebuildModelPicker();   /* restore a saved model even before the live catalog arrives */
+{const smd=localStorage.getItem('al_mode');if(smd){const o=$('#mode');for(const x of o.options)if(x.value===smd){o.value=smd;break;}}}
 $('#tabEdits').onclick=()=>showTab('edits');
 $('#tabGit').onclick=()=>showTab('git');
 $('#dclose').onclick=()=>$('#drawer').classList.remove('open');
@@ -3366,6 +4421,13 @@ setInterval(loadPast,30000);
 loadPast();
 loadUsage();
 setInterval(loadUsage,60000);
+loadModels();
+setInterval(loadModels,300000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)loadModels();});
+wireImport();
+wireSearch();
+$('#mrefresh').onclick=()=>{const b=$('#mrefresh');if(b.classList.contains('busy'))return;
+  b.classList.add('busy');loadModels(true).finally(()=>b.classList.remove('busy'));};
 openWs();
 </script>
 </body>
@@ -3395,12 +4457,18 @@ def main():
         (r"/api/dircomplete", DirCompleteHandler),
         (r"/api/diff", DiffHandler),
         (r"/api/usage", UsageHandler),
+        (r"/api/models", ModelsHandler),
+        (r"/api/export", ExportHandler),
+        (r"/api/import", ImportHandler),
+        (r"/api/search", SearchHandler),
+        (r"/api/thread", ThreadHandler),
         (r"/ws/chat", ChatSocket),
         (r"/static/(.*)", tornado.web.StaticFileHandler,
          {"path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")}),
     ])
     loopback = BIND in ("127.0.0.1", "localhost", "::1")
-    app.listen(PORT, address=BIND)
+    app.listen(PORT, address=BIND, max_buffer_size=IMPORT_MAX, max_body_size=IMPORT_MAX)
+    tornado.ioloop.IOLoop.current().run_in_executor(None, reindex)
     if RECAP_ENABLED:   # idle-session recap sweep (every 30s)
         tornado.ioloop.PeriodicCallback(_recap_tick, 30000).start()
     print("Codex Console on http://%s:%d" % (BIND, PORT))

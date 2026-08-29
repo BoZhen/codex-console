@@ -22,14 +22,26 @@ a Codex-style chat where code and conversation stay visually separated.
   Each card has a `⋮` menu: rename, favorite, delete, end.
 - **Resumable sessions** — reopen a project and pick up a previous Codex thread
   (rollouts under `~/.codex/sessions` restore history and the right `cwd`).
+- **History search** — `Ctrl/Cmd+K` searches indexed Codex history across all
+  sessions, this folder, or the current conversation; hits open in a read-only
+  transcript viewer before you explicitly resume.
+- **Transcript portability** — export a raw rollout `.jsonl` from any session and
+  import one from another machine into the local Codex sessions tree.
 - **Interactive approvals** — when the approval policy is `🔐 Approve`, each
   shell command / file change surfaces a per-action prompt (**Approve** /
   **Approve & don't ask again this session** → `acceptForSession` / **Deny**).
   Tool user-input questions render as in-browser cards.
 - **Message queue / steering** — type while the agent is busy; the message is
   injected into the running turn at the next tool boundary (`turn/steer`).
-- **Reasoning effort** — a `🧠` pill (minimal / low / medium / high / xhigh).
-  Codex effort is per-turn, so a change applies on the next turn (no relaunch).
+- **Local slash commands** — `/compact` compacts the Codex thread and `/status`
+  shows session, model, service, usage, and git state without sending a turn.
+- **Model-aware reasoning effort** — the `🧠` pill and session-card picker use
+  each model's live `reasoningEfforts` catalog (including `max` / `ultra` where
+  supported). Changes apply on the next turn without relaunching.
+- **Live model catalog** — the new-session picker and each session card read
+  `model/list` from the installed Codex app-server, refresh automatically or via
+  the `↻` button, and pick up newly released or account-enabled models without
+  frontend changes.
 - **Approval & sandbox presets** — a single picker maps to codex's
   `approvalPolicy` × `sandbox`: 🔐 Approve, ⚡ Auto (sandbox), 👁 Read-only,
   🔓 Full access.
@@ -59,6 +71,7 @@ Open `http://<host>:7704`, pick a project dir, and start chatting.
 | `CODEX_CONSOLE_AUTH` | *(disabled)* | optional HTTP Basic Auth `user:pass` |
 | `CODEX_CONSOLE_CODEX` | *(auto)* | path to the codex binary (else auto-resolved) |
 | `CODEX_CONSOLE_WEBFM_URL` | same host, port `7701` | web-file-manager base URL for local file links |
+| `CODEX_CONSOLE_IMPORT_MAX_MB` | `1024` | max upload size for transcript import |
 | `CODEX_CONSOLE_RECAP` | `0` | enable idle away-summary recap cards |
 | `CODEX_CONSOLE_RECAP_IDLE_SEC` | `300` | idle seconds before a recap is generated |
 | `CODEX_CONSOLE_RECAP_MODEL` | `gpt-5.3-codex-spark` | model used for recap generation |
@@ -88,6 +101,8 @@ background process (with a minimal `PATH`) launches it. So the console
 - [KaTeX](https://katex.org/) is vendored under `static/katex/` (MIT) for offline
   math rendering.
 - Per-session prefs/names live under `~/.codex/console-*.json`.
+- The history-search index lives under `~/.cache/codex-console/history.db`; it
+  stores conversation text and tool inputs, not full tool outputs.
 
 ## License
 
