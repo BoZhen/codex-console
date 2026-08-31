@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -28,7 +29,7 @@ class StatusCommandTests(unittest.TestCase):
         self.assertTrue(status["service"]["auth"])
         self.assertNotIn("example:not-real", json.dumps(status))
 
-    def test_context_uses_configured_window_when_larger_than_reported(self):
+    def test_context_uses_reported_window_for_actionable_percentage(self):
         session = codex_console.ChatSession(
             "sid", os.getcwd(), "default", "full-access", effort="xhigh")
         emitted = []
@@ -41,12 +42,63 @@ class StatusCommandTests(unittest.TestCase):
                 "modelContextWindow": 353_400,
             })
 
-        self.assertEqual(session.ctx["maxTokens"], 1_000_000)
+        self.assertEqual(session.ctx["maxTokens"], 353_400)
         self.assertEqual(session.ctx["reportedMaxTokens"], 353_400)
         self.assertEqual(session.ctx["configuredMaxTokens"], 1_000_000)
-        self.assertEqual(session.ctx["percentage"], 25.0)
+        self.assertEqual(session.ctx["percentage"], 70.7)
         context_events = [event for event in emitted if event.get("type") == "context"]
         self.assertEqual(context_events[-1]["ctx"], session.ctx)
+
+    def test_token_usage_accepts_snake_case_appserver_fields(self):
+        session = codex_console.ChatSession(
+            "sid", os.getcwd(), "default", "full-access", effort="xhigh")
+        emitted = []
+        session._emit = lambda event: emitted.append(event)
+
+        session._on_token_usage({
+            "last_token_usage": {
+                "input_tokens": 25_000,
+                "cached_input_tokens": 20_000,
+                "output_tokens": 400,
+            },
+            "model_context_window": 100_000,
+        })
+
+        self.assertEqual(session.ctx["maxTokens"], 100_000)
+        self.assertEqual(session.ctx["percentage"], 25.0)
+        self.assertTrue(any(event.get("type") == "tokens" for event in emitted))
+
+    def test_resume_metadata_prefers_actual_turn_context_model(self):
+        rows = [
+            {"type": "turn_context", "payload": {"model": "gpt-5.5", "effort": "xhigh"}},
+            {"type": "event_msg", "payload": {
+                "type": "token_count",
+                "info": {
+                    "model_context_window": 258_400,
+                    "last_token_usage": {"input_tokens": 129_200},
+                },
+            }},
+        ]
+        tmp = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False)
+        try:
+            with tmp:
+                for row in rows:
+                    tmp.write(json.dumps(row) + "\n")
+            with mock.patch.object(codex_console, "find_transcript",
+                                   return_value=tmp.name):
+                with mock.patch.object(codex_console, "_configured_context_window",
+                                       return_value=1_000_000):
+                    session = codex_console.ChatSession(
+                        "sid", os.getcwd(), "default", "full-access",
+                        resume_cc="thread-1", effort="xhigh")
+                    session.preload()
+        finally:
+            os.unlink(tmp.name)
+
+        self.assertEqual(session.display_model, "gpt-5.5")
+        self.assertEqual(session.ctx["maxTokens"], 258_400)
+        self.assertEqual(session.ctx["model"], "gpt-5.5")
+        self.assertEqual(session.ctx["percentage"], 50.0)
 
 
 if __name__ == "__main__":

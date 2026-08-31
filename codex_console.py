@@ -22,6 +22,7 @@ import os
 import queue
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -351,7 +352,7 @@ _READ_SLICE_PIPE_RE = re.compile(
 _CONFIG_MODEL_RE = re.compile(r"^\s*model\s*=\s*(['\"])(.*?)\1\s*(?:#.*)?$")
 _CONFIG_CONTEXT_RE = re.compile(r"^\s*model_context_window\s*=\s*([0-9_]+)\s*(?:#.*)?$")
 def _codex_is_read_cmd(command):
-    c = _txt(command).strip()
+    c = _shell_command_text(command).strip()
     if not c:
         return False
     if "&&" in c:
@@ -362,15 +363,47 @@ def _codex_is_read_cmd(command):
     return bool((_READ_RE.match(c) or _SED_READ_RE.match(c))
                 and not re.search(r"[|;&]|\$\(|`|>|<", c))
 
-def _codex_cmd(command):
-    """→ (tool, shown_command). tool is 'Read' for a simple single-file read,
-    else 'shell'; shown_command is the unwrapped inner command."""
-    c = _txt(command).strip()
+def _shell_words(command):
+    if isinstance(command, list):
+        return [str(x) for x in command]
+    return None
+
+
+def _shell_command_text(command):
+    words = _shell_words(command)
+    if not words:
+        return _txt(command)
+    if (len(words) >= 3 and os.path.basename(words[0]) in ("bash", "sh", "zsh", "dash")
+            and words[1] in ("-c", "-lc")):
+        return " ".join(words[2:])
+    return " ".join(shlex.quote(w) for w in words)
+
+
+def _codex_cmd(command, actions=None):
+    """→ (tool, shown_command). Prefer app-server commandActions when present.
+
+    Modern app-server already parses shell commands into semantic actions. Use that
+    instead of guessing from raw pipes whenever possible, then fall back to the
+    older regex classifier for restored/legacy transcript events.
+    """
+    action_list = actions if isinstance(actions, list) else []
+    action_types = [a.get("type") for a in action_list if isinstance(a, dict)]
+    first = next((a for a in action_list if isinstance(a, dict)), None)
+    c = _shell_command_text(command).strip()
     m = _WRAP_RE.match(c)
     inner = (m.group(2) if m else c).strip()
+    if action_types and all(t == "read" for t in action_types):
+        shown = first.get("path") or first.get("name") or first.get("command") or inner
+        return "Read", _shell_command_text(shown)
+    if action_types and all(t == "listFiles" for t in action_types):
+        shown = first.get("path") or first.get("command") or inner
+        return "List", _shell_command_text(shown)
+    if action_types and all(t == "search" for t in action_types):
+        shown = first.get("query") or first.get("path") or first.get("command") or inner
+        return "Search", _shell_command_text(shown)
     if _codex_is_read_cmd(inner):
         return "Read", inner
-    return "shell", inner
+    return "Bash", inner
 
 
 def _codex_exec_event(base, args, call_id):
@@ -380,6 +413,235 @@ def _codex_exec_event(base, args, call_id):
     return {**base, "kind": "tool_use", "tool": tool,
             "input": {"command": _cap(shown), "cwd": args.get("workdir") or args.get("cwd")},
             "toolId": call_id or ""}
+
+
+def _change_kind(kind):
+    if isinstance(kind, dict):
+        return kind.get("type") or kind.get("kind") or "update"
+    return kind or "update"
+
+
+def _file_change_rows(changes):
+    if isinstance(changes, dict):
+        changes = [changes]
+    rows = []
+    for ch in changes or []:
+        if not isinstance(ch, dict):
+            continue
+        rows.append({
+            "path": ch.get("path") or ch.get("file") or ch.get("absolutePath") or "",
+            "diff": ch.get("diff") or ch.get("unified_diff") or ch.get("unifiedDiff") or "",
+            "kind": _change_kind(ch.get("kind") or ch.get("type") or ch.get("change")),
+        })
+    return rows
+
+
+def _file_change_input(changes):
+    files = _file_change_rows(changes)
+    if len(files) == 1:
+        fp, body, kind = files[0]["path"], files[0]["diff"], files[0]["kind"]
+    elif files:
+        fp, kind = "%d files" % len(files), "edit"
+        body = "\n".join("--- %s (%s) ---\n%s" % (f["path"], f["kind"], f["diff"])
+                         for f in files)
+    else:
+        fp, body, kind = "apply_patch", "", "edit"
+    return {"file_path": fp, "diff": _cap(body, RESULT_CAP), "kind": kind, "n": len(files)}
+
+
+def _status_type(status):
+    if isinstance(status, dict):
+        return status.get("type") or ""
+    return _txt(status)
+
+
+def _active_flags(status):
+    if isinstance(status, dict):
+        return status.get("activeFlags") or []
+    return []
+
+
+def _decode_b64_text(value):
+    if not value:
+        return ""
+    try:
+        return base64.b64decode(value).decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def _web_action_type(action):
+    raw = _txt((action or {}).get("type")).strip()
+    return {"open_page": "openPage", "find_in_page": "findInPage"}.get(raw, raw or "search")
+
+
+def _web_search_input(item):
+    item = item if isinstance(item, dict) else {}
+    action = item.get("action") if isinstance(item.get("action"), dict) else {}
+    kind = _web_action_type(action)
+    out = {"action": kind}
+    if kind == "search":
+        queries = [_txt(q).strip() for q in (action.get("queries") or []) if _txt(q).strip()]
+        query = _txt(action.get("query") or item.get("query") or (queries[0] if queries else "")).strip()
+        if query:
+            out["query"] = query
+        if queries:
+            out["queries"] = queries
+        out["display"] = query or " / ".join(queries[:2]) or "web search"
+    elif kind == "openPage":
+        url = _txt(action.get("url") or item.get("url")).strip()
+        if url:
+            out["url"] = url
+        out["display"] = url or "open page"
+    elif kind == "findInPage":
+        url = _txt(action.get("url") or item.get("url")).strip()
+        pattern = _txt(action.get("pattern") or item.get("pattern")).strip()
+        if url:
+            out["url"] = url
+        if pattern:
+            out["pattern"] = pattern
+        out["display"] = (pattern + (" · " + url if url else "")) or url or "find in page"
+    else:
+        query = _txt(item.get("query")).strip()
+        if query:
+            out["query"] = query
+            out["display"] = query
+        elif action:
+            out["action_detail"] = action
+            out["display"] = kind
+        else:
+            out["display"] = "web search"
+    return out
+
+
+def _web_result_text(results):
+    if not results:
+        return ""
+    if not isinstance(results, list):
+        return _txt(results)
+    lines = []
+    for i, res in enumerate(results[:8], 1):
+        if isinstance(res, dict):
+            title = _txt(res.get("title") or res.get("name") or res.get("url") or "result").strip()
+            url = _txt(res.get("url") or res.get("link")).strip()
+            snippet = _txt(res.get("snippet") or res.get("text") or res.get("content")).strip()
+            line = "%d. %s" % (i, title)
+            if url and url != title:
+                line += "\n   " + url
+            if snippet:
+                line += "\n   " + _cap(snippet, 500)
+            lines.append(line)
+        else:
+            text = _txt(res).strip()
+            if text:
+                lines.append("%d. %s" % (i, text))
+    extra = len(results) - len(lines)
+    if extra > 0:
+        lines.append("… %d more result%s" % (extra, "" if extra == 1 else "s"))
+    return "\n".join(lines)
+
+
+def _thread_ref_ok(thread_id):
+    return bool(re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", _txt(thread_id)))
+
+
+def _agent_label(rec):
+    for key in ("agentRole", "agentNickname", "agentPath"):
+        val = _txt((rec or {}).get(key)).strip()
+        if val:
+            return os.path.basename(val) if key == "agentPath" else val
+    prompt = _txt((rec or {}).get("prompt")).strip().splitlines()
+    if prompt:
+        return _cap(prompt[0], 80)
+    tid = _txt((rec or {}).get("threadId")).strip()
+    return "subagent " + (tid[:8] if tid else "?")
+
+
+def _subagent_public(rec):
+    rec = dict(rec or {})
+    state = _txt(rec.get("state") or "running")
+    done = state in ("completed", "interrupted", "errored", "shutdown", "notFound", "notfound")
+    out = {
+        "threadId": rec.get("threadId"),
+        "label": _agent_label(rec),
+        "state": state,
+        "active": not done,
+        "updatedAt": rec.get("updatedAt"),
+        "createdAt": rec.get("createdAt"),
+    }
+    for key in ("activity", "agentPath", "agentRole", "agentNickname", "prompt",
+                "message", "model", "reasoningEffort", "tool", "cwd", "title"):
+        if rec.get(key):
+            out[key] = rec.get(key)
+    return out
+
+
+def _item_user_text(item):
+    parts = []
+    for block in item.get("content") or []:
+        if isinstance(block, dict):
+            bt = block.get("type")
+            if bt == "text":
+                parts.append(_txt(block.get("text")))
+            elif bt == "localImage":
+                parts.append("[image] " + _txt(block.get("path")))
+            else:
+                parts.append(_txt(block))
+        else:
+            parts.append(_txt(block))
+    return "\n".join(x for x in parts if x)
+
+
+def _subagent_item_message(entry):
+    entry = entry if isinstance(entry, dict) else {}
+    item = entry.get("item") if isinstance(entry.get("item"), dict) else {}
+    it = item.get("type") or "item"
+    role, text = "tool", ""
+    if it == "userMessage":
+        role, text = "user", _item_user_text(item)
+    elif it == "agentMessage":
+        role, text = "assistant", _txt(item.get("text"))
+    elif it == "reasoning":
+        role, text = "thinking", _txt(item.get("summary") or item.get("content"))
+    elif it == "plan":
+        role, text = "plan", _txt(item.get("text"))
+    elif it == "commandExecution":
+        tool, shown = _codex_cmd(item.get("command"), item.get("commandActions"))
+        out = _txt(item.get("aggregatedOutput")).strip()
+        text = tool + " " + shown + (("\n\n" + out) if out else "")
+    elif it == "fileChange":
+        inp = _file_change_input(item.get("changes") or [])
+        text = "apply_patch " + _txt(inp.get("file_path")) + "\n" + _txt(inp.get("diff"))
+    elif it == "mcpToolCall":
+        text = "%s.%s" % (item.get("server") or "mcp", item.get("tool") or "")
+        res = item.get("error") or item.get("result")
+        if res:
+            text += "\n" + _txt(res)
+    elif it == "dynamicToolCall":
+        name = ".".join(x for x in (item.get("namespace"), item.get("tool")) if x)
+        text = name or "dynamicTool"
+        if item.get("contentItems"):
+            text += "\n" + _txt(item.get("contentItems"))
+    elif it == "webSearch":
+        inp = _web_search_input(item)
+        text = "web_search " + _txt(inp.get("display"))
+        res = _web_result_text(item.get("results"))
+        if res:
+            text += "\n" + res
+    elif it == "subAgentActivity":
+        role = "agent"
+        text = "%s %s" % (item.get("kind") or "agent", item.get("agentPath") or "")
+    elif it in ("enteredReviewMode", "exitedReviewMode"):
+        role, text = "agent", it
+    elif it == "contextCompaction":
+        role, text = "system", "context compacted"
+    else:
+        text = _txt(item)
+    if not _txt(text).strip():
+        return None
+    return {"turnId": entry.get("turnId"), "itemId": item.get("id"),
+            "role": role, "kind": it, "status": item.get("status"),
+            "txt": _cap(_txt(text).strip(), THREAD_TXT_CAP)}
 
 
 def _configured_default_model():
@@ -467,6 +729,16 @@ def _txt(x):
             return str(x.get("text", ""))
         return json.dumps(x, ensure_ascii=False)
     return str(x)
+
+
+def _pick(d, *keys):
+    if not isinstance(d, dict):
+        return None
+    for key in keys:
+        val = d.get(key)
+        if val is not None:
+            return val
+    return None
 
 
 def _cap(s, n=CAP):
@@ -590,6 +862,24 @@ def _codex_injected(text):
 
 def parse_codex(rec, idx):
     base = {"ts": rec.get("timestamp"), "id": "L%d" % idx}
+    if rec.get("type") == "event_msg":
+        p = rec.get("payload") or {}
+        if p.get("type") == "sub_agent_activity":
+            tid = p.get("agent_thread_id")
+            if not tid:
+                return []
+            kind = p.get("kind") or "interacted"
+            state = {"started": "running", "interacted": "running",
+                     "completed": "completed", "interrupted": "interrupted"}.get(kind, kind)
+            ts = p.get("occurred_at_ms")
+            updated = (ts / 1000.0) if isinstance(ts, (int, float)) else None
+            agent = {"threadId": tid, "agentPath": p.get("agent_path"),
+                     "activity": kind, "state": state,
+                     "updatedAt": updated, "createdAt": updated}
+            return [{**base, "id": p.get("event_id") or base["id"],
+                     "kind": "subagent_activity",
+                     "subagent": _subagent_public(agent), "activity": kind}]
+        return []
     if rec.get("type") != "response_item":
         return []
     p = rec.get("payload") or {}
@@ -639,6 +929,14 @@ def parse_codex(rec, idx):
             out = out["output"]
         evs.append({**base, "kind": "tool_result", "toolId": p.get("call_id", ""),
                     "content": _cap(_txt(out), RESULT_CAP), "isError": False})
+    elif pt == "web_search_call":
+        tid = p.get("call_id") or p.get("id") or base["id"]
+        evs.append({**base, "kind": "tool_use", "tool": "web_search",
+                    "input": _web_search_input(p), "toolId": tid})
+        if p.get("status"):
+            evs.append({**base, "kind": "tool_result", "toolId": tid,
+                        "content": _cap(_web_result_text(p.get("results")), RESULT_CAP),
+                        "isError": p.get("status") == "failed", "status": p.get("status")})
     return evs
 
 
@@ -1499,6 +1797,48 @@ def load_transcript_events(cc, cap=1000):
     return evs[-cap:] if len(evs) > cap else evs
 
 
+def load_transcript_meta(cc):
+    """Latest non-content model/context metadata from a saved Codex rollout."""
+    path = find_transcript(cc)
+    if not path:
+        return {}
+    meta = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                p = rec.get("payload") or {}
+                if rec.get("type") == "turn_context":
+                    model = _txt(p.get("model")).strip()
+                    effort = _txt(p.get("effort")).strip()
+                    if model:
+                        meta["model"] = model
+                    if effort:
+                        meta["effort"] = effort
+                elif rec.get("type") == "event_msg" and p.get("type") == "token_count":
+                    info = p.get("info") or {}
+                    last = _pick(info, "last_token_usage", "lastTokenUsage") or {}
+                    mx = _pick(info, "model_context_window", "modelContextWindow")
+                    cur = _pick(last, "input_tokens", "inputTokens", "total_tokens", "totalTokens")
+                    if cur is not None and mx:
+                        meta["ctx"] = {"totalTokens": cur, "maxTokens": mx,
+                                       "reportedMaxTokens": mx,
+                                       "configuredMaxTokens": _configured_context_window(),
+                                       "percentage": round(cur * 100.0 / mx, 1)}
+                elif rec.get("type") == "event_msg" and p.get("type") == "task_started":
+                    mx = _pick(p, "model_context_window", "modelContextWindow")
+                    if mx:
+                        meta["reportedMaxTokens"] = mx
+    except Exception:
+        return meta
+    if meta.get("ctx") and meta.get("model"):
+        meta["ctx"]["model"] = meta["model"]
+    return meta
+
+
 def list_resumable(cwd=None, limit=20):
     """Recent codex sessions that can be continued (thread/resume). If `cwd` is
     given, restrict to sessions whose working dir is exactly that folder
@@ -1994,6 +2334,13 @@ class ChatSession:
         self._waiters = {}              # rpc_id -> Future (responses to our requests)
         self._stderr_tail = []          # recent app-server stderr lines (for error msgs)
         self._items = {}               # itemId -> bookkeeping for delta/result pairing
+        self.thread_status = {"type": "notLoaded"}
+        self.turn_diff = ""
+        self.plan = None
+        self.goal = None
+        self.safety_buffering = None
+        self.subagents = {}             # agentThreadId -> status shown in Subagents panel
+        self.transcript_meta = {}
         # live streaming token counters (ephemeral; pushed to the pill, never logged)
         self._tok_up = 0
         self._tok_out = 0
@@ -2011,7 +2358,18 @@ class ChatSession:
     def preload(self):
         """Populate history from the on-disk rollout before resuming."""
         if self.resume_cc:
+            self.transcript_meta = load_transcript_meta(self.resume_cc)
+            if (not self.model or self.model == "default") and self.transcript_meta.get("model"):
+                self.display_model = self.transcript_meta["model"]
+            if self.transcript_meta.get("ctx"):
+                self.ctx = dict(self.transcript_meta["ctx"])
             self.log = load_transcript_events(self.resume_cc)
+            for ev in self.log:
+                if ev.get("kind") == "subagent_activity":
+                    agent = dict(ev.get("subagent") or {})
+                    tid = agent.get("threadId")
+                    if tid:
+                        self.subagents[tid] = {**self.subagents.get(tid, {}), **agent}
 
     def title(self):
         if self.cc_id:
@@ -2035,7 +2393,8 @@ class ChatSession:
         tornado.ioloop.IOLoop.current().spawn_callback(self._stderr_reader)
         # 1. handshake
         await self._request("initialize", {"clientInfo": {
-            "name": "codex-console", "version": "0.1.0", "title": "Codex Console"}})
+            "name": "codex-console", "version": "0.1.0", "title": "Codex Console"},
+            "capabilities": {"experimentalApi": True, "requestAttestation": False}})
         self._notify("initialized")
         # 2. start (or resume) a thread
         ap, sbx = _mode_policy(self.mode)
@@ -2053,7 +2412,10 @@ class ChatSession:
         th = (res or {}).get("thread") or {}
         self.thread_id = th.get("id") or self.thread_id
         self.cc_id = self.thread_id
-        self.display_model = _display_model(self.model, (res or {}).get("model"))
+        meta_model = self.transcript_meta.get("model") if (not self.model or self.model == "default") else ""
+        self.display_model = _display_model(self.model, meta_model or (res or {}).get("model"))
+        self.effort = (res or {}).get("reasoningEffort") or self.effort
+        self.thread_status = th.get("status") or self.thread_status
         if self.cc_id:
             save_pref(self.cc_id, mode=self.mode, model=self.model, effort=self.effort)
         # Defer the "ready" push one loop tick: start() returns to the controller,
@@ -2180,16 +2542,189 @@ class ChatSession:
         else:                               # notification
             self._on_note(method, m.get("params") or {})
 
+    # ───────── subagents ─────────
+    def subagents_snapshot(self):
+        rows = [_subagent_public(x) for x in self.subagents.values()]
+        rows.sort(key=lambda r: (not r.get("active"), -(r.get("updatedAt") or 0)))
+        return rows
+
+    def _emit_subagents(self):
+        self._emit({"type": "events", "events": [{"kind": "subagents",
+                    "subagents": self.subagents_snapshot()}]})
+
+    def _upsert_subagent(self, thread_id, state=None, activity=None, **fields):
+        thread_id = _txt(thread_id).strip()
+        if not thread_id:
+            return None
+        now = time.time()
+        rec = self.subagents.setdefault(
+            thread_id, {"threadId": thread_id, "createdAt": now})
+        rec["updatedAt"] = now
+        if activity:
+            rec["activity"] = activity
+            if activity in ("started", "interacted"):
+                state = state or "running"
+            elif activity in ("completed", "interrupted"):
+                state = state or activity
+        if state:
+            state = _status_type(state)
+            rec["state"] = {
+                "active": "running",
+                "idle": rec.get("state") or "running",
+                "notLoaded": rec.get("state") or "notLoaded",
+            }.get(state, state)
+        elif not rec.get("state"):
+            rec["state"] = "running"
+        for key, val in fields.items():
+            if val is not None and val != "":
+                rec[key] = _cap(_txt(val), 1200) if isinstance(val, str) else val
+        return _subagent_public(rec)
+
+    def _update_subagents_from_collab(self, item):
+        ids = list(item.get("receiverThreadIds") or [])
+        states = item.get("agentsStates") if isinstance(item.get("agentsStates"), dict) else {}
+        for tid in states:
+            if tid not in ids:
+                ids.append(tid)
+        changed = False
+        for tid in ids:
+            st = states.get(tid) if isinstance(states.get(tid), dict) else {}
+            self._upsert_subagent(
+                tid,
+                state=st.get("status") or ("pendingInit" if item.get("status") not in ("completed", "success") else None),
+                prompt=item.get("prompt"),
+                message=st.get("message"),
+                model=item.get("model"),
+                reasoningEffort=item.get("reasoningEffort"),
+                tool=item.get("tool"))
+            changed = True
+        if changed:
+            self._emit_subagents()
+
+    def _on_subagent_activity(self, item, book=None):
+        if book is not None and book.get("subagent_activity_seen"):
+            return
+        if book is not None:
+            book["subagent_activity_seen"] = True
+        tid = item.get("agentThreadId")
+        rec = self._upsert_subagent(
+            tid, activity=item.get("kind") or "interacted",
+            agentPath=item.get("agentPath"))
+        if not rec:
+            return
+        self._push([{"kind": "subagent_activity", "subagent": rec,
+                     "activity": item.get("kind") or rec.get("activity")}])
+        self._emit_subagents()
+
+    def _on_foreign_thread_note(self, method, p):
+        tid = _txt((p or {}).get("threadId")).strip()
+        if not tid or not self.thread_id or tid == self.thread_id:
+            return False
+        if method == "thread/status/changed":
+            self._upsert_subagent(tid, state=p.get("status"))
+            self._emit_subagents()
+            return True
+        item = (p or {}).get("item") if isinstance((p or {}).get("item"), dict) else {}
+        msg = ""
+        if item.get("type") == "agentMessage" and item.get("text"):
+            msg = item.get("text")
+        elif method.startswith("turn/"):
+            msg = method.replace("/", " ")
+        elif method.startswith("item/"):
+            msg = item.get("type") or method.replace("/", " ")
+        self._upsert_subagent(tid, state="running", message=msg)
+        self._emit_subagents()
+        return True
+
+    async def read_subagent_thread(self, thread_id, limit=160):
+        thread_id = _txt(thread_id).strip()
+        if not _thread_ref_ok(thread_id):
+            return {"ok": False, "error": "invalid subagent thread id", "threadId": thread_id}
+        if thread_id not in self.subagents:
+            return {"ok": False, "error": "unknown subagent for this session", "threadId": thread_id}
+        if not self.proc or self.ended:
+            return {"ok": False, "error": "session is not running", "threadId": thread_id,
+                    "subagent": _subagent_public(self.subagents.get(thread_id))}
+        try:
+            limit = int(limit or 160)
+        except Exception:
+            limit = 160
+        limit = max(20, min(limit, 400))
+        thread, entries, error = {}, [], ""
+        try:
+            res = await self._request("thread/read", {"threadId": thread_id, "includeTurns": False})
+            thread = (res or {}).get("thread") or {}
+            self._upsert_subagent(
+                thread_id, state=thread.get("status"), title=thread.get("name") or thread.get("preview"),
+                cwd=thread.get("cwd"), agentRole=thread.get("agentRole"),
+                agentNickname=thread.get("agentNickname"))
+        except Exception as ex:
+            error = "thread/read failed: %r" % ex
+        try:
+            res = await self._request("thread/items/list", {
+                "threadId": thread_id, "limit": limit, "sortDirection": "asc"})
+            entries = (res or {}).get("data") or []
+        except Exception as ex:
+            if error:
+                error += "; "
+            error += "thread/items/list failed: %r" % ex
+            try:
+                res = await self._request("thread/read", {"threadId": thread_id, "includeTurns": True})
+                thread = (res or {}).get("thread") or thread or {}
+                for turn in thread.get("turns") or []:
+                    for item in turn.get("items") or []:
+                        entries.append({"turnId": turn.get("id"), "item": item})
+            except Exception:
+                pass
+        messages = []
+        for entry in entries:
+            msg = _subagent_item_message(entry)
+            if msg:
+                messages.append(msg)
+        return {"ok": not bool(error) or bool(messages), "error": error,
+                "threadId": thread_id, "subagent": _subagent_public(self.subagents.get(thread_id)),
+                "thread": {
+                    "id": thread.get("id") or thread_id,
+                    "name": thread.get("name") or thread.get("preview"),
+                    "preview": thread.get("preview"),
+                    "cwd": thread.get("cwd"),
+                    "status": _status_type(thread.get("status")) or None,
+                    "createdAt": thread.get("createdAt"),
+                    "updatedAt": thread.get("updatedAt"),
+                },
+                "messages": messages}
+
     # ───────── inbound: notifications → normalized events ─────────
     def _on_note(self, method, p):
         if method == "thread/started":
             th = p.get("thread") or {}
+            parent_id = th.get("parentThreadId")
+            if th.get("id") and parent_id and self.thread_id and parent_id == self.thread_id:
+                self._upsert_subagent(
+                    th["id"], state=th.get("status"), title=th.get("name") or th.get("preview"),
+                    cwd=th.get("cwd"), agentRole=th.get("agentRole"),
+                    agentNickname=th.get("agentNickname"))
+                self._emit_subagents()
+                return
             if th.get("id"):
                 self.cc_id = self.thread_id = th["id"]
+            self.thread_status = th.get("status") or self.thread_status
+            self._emit({"type": "events", "events": [{"kind": "thread_status",
+                        "status": _status_type(self.thread_status),
+                        "flags": _active_flags(self.thread_status)}]})
+        elif self._on_foreign_thread_note(method, p):
+            return
         elif method == "turn/started":
-            self.turn_id = (p.get("turn") or {}).get("id")
+            turn = p.get("turn") or {}
+            self.turn_id = turn.get("id")
+            if turn.get("items"):
+                for item in turn.get("items") or []:
+                    self._on_item(item, started=True)
         elif method == "turn/completed":
-            self._finish_turn(error=False)
+            turn = p.get("turn") or {}
+            for item in turn.get("items") or []:
+                self._on_item(item, started=False)
+            self._finish_turn(error=_status_type(turn.get("status")) == "failed")
         elif method == "turn/failed":
             err = (p.get("error") or {})
             self._push([{"kind": "notice", "text": "turn failed: " + _txt(err.get("message") or err)}])
@@ -2200,16 +2735,77 @@ class ChatSession:
             self._on_item(p.get("item") or {}, started=False)
         elif method == "item/agentMessage/delta":
             d = p.get("delta") or ""
+            if d:
+                self._on_item_delta(p.get("itemId"), "assistant", d)
             if d and not self._tok_exact:
                 self._tok_chars += len(d)
                 self._tok_out = max(self._tok_out, (self._tok_chars + 3) // 4)
                 self._emit_tokens()
         elif method in ("item/reasoning/textDelta", "item/reasoning/summaryTextDelta"):
             d = p.get("delta") or ""
+            if d:
+                self._on_item_delta(p.get("itemId"), "thinking", d)
             if d and not self._tok_exact:
                 self._tok_chars += len(d)
                 self._tok_out = max(self._tok_out, (self._tok_chars + 3) // 4)
                 self._emit_tokens()
+        elif method == "item/reasoning/summaryPartAdded":
+            iid = p.get("itemId")
+            book = self._book_item(iid, "reasoning")
+            book["text"] = (book.get("text") or "").rstrip() + "\n"
+        elif method == "item/plan/delta":
+            d = p.get("delta") or ""
+            if d:
+                self._on_item_delta(p.get("itemId"), "plan", d, turn_id=p.get("turnId"))
+        elif method == "turn/plan/updated":
+            self.plan = {"explanation": p.get("explanation"), "plan": p.get("plan") or []}
+            self._push([{"kind": "plan", "turnId": p.get("turnId"),
+                         "explanation": _cap(_txt(p.get("explanation")), 4000),
+                         "plan": p.get("plan") or []}])
+        elif method == "turn/diff/updated":
+            self.turn_diff = _cap(p.get("diff") or "", RESULT_CAP * 4)
+            self._emit({"type": "events", "events": [{"kind": "turn_diff",
+                        "turnId": p.get("turnId"), "diff": self.turn_diff}]})
+        elif method == "item/fileChange/patchUpdated":
+            self._on_file_change_updated(p.get("itemId"), p.get("changes") or [])
+        elif method == "item/fileChange/outputDelta":
+            self._on_tool_delta(p.get("itemId"), p.get("delta") or "")
+        elif method == "item/commandExecution/outputDelta":
+            self._on_tool_delta(p.get("itemId"), p.get("delta") or "")
+        elif method == "item/commandExecution/terminalInteraction":
+            self._push([{"kind": "tool_progress", "toolId": p.get("itemId"),
+                         "text": _cap(_txt(p.get("stdin")), 1200)}])
+        elif method in ("command/exec/outputDelta", "process/outputDelta"):
+            delta = _decode_b64_text(p.get("deltaBase64"))
+            pid = p.get("processId") or p.get("processHandle")
+            if delta and pid:
+                self._on_tool_delta(pid, delta, stream=p.get("stream"),
+                                    cap_reached=bool(p.get("capReached")))
+        elif method == "item/mcpToolCall/progress":
+            self._push([{"kind": "tool_progress", "toolId": p.get("itemId"),
+                         "text": _cap(_txt(p.get("message")), 1200)}])
+        elif method == "thread/status/changed":
+            self.thread_status = p.get("status") or {}
+            st = _status_type(self.thread_status)
+            if st == "active":
+                self.busy = True
+            elif st in ("idle", "notLoaded") and not self.turn_id:
+                self.busy = False
+            self._emit({"type": "events", "events": [{"kind": "thread_status",
+                        "status": st, "flags": _active_flags(self.thread_status)}]})
+        elif method == "thread/settings/updated":
+            self._on_settings_updated(p.get("threadSettings") or {})
+        elif method == "thread/name/updated":
+            name = p.get("threadName") or ""
+            if name:
+                self._emit({"type": "events", "events": [{"kind": "notice",
+                            "text": "thread renamed: " + _cap(name, 120)}]})
+        elif method == "thread/goal/updated":
+            self.goal = p.get("goal") or {}
+            self._push([{"kind": "goal", "goal": self.goal}])
+        elif method == "thread/goal/cleared":
+            self.goal = None
+            self._push([{"kind": "goal", "goal": None}])
         elif method == "thread/tokenUsage/updated":
             self._on_token_usage(p.get("tokenUsage") or {})
         elif method == "account/rateLimits/updated":
@@ -2222,38 +2818,155 @@ class ChatSession:
                 self._finish_turn(error=False, compact=True)
         elif method == "error":
             self._push([{"kind": "notice", "text": _txt(p.get("message") or p)}])
-        # ignored: hook/*, mcpServer/*, thread/status/changed, turn/diff/updated,
-        # turn/plan/updated, account/updated, warning, model/*, fuzzyFileSearch/* …
+        elif method == "model/rerouted":
+            frm, to = p.get("fromModel"), p.get("toModel")
+            if to:
+                self.display_model = to
+            self._push([{"kind": "model_rerouted", "from": frm, "to": to,
+                         "reason": _txt(p.get("reason"))}])
+        elif method == "model/safetyBuffering/updated":
+            self.safety_buffering = p
+            if p.get("showBufferingUi"):
+                self._emit({"type": "events", "events": [{"kind": "safety_buffering",
+                            "model": p.get("model"), "fasterModel": p.get("fasterModel"),
+                            "reasons": p.get("reasons") or []}]})
+        elif method in ("warning", "guardianWarning", "deprecationNotice", "configWarning"):
+            msg = p.get("message") or p.get("warning") or p.get("text") or p
+            self._push([{"kind": "notice", "text": _cap(_txt(msg), 1200)}])
+        elif method in ("thread/archived", "thread/deleted", "thread/unarchived",
+                        "thread/closed", "thread/reverted"):
+            self._emit({"type": "events", "events": [{"kind": "thread_lifecycle",
+                        "method": method}]})
+        # ignored: hook/* details, mcpServer status spam, account/updated,
+        # fuzzyFileSearch/*, realtime audio, and internal rawResponse/* payloads.
+
+    def _book_item(self, item_id, item_type=None):
+        if not item_id:
+            return {}
+        book = self._items.setdefault(item_id, {})
+        if item_type and not book.get("type"):
+            book["type"] = item_type
+        return book
+
+    def _on_item_delta(self, item_id, kind, delta, turn_id=None):
+        if not item_id or not delta:
+            return
+        book = self._book_item(item_id, kind)
+        book["streamed"] = True
+        book["text"] = (book.get("text") or "") + delta
+        ev_kind = {"assistant": "assistant_delta", "thinking": "thinking_delta",
+                   "plan": "plan_delta"}.get(kind)
+        if ev_kind:
+            self._push([{"kind": ev_kind, "itemId": item_id, "turnId": turn_id,
+                         "delta": _cap(delta, 4000)}])
+
+    def _on_tool_delta(self, item_id, delta, stream=None, cap_reached=False):
+        if not item_id or not delta:
+            return
+        book = self._book_item(item_id)
+        book["output"] = _cap((book.get("output") or "") + delta, RESULT_CAP)
+        self._emit({"type": "events", "events": [{"kind": "tool_delta",
+                    "toolId": item_id, "delta": _cap(delta, 4000),
+                    "stream": stream, "capReached": bool(cap_reached)}]})
+
+    def _on_file_change_updated(self, item_id, changes):
+        if not item_id:
+            return
+        inp = _file_change_input(changes)
+        book = self._book_item(item_id, "fileChange")
+        book["input"] = inp
+        if not book.get("started"):
+            book["started"] = True
+            self._push([{"kind": "tool_use", "tool": "apply_patch",
+                         "input": inp, "toolId": item_id}])
+            self._maybe_steer()
+            return
+        self._push([{"kind": "tool_update", "toolId": item_id,
+                     "tool": "apply_patch", "input": inp}])
+
+    def _on_settings_updated(self, settings):
+        if not isinstance(settings, dict):
+            return
+        model = settings.get("model")
+        if model:
+            self.display_model = model
+        effort = settings.get("effort")
+        if effort:
+            self.effort = effort
+        cwd = settings.get("cwd")
+        if cwd:
+            self.cwd = cwd
+        self._emit({"type": "events", "events": [{"kind": "settings",
+                    "model": self.model or "default",
+                    "display_model": self.display_model,
+                    "effort": self.effort,
+                    "cwd": self.cwd,
+                    "approvalPolicy": settings.get("approvalPolicy"),
+                    "sandboxPolicy": settings.get("sandboxPolicy"),
+                    "personality": settings.get("personality")}]})
 
     def _on_item(self, item, started):
         it = item.get("type")
         iid = item.get("id")
+        book = self._book_item(iid, it)
+        if iid and started:
+            if book.get("started"):
+                return
+            book["started"] = True
+        elif iid and not started:
+            if book.get("completed"):
+                return
+            book["completed"] = True
         if it == "userMessage":
             return                          # echoed locally by _echo_user
         if it == "agentMessage":
             if not started:
                 txt = item.get("text") or ""
                 if txt.strip():
-                    self._push([{"kind": "assistant_text", "text": _cap(txt)}])
+                    if book.get("streamed"):
+                        if txt != book.get("text"):
+                            book["text"] = txt
+                            self._push([{"kind": "assistant_update", "itemId": iid,
+                                         "text": _cap(txt)}])
+                    else:
+                        self._push([{"kind": "assistant_text", "itemId": iid,
+                                     "text": _cap(txt)}])
             return
         if it == "reasoning":
             if not started:
                 txt = _txt(item.get("summary") or item.get("content"))
                 if txt.strip():
-                    self._push([{"kind": "thinking", "text": _cap(txt)}])
+                    if book.get("streamed"):
+                        if txt != book.get("text"):
+                            book["text"] = txt
+                            self._push([{"kind": "thinking_update", "itemId": iid,
+                                         "text": _cap(txt)}])
+                    else:
+                        self._push([{"kind": "thinking", "itemId": iid,
+                                     "text": _cap(txt)}])
             return
         if it == "plan":
             if not started:
                 txt = _txt(item.get("text"))
                 if txt.strip():
-                    self._push([{"kind": "assistant_text", "text": _cap("📋 Plan\n" + txt)}])
+                    if book.get("streamed"):
+                        if txt != book.get("text"):
+                            book["text"] = txt
+                            self._push([{"kind": "plan_text", "itemId": iid,
+                                         "text": _cap(txt)}])
+                    else:
+                        self._push([{"kind": "plan_text", "itemId": iid,
+                                     "text": _cap(txt)}])
             return
         if it == "commandExecution":
-            cmd = _txt(item.get("command"))
+            raw_cmd = item.get("command")
+            cmd = _shell_command_text(raw_cmd)
             if started:
-                tool, shown = _codex_cmd(cmd)   # 'Read' for a plain read, else 'shell'; unwrapped
+                tool, shown = _codex_cmd(raw_cmd, item.get("commandActions"))
                 self._push([{"kind": "tool_use", "tool": tool,
-                             "input": {"command": _cap(shown), "cwd": item.get("cwd")},
+                             "input": {"command": _cap(cmd), "cwd": item.get("cwd"),
+                                       "display": _cap(shown),
+                                       "actions": item.get("commandActions") or []},
                              "toolId": iid}])
                 self._maybe_steer()
             else:
@@ -2262,39 +2975,27 @@ class ChatSession:
                 err = (item.get("status") not in ("completed", "success")
                        or (code not in (0, None)))
                 self._push([{"kind": "tool_result", "toolId": iid,
-                             "content": _cap(out, RESULT_CAP), "isError": bool(err)}])
+                             "content": _cap(out, RESULT_CAP), "isError": bool(err),
+                             "exitCode": code, "durationMs": item.get("durationMs"),
+                             "status": item.get("status")}])
             return
         if it == "fileChange":
             # codex apply_patch: each change carries {path, kind(add/update/delete),
             # diff(unified)}. Surface it as an EDIT (file path + real diff) so it
             # shows as a "see Changes" marker + a diff card in the drawer — not a
             # generic exec card.
-            files = []
-            for ch in (item.get("changes") or []):
-                if isinstance(ch, dict):
-                    k = ch.get("kind")
-                    kind = (k.get("type") if isinstance(k, dict) else k) or "update"
-                    files.append({"path": ch.get("path") or "",
-                                  "diff": ch.get("diff") or "", "kind": kind})
             if started:
-                if len(files) == 1:
-                    fp, body, kind = files[0]["path"], files[0]["diff"], files[0]["kind"]
-                elif files:
-                    fp, kind = "%d files" % len(files), "edit"
-                    body = "\n".join("--- %s (%s) ---\n%s" % (f["path"], f["kind"], f["diff"])
-                                     for f in files)
-                else:
-                    fp, body, kind = "apply_patch", "", "edit"
+                inp = _file_change_input(item.get("changes") or [])
+                book["input"] = inp
                 self._push([{"kind": "tool_use", "tool": "apply_patch",
-                             "input": {"file_path": fp, "diff": _cap(body, RESULT_CAP),
-                                       "kind": kind, "n": len(files)},
-                             "toolId": iid}])
+                             "input": inp, "toolId": iid}])
                 self._maybe_steer()
             else:
                 st = item.get("status")
                 if st not in ("completed", "success", "applied", None):
                     self._push([{"kind": "tool_result", "toolId": iid,
-                                 "content": "patch %s" % st, "isError": True}])
+                                 "content": "patch %s" % st, "isError": True,
+                                 "status": st}])
             return
         if it == "mcpToolCall":
             name = "%s.%s" % (item.get("server") or "mcp", item.get("tool") or "")
@@ -2306,16 +3007,81 @@ class ChatSession:
                 res = item.get("error") or item.get("result")
                 self._push([{"kind": "tool_result", "toolId": iid,
                              "content": _cap(_txt(res), RESULT_CAP),
-                             "isError": bool(item.get("error"))}])
+                             "isError": bool(item.get("error")),
+                             "durationMs": item.get("durationMs"),
+                             "status": item.get("status")}])
+            return
+        if it == "dynamicToolCall":
+            name = ".".join(x for x in (item.get("namespace"), item.get("tool")) if x)
+            if started:
+                self._push([{"kind": "tool_use", "tool": name or "dynamicTool",
+                             "input": _cap_input(item.get("arguments")), "toolId": iid}])
+                self._maybe_steer()
+            else:
+                content = item.get("contentItems")
+                self._push([{"kind": "tool_result", "toolId": iid,
+                             "content": _cap(_txt(content), RESULT_CAP),
+                             "isError": item.get("success") is False,
+                             "durationMs": item.get("durationMs"),
+                             "status": item.get("status")}])
+            return
+        if it == "collabAgentToolCall":
+            self._update_subagents_from_collab(item)
+            if started:
+                self._push([{"kind": "tool_use", "tool": "Agent",
+                             "input": {"tool": item.get("tool"), "prompt": item.get("prompt"),
+                                       "model": item.get("model"),
+                                       "reasoningEffort": item.get("reasoningEffort"),
+                                       "receiverThreadIds": item.get("receiverThreadIds") or []},
+                             "toolId": iid}])
+                self._maybe_steer()
+            else:
+                self._push([{"kind": "tool_result", "toolId": iid,
+                                 "content": _cap(_txt(item.get("agentsStates")), RESULT_CAP),
+                                 "isError": item.get("status") == "failed",
+                                 "status": item.get("status")}])
+            return
+        if it == "subAgentActivity":
+            self._on_subagent_activity(item, book=book)
             return
         if it == "webSearch":
             if started:
                 self._push([{"kind": "tool_use", "tool": "web_search",
-                             "input": {"query": _txt(item.get("query"))}, "toolId": iid}])
+                             "input": _web_search_input(item), "toolId": iid}])
             else:
-                self._push([{"kind": "tool_result", "toolId": iid, "content": "", "isError": False}])
+                self._push([{"kind": "tool_result", "toolId": iid,
+                             "content": _cap(_web_result_text(item.get("results")), RESULT_CAP),
+                             "isError": item.get("status") == "failed",
+                             "status": item.get("status") or "completed"}])
             return
-        # other item types (imageView, imageGeneration, review modes, …) ignored for v1
+        if it == "imageView":
+            if started:
+                self._push([{"kind": "tool_use", "tool": "ViewImage",
+                             "input": {"path": item.get("path")}, "toolId": iid}])
+            else:
+                self._push([{"kind": "tool_result", "toolId": iid,
+                             "content": item.get("path") or "", "isError": False}])
+            return
+        if it == "imageGeneration":
+            if started:
+                self._push([{"kind": "tool_use", "tool": "ImageGeneration",
+                             "input": _cap_input(item), "toolId": iid}])
+            else:
+                self._push([{"kind": "tool_result", "toolId": iid,
+                             "content": _cap(_txt(item), RESULT_CAP),
+                             "isError": False}])
+            return
+        if it == "contextCompaction":
+            if started:
+                self.compacting = True
+                self._push([{"kind": "compacting", "word": self.turn_word}])
+            else:
+                self.compacting = False
+                self._push([{"kind": "compacted", "trigger": "auto",
+                             "pre": None, "post": None, "ms": None}])
+            return
+        if it in ("enteredReviewMode", "exitedReviewMode"):
+            self._push([{"kind": "notice", "text": it}])
 
     def _finish_turn(self, error=False, compact=False):
         if not self.busy:
@@ -2337,27 +3103,32 @@ class ChatSession:
         self._drain_queue()
 
     def _on_token_usage(self, tu):
-        total = tu.get("total") or {}
-        last = tu.get("last") or {}
-        mx = tu.get("modelContextWindow")
+        total = _pick(tu, "total", "total_token_usage", "totalTokenUsage") or {}
+        last = _pick(tu, "last", "last_token_usage", "lastTokenUsage") or {}
+        mx = _pick(tu, "modelContextWindow", "model_context_window")
         # Context-window occupancy = the LAST request's input tokens (the full
         # prompt the model saw, incl. cached history). NOT total.totalTokens —
         # that's the cumulative sum over the whole thread and runs to thousands of
         # percent on a long or resumed session (the "2508%" bug).
-        cur = last.get("inputTokens")
+        cur = _pick(last, "inputTokens", "input_tokens")
         if cur is None:
-            cur = last.get("totalTokens")
+            cur = _pick(last, "totalTokens", "total_tokens")
         if cur is not None and mx:
+            if (not self.model or self.model == "default") and self.cc_id:
+                meta_model = (self.transcript_meta or {}).get("model")
+                if meta_model:
+                    self.display_model = meta_model
             cfg_mx = _configured_context_window()
-            shown_mx = cfg_mx if cfg_mx and cfg_mx > mx else mx
-            self.ctx = {"totalTokens": cur, "maxTokens": shown_mx,
+            # For compaction decisions, show occupancy against the effective
+            # window reported by app-server, not a larger local config override.
+            self.ctx = {"totalTokens": cur, "maxTokens": mx,
                         "reportedMaxTokens": mx, "configuredMaxTokens": cfg_mx,
-                        "percentage": round(cur * 100.0 / shown_mx, 1),
+                        "percentage": round(cur * 100.0 / mx, 1),
                         "model": self.display_model or self.model or None}
             self._emit({"type": "context", "ctx": self.ctx})
-        li = last.get("inputTokens")
-        lc = last.get("cachedInputTokens") or 0
-        lo = last.get("outputTokens")
+        li = _pick(last, "inputTokens", "input_tokens")
+        lc = _pick(last, "cachedInputTokens", "cached_input_tokens") or 0
+        lo = _pick(last, "outputTokens", "output_tokens")
         if li is not None:
             self._tok_up = max(0, li - lc)   # fresh (uncached) upload this request
         if lo is not None:
@@ -2380,9 +3151,13 @@ class ChatSession:
         aid = "ap%d" % self._aid
         if method in ("item/commandExecution/requestApproval", "execCommandApproval"):
             self._req[aid] = {"rpc": rpc_id, "kind": "exec"}
-            cmd = _txt(p.get("command") or "")
-            self._push([{"kind": "approval", "aid": aid, "tool": "shell",
+            raw_cmd = p.get("command") or ""
+            cmd = _shell_command_text(raw_cmd)
+            tool, shown = _codex_cmd(raw_cmd, p.get("commandActions"))
+            self._push([{"kind": "approval", "aid": aid, "tool": tool,
                          "input": {"command": _cap(cmd) if cmd else None,
+                                   "display": _cap(shown),
+                                   "actions": p.get("commandActions") or [],
                                    "reason": p.get("reason"), "cwd": p.get("cwd")},
                          "toolId": p.get("itemId"), "always": True}])
         elif method in ("item/fileChange/requestApproval", "applyPatchApproval"):
@@ -2728,6 +3503,7 @@ class ChatSession:
     # ───────── recap (disabled in v1) ─────────
     def _recap_transcript(self):
         lines, has_asst = [], False
+        assistant, order = {}, []
         for e in self.log:
             k = e.get("kind")
             if k == "user_text":
@@ -2739,8 +3515,23 @@ class ChatSession:
                 if t:
                     lines.append("Assistant: " + t)
                     has_asst = True
+            elif k == "assistant_delta":
+                iid = e.get("itemId") or "assistant"
+                if iid not in assistant:
+                    order.append(iid)
+                assistant[iid] = assistant.get(iid, "") + (e.get("delta") or "")
+            elif k == "assistant_update":
+                iid = e.get("itemId") or "assistant"
+                if iid not in assistant:
+                    order.append(iid)
+                assistant[iid] = e.get("text") or assistant.get(iid, "")
             elif k == "tool_use":
                 lines.append("[tool: %s]" % (e.get("tool") or "?"))
+        for iid in order:
+            t = assistant.get(iid, "").strip()
+            if t:
+                lines.append("Assistant: " + t)
+                has_asst = True
         if not has_asst:
             return ""
         return "\n".join(lines)[-6000:]
@@ -2878,7 +3669,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             self._say({"type": "started", "id": sid, "cwd": cwd,
                        "name": os.path.basename(cwd) or cwd,
                        "model": sess.model or "default", "display_model": sess.display_model,
-                       "mode": sess.mode, "effort": sess.effort})
+                       "mode": sess.mode, "effort": sess.effort,
+                       "subagents": sess.subagents_snapshot()})
         elif mt == "attach":
             sess = CHAT_SESSIONS.get(msg.get("id"))
             if not sess:
@@ -2895,7 +3687,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "mode": sess.mode,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
-                       "compacting": sess.compacting})
+                       "compacting": sess.compacting,
+                       "subagents": sess.subagents_snapshot()})
             # returning to an idle session that's been quiet a while → recap it now
             # (the periodic sweep may not have ticked yet); guarded against busy/dup
             if (RECAP_ENABLED and not sess.busy and not sess.ended and not sess.compacting
@@ -2941,7 +3734,12 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "mode": sess.mode,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
-                       "compacting": sess.compacting, "resumed": True})
+                       "compacting": sess.compacting, "resumed": True,
+                       "subagents": sess.subagents_snapshot()})
+        elif mt == "subagent_read" and self.session:
+            res = await self.session.read_subagent_thread(
+                msg.get("threadId"), msg.get("limit") or 160)
+            self._say({"type": "subagent_thread", **res})
         elif mt == "approve" and self.session:
             self.session.resolve_approval(msg.get("aid"), bool(msg.get("allow")), bool(msg.get("always")))
         elif mt == "answer" and self.session:
@@ -3184,6 +3982,20 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .think.hide{display:none}
 .notice{color:var(--mut);font-size:11.5px;margin:6px 0}
 .errline{color:var(--del);font-size:12px;font-family:var(--fmono);margin:4px 0;white-space:pre-wrap}
+.plandock{position:sticky;top:0;z-index:7;max-width:820px;margin:0 auto 10px;padding:0 0 8px;
+  background:linear-gradient(to bottom,var(--bg) 0%,var(--bg) calc(100% - 8px),transparent 100%)}
+.plandock[hidden]{display:none}
+.plandock .plan{margin:0;box-shadow:0 7px 18px rgba(0,0,0,.18)}
+.plan{border:1px solid var(--infoln);border-radius:8px;margin:7px 0 12px;background:var(--infobg);overflow:hidden}
+.plan .ph{display:flex;align-items:center;gap:7px;padding:7px 10px;color:var(--usr);font-weight:650}
+.plan .pex{padding:0 10px 7px;color:var(--mut);font-size:12.5px;white-space:pre-wrap}
+.plan .psteps{display:flex;flex-direction:column;border-top:1px solid var(--infoln)}
+.plan .pst{display:grid;grid-template-columns:22px 1fr;gap:6px;align-items:start;padding:6px 10px;font-size:13px;line-height:1.35}
+.plan .pst + .pst{border-top:1px solid color-mix(in srgb,var(--infoln) 55%,transparent)}
+.plan .pi{font-family:var(--fmono);color:var(--mut)}
+.plan .pst.done .pi{color:var(--addfg)}.plan .pst.active .pi{color:var(--tool)}.plan .pst.todo .pi{color:var(--mut)}
+.plan .ptext{padding:8px 10px;border-top:1px solid var(--infoln);white-space:pre-wrap;font-family:var(--fmono);font-size:12px;color:var(--fg)}
+.streaming{opacity:.95}
 .localstatus{border:1px solid var(--line);border-radius:8px;margin:8px 0 12px;background:var(--bg2);padding:9px 10px;font-size:12px;line-height:1.45}
 .localstatus .sh{display:flex;align-items:center;gap:8px;color:var(--fg);font-weight:650;margin-bottom:7px}
 .localstatus .sg{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:5px 14px}
@@ -3214,6 +4026,9 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .tool .tb{display:none;border-top:1px solid var(--line);padding:8px 10px}
 .tool.open .tb{display:block}
 .tool.err .tn{color:var(--del)}
+.tool.done .tn{opacity:.85}
+.tool .progress,.ecard .progress{font-size:11.5px;color:var(--mut);font-family:var(--fmono);white-space:pre-wrap;margin:0 0 5px}
+.tool .resmeta,.ecard .resmeta{font-size:11px;color:var(--mut);margin-left:6px}
 pre{background:var(--codebg);border:1px solid var(--line);border-radius:6px;padding:8px;overflow-x:auto;margin:5px 0;
   font-family:var(--fmono);font-size:12.5px;line-height:1.45}
 code{font-family:var(--fmono);font-size:12.5px;background:var(--codebg);border:1px solid var(--line);border-radius:3px;padding:0 4px}
@@ -3267,6 +4082,46 @@ pre code{background:none;border:none;padding:0}
 #drawer .dc{flex:1;overflow:auto;padding:10px}
 .gfile{font-family:var(--fmono);font-size:12px;padding:1px 0}.gfile .st{display:inline-block;width:24px;color:var(--tool);font-weight:700}
 .empty{color:var(--mut);padding:18px;text-align:center}
+#agentPanel{position:fixed;top:0;right:0;width:var(--agw,min(760px,96vw));height:100%;background:var(--bg);border-left:1px solid var(--line);
+  transform:translateX(100%);transition:transform .34s cubic-bezier(.32,.72,0,1);z-index:22;display:flex;flex-direction:column}
+#agentPanel.open{transform:none}
+#agentPanel .agh{padding:8px 12px;background:var(--bg2);border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}
+#agentPanel .agh .agtit{font-size:13px;font-weight:700;color:var(--fg)}
+#agentPanel .agh .agmeta{font-size:11.5px;color:var(--mut);font-family:var(--fmono)}
+#agentPanel .agh .grow{flex:1}
+#agentPanel .agbody{flex:1;min-height:0;display:flex}
+#agentList{width:260px;flex:0 0 auto;border-right:1px solid var(--line);overflow:auto;background:var(--bg2)}
+#agentDetail{flex:1;min-width:0;overflow:auto;background:var(--bg)}
+.agsec{font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--mut);padding:9px 10px 4px}
+.agrow{display:flex;gap:8px;align-items:flex-start;padding:8px 10px;border-left:2px solid transparent;cursor:pointer}
+.agrow:hover{background:var(--bg3)}
+.agrow.on{background:var(--sel);border-left-color:var(--acc)}
+.agrow.done{opacity:.72}
+.agdot{width:7px;height:7px;border-radius:50%;background:var(--mut);flex:0 0 auto;margin-top:5px}
+.agdot.run{background:var(--tool);box-shadow:0 0 5px var(--tool);animation:pulse 1s infinite}
+.agdot.ok{background:var(--add)}
+.agdot.bad{background:var(--del)}
+.agrow .agm{min-width:0;flex:1}
+.agrow .agn{font-size:12.5px;color:var(--fg);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.agrow .ags{font-size:11px;color:var(--mut);line-height:1.35;word-break:break-word;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.aghead{padding:12px 14px;border-bottom:1px solid var(--line);background:var(--bg2)}
+.aghead .agt{font-size:13.5px;font-weight:700;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.aghead .agsub{font-size:11.5px;color:var(--mut);font-family:var(--fmono);line-height:1.45;word-break:break-word}
+.agmsgs{padding:6px 0 14px}
+.agmsg{padding:8px 14px;border-left:3px solid transparent}
+.agmsg .agr{font-size:10.5px;color:var(--dim);margin-bottom:2px;letter-spacing:.03em}
+.agmsg .agtxt{font-size:12.5px;line-height:1.55;color:var(--fg);white-space:pre-wrap;word-break:break-word}
+.agmsg.user{border-left-color:var(--acc)}
+.agmsg.assistant{border-left-color:var(--line)}
+.agmsg.thinking{border-left-color:var(--tool)}
+.agmsg.plan{border-left-color:var(--usr)}
+.agmsg.system,.agmsg.agent{border-left-color:var(--mut)}
+.agmsg.tool .agtxt{font-family:var(--fmono);font-size:11.5px;color:var(--dim)}
+.agmsg.tool pre{margin:0}
+.agmark{font-size:12px;color:var(--acc);background:var(--infobg);border:1px solid var(--infoln);border-radius:6px;
+  padding:3px 9px;margin:2px 0 12px;display:inline-flex;gap:7px;cursor:pointer;font-family:var(--fmono);align-items:center}
+.agmark:hover{filter:brightness(1.18)}
+.agmark .mut{color:var(--mut)}
 /* edits-out-of-chat */
 .dh .tab{cursor:pointer;padding:3px 9px;border-radius:5px;color:var(--mut);font-size:12.5px;user-select:none}
 .dh .tab.on{background:var(--bg3);color:var(--fg)}
@@ -3276,6 +4131,7 @@ pre code{background:none;border:none;padding:0}
 .emark:hover{filter:brightness(1.25)}
 .emark .a{color:var(--addfg)}.emark .d{color:var(--delfg)}.emark .mut{color:var(--mut)}
 .ecard{border:1px solid var(--line);border-radius:8px;margin-bottom:10px;background:var(--bg2);overflow:hidden}
+.ecard.turndiff .eh{background:var(--infobg)}
 .ecard .eh{padding:7px 9px;display:flex;gap:7px;align-items:center;background:var(--toolbg);border-bottom:1px solid var(--line)}
 .ecard .ef{color:var(--tool);font-family:var(--fmono);font-size:12px;font-weight:600;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ecard .cnt{font-size:11px;font-family:var(--fmono)}.ecard .cnt .a{color:var(--addfg)}.ecard .cnt .d{color:var(--delfg)}
@@ -3333,6 +4189,12 @@ pre code{background:none;border:none;padding:0}
 .ctx .ulabel,.usage .ulabel{opacity:.7}
 .usage .useg{display:inline-flex;align-items:center;gap:5px}
 .usage .useg + .useg::before{content:"|";opacity:.3;font-weight:400}   /* divider between 5h | 7d */
+.agentbtn{display:none;align-items:center;gap:5px;font-size:13px;color:var(--mut);font-family:var(--fmono);
+  border-left:1px solid var(--line);padding-left:10px;margin-left:4px}
+.agentbtn.on{display:inline-flex;color:var(--acc)}
+.agentbtn .agentn{min-width:16px;height:16px;border-radius:8px;background:var(--bg3);border:1px solid var(--line);
+  display:inline-flex;align-items:center;justify-content:center;font-size:10px;color:var(--fg);padding:0 4px}
+.agentbtn.busy .agentn{border-color:var(--tool);color:var(--tool);box-shadow:0 0 5px var(--tool)}
 /* shared segmented meter: 5 cells × 20%, whole bar coloured by the total % (Context + Usage) */
 .cells{display:inline-flex;gap:2px;align-items:center}
 .cells .cell{width:7px;height:13px;border-radius:2px;background:var(--bg3);border:1px solid var(--line);box-sizing:border-box;transition:background .25s,box-shadow .25s}
@@ -3348,7 +4210,11 @@ pre code{background:none;border:none;padding:0}
 .cells.lv-g{color:var(--mg)}.cells.lv-y{color:var(--my)}
 .cells.lv-o{color:var(--mo)}.cells.lv-r{color:var(--mr)}
 .cells .cell.on{background:currentColor;border-color:currentColor;box-shadow:0 0 4px currentColor}
-@media(max-width:680px){.usage{display:none!important}}
+@media(max-width:680px){.usage{display:none!important}.agentbtn>span:first-child{display:none}.agentbtn{padding-left:6px}}
+@media(max-width:760px){
+  #agentPanel .agbody{flex-direction:column}
+  #agentList{width:auto;max-height:36vh;border-right:none;border-bottom:1px solid var(--line)}
+}
 #shell{flex:1;display:flex;min-height:0;position:relative}
 #mainCol{flex:1;display:flex;flex-direction:column;min-width:0}
 #sidebar{width:var(--sbw,270px);flex-shrink:0;background:var(--bg2);border-right:1px solid var(--line);display:flex;flex-direction:column;overflow-y:auto}
@@ -3614,6 +4480,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
   <span class="curname" id="curname">— no session —</span>
   <span class="ctx" id="ctx" title="context-window usage"></span>
   <span class="usage" id="usage" title="usage limits (5h / 7d)"></span>
+  <button class="iconbtn agentbtn" id="agentbtn" title="subagents"><span>Agents</span><span class="agentn" id="agentN">0</span></button>
 </header>
 
 <div id="shell">
@@ -3697,7 +4564,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     </div>
   </div></div>
   <div id="mainCol">
-    <div id="chat"><div class="wrap" id="stream"></div></div>
+    <div id="chat"><div class="plandock" id="planDock" hidden></div><div class="wrap" id="stream"></div></div>
     <div id="composer">
       <div class="pillrow">
         <div id="thinking"><div class="twrap"><span class="dot" id="dot"></span><span class="glyph">✶</span><span class="word">idle</span><span class="meta"></span></div></div>
@@ -3718,6 +4585,13 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
   <div class="dh"><span class="tab on" id="tabEdits">Edits <span id="editN">0</span></span><span class="tab" id="tabGit">Git diff</span><span class="grow"></span><span class="btn" id="grefresh">↻</span><span class="btn" id="dclose">✕</span></div>
   <div class="dc" id="edits"><div class="empty">no file changes yet</div></div>
   <div class="dc" id="gitc" style="display:none"><div class="empty">—</div></div>
+</div>
+<div id="agentPanel">
+  <div class="agh"><span class="agtit">Subagents</span><span class="agmeta" id="agentMeta"></span><span class="grow"></span><span class="btn" id="agentClose">✕</span></div>
+  <div class="agbody">
+    <div id="agentList"><div class="empty">no subagents yet</div></div>
+    <div id="agentDetail"><div class="empty">select a subagent</div></div>
+  </div>
 </div>
 <div id="fimp" hidden>
   <div id="fimppanel">
@@ -3762,6 +4636,7 @@ let curEffort=localStorage.getItem('al_effort')||'xhigh';
 let activeModel='default';
 let showThink=false;
 let liveSessions=[], projData=[], HOMEDIR='';
+let subagents={}, subagentCurrent='';
 /* which project groups are expanded — per device, survives reloads */
 let pExp=new Set();try{pExp=new Set(JSON.parse(localStorage.getItem('al_pexp')||'[]'));}catch(e){}
 const EDIT_TOOLS=new Set(['Edit','MultiEdit','Write','NotebookEdit','apply_patch']);
@@ -3873,14 +4748,21 @@ let replaying=false;   /* true while bulk-replaying a session log on attach — 
 function atBottom(){if(replaying)return false;const c=$('#chat');return c.scrollHeight-c.scrollTop-c.clientHeight<140;}
 function scroll(){if(replaying)return;const c=$('#chat');c.scrollTop=c.scrollHeight;}
 
-const ICON={Edit:'✏️',MultiEdit:'✏️',Write:'📝',Bash:'▶',Read:'📖',Glob:'🔍',Grep:'🔍',Task:'🤖',
+const ICON={Edit:'✏️',MultiEdit:'✏️',Write:'📝',Bash:'▶',Read:'📖',List:'📂',Search:'🔍',
+  Glob:'🔍',Grep:'🔍',Task:'🤖',Agent:'🤖',ViewImage:'🖼',ImageGeneration:'🖼',
   WebFetch:'🌐',WebSearch:'🌐',TodoWrite:'☑️',NotebookEdit:'📓',
   apply_patch:'✏️',shell:'▶',web_search:'🌐'};   /* codex tools */
 function primaryArg(i){if(!i)return '';if(typeof i==='string')return i.slice(0,80);
   if(i.file_path)return i.file_path.split('/').slice(-2).join('/');
+  if(i.display)return (''+i.display).split('\n')[0].slice(0,90);
+  if(i.query)return (''+i.query).split('\n')[0].slice(0,90);
+  if(Array.isArray(i.queries)&&i.queries.length)return (''+i.queries[0]).split('\n')[0].slice(0,90);
+  if(i.url)return i.url;
   if(i.command)return (''+i.command).split('\n')[0].slice(0,90);
+  if(i.prompt)return (''+i.prompt).split('\n')[0].slice(0,90);
+  if(i.path)return (''+i.path).split('/').slice(-2).join('/');
   if(i.pattern)return i.pattern;if(i.description)return i.description.slice(0,80);
-  if(i.url)return i.url;return '';}
+  return '';}
 function counts(ev){const i=ev.input||{};
   if(ev.tool==='Edit'&&i.new_string!==undefined)return {a:(i.new_string.match(/\n/g)||[]).length+1,d:(i.old_string.match(/\n/g)||[]).length+1};
   if(ev.tool==='Write'&&i.content!==undefined)return {a:(i.content.match(/\n/g)||[]).length+1,d:0};
@@ -3891,10 +4773,18 @@ function toolBody(ev){const i=ev.input||{},t=ev.tool;
   if(t==='apply_patch'&&typeof i.diff==='string')return diffHtml(i.diff);   /* codex: render the unified diff directly */
   if(t==='Edit'&&i.old_string!==undefined)return diffHtml(i.old_string.split('\n').map(x=>'-'+x).join('\n')+'\n'+i.new_string.split('\n').map(x=>'+'+x).join('\n'));
   if(t==='Write'&&i.content!==undefined)return '<div class="reslabel">new file content</div>'+diffHtml(i.content.split('\n').map(x=>'+'+x).join('\n'));
-  if((t==='Bash'||t==='shell'||t==='Read')&&i.command)return '<pre><code>'+esc(i.command)+'</code></pre>';
+  if(t==='web_search'){
+    const act=i.action||'search';
+    if(act==='search')return '<div class="reslabel">search</div><pre><code>'+
+      esc((Array.isArray(i.queries)&&i.queries.length?i.queries.join('\n'):(i.query||'')))+'</code></pre>';
+    if(act==='openPage')return '<div class="reslabel">open page</div><pre><code>'+esc(i.url||'')+'</code></pre>';
+    if(act==='findInPage')return '<div class="reslabel">find in page</div><pre><code>'+esc((i.pattern||'')+(i.url?('\n'+i.url):''))+'</code></pre>';
+  }
+  if((t==='Bash'||t==='shell'||t==='Read'||t==='List'||t==='Search')&&i.command)return '<pre><code>'+esc(i.command)+'</code></pre>';
   if(typeof i==='string')return '<pre><code>'+esc(i)+'</code></pre>';
   return '<pre><code>'+esc(JSON.stringify(i,null,2))+'</code></pre>';}
 
+let textItems={},thinkItems={},planItems={},turnDiffCards={};
 function addUser(text,nImg){const s=atBottom();const d=document.createElement('div');d.className='msg user';
   d.innerHTML='<div class="b">'+esc(text)+'</div>'+(nImg?'<div class="imgs">🖼 '+nImg+' image'+(nImg>1?'s':'')+' attached</div>':'');
   stream.appendChild(d);scroll();}
@@ -3902,12 +4792,50 @@ function addAsst(text){const s=atBottom();const d=document.createElement('div');
   d.innerHTML='<div class="b bubble">'+md(text)+'</div>';typesetMath(d);stream.appendChild(d);if(s)scroll();}
 function addThink(text){const s=atBottom();const d=document.createElement('div');d.className='think'+(showThink?'':' hide');d.dataset.t=1;
   d.textContent=text;stream.appendChild(d);if(s)scroll();}
+function upsertAsst(ev){const id=ev.itemId||'asst-'+Object.keys(textItems).length;
+  let rec=textItems[id],s=atBottom();
+  if(!rec){const d=document.createElement('div');d.className='msg asst streaming';
+    d.innerHTML='<div class="b bubble"></div>';stream.appendChild(d);rec=textItems[id]={el:d,text:''};}
+  rec.text=ev.text!=null?ev.text:(rec.text+(ev.delta||''));const b=rec.el.querySelector('.bubble');
+  b.innerHTML=md(rec.text);typesetMath(rec.el);if(ev.text!=null)rec.el.classList.remove('streaming');if(s)scroll();}
+function upsertThink(ev){const id=ev.itemId||'think-'+Object.keys(thinkItems).length;
+  let rec=thinkItems[id],s=atBottom();
+  if(!rec){const d=document.createElement('div');d.className='think'+(showThink?'':' hide')+' streaming';
+    d.dataset.t=1;stream.appendChild(d);rec=thinkItems[id]={el:d,text:''};}
+  rec.text=ev.text!=null?ev.text:(rec.text+(ev.delta||''));rec.el.textContent=rec.text;
+  if(ev.text!=null)rec.el.classList.remove('streaming');if(s)scroll();}
+function planStepClass(st){st=(''+(st||'')).toLowerCase();
+  if(st.includes('complete')||st==='done')return ['done','●'];
+  if(st.includes('progress')||st==='active')return ['active','◐'];
+  return ['todo','○'];}
+function planHTML(ev,rec){let h='<div class="ph">☑ Plan</div>';
+  if(ev.explanation)h+='<div class="pex">'+esc(ev.explanation)+'</div>';
+  if(Array.isArray(ev.plan)&&ev.plan.length){h+='<div class="psteps">';
+    ev.plan.forEach(x=>{const pc=planStepClass(x.status),step=x.step||x.text||'';
+      h+='<div class="pst '+pc[0]+'"><span class="pi">'+pc[1]+'</span><span>'+esc(step)+'</span></div>';});
+    h+='</div>';}
+  else{const text=(ev.text!=null?ev.text:(rec&&rec.text)||'')+(ev.delta||'');
+    h+='<div class="ptext">'+esc(text||'planning…')+'</div>';}
+  return h;}
+function upsertPlan(ev){const id='plan-current';
+  let rec=planItems[id],s=atBottom(),host=$('#planDock');
+  if(!rec)rec=planItems[id]={text:'',explanation:'',plan:null};
+  if(!host)return;
+  if(ev.text!=null)rec.text=ev.text;else if(ev.delta)rec.text+=ev.delta;
+  if(ev.explanation!=null)rec.explanation=ev.explanation;
+  if(Array.isArray(ev.plan))rec.plan=ev.plan;
+  const stable={text:rec.text,explanation:rec.explanation,plan:rec.plan};
+  host.hidden=false;
+  host.innerHTML='<div class="plan '+((ev.plan||ev.text!=null)?'':'streaming')+'">'+planHTML(stable,rec)+'</div>';
+  if(s)scroll();}
+function addGoal(ev){const g=ev.goal;if(!g){addNotice('goal cleared');return;}
+  const used=g.tokensUsed!=null?(' · '+fmtTok(g.tokensUsed)+(g.tokenBudget?('/'+fmtTok(g.tokenBudget)):'')+' tokens'):'';
+  addNotice('goal '+(g.status||'updated')+': '+(g.objective||'')+used);}
 function addNotice(t){const d=document.createElement('div');d.className='notice';d.textContent=t;stream.appendChild(d);}
 function addStatus(ev){const s=atBottom(),st=ev.status||{},se=st.session||{},sv=st.service||{},g=st.git||{};
   const ctx=st.context||{},u=st.usage||{};
   const state=se.ended?'ended':(se.compacting?'compacting':(se.busy?'busy '+fmtSecs((se.turn_age||0)*1000):'ready'));
   let ctxText=ctx.percentage!=null?(ctx.percentage+'% · '+fmtTok(ctx.totalTokens)+' / '+fmtTok(ctx.maxTokens)):'unknown';
-  if(ctx.reportedMaxTokens&&ctx.reportedMaxTokens!==ctx.maxTokens)ctxText+=' · reported '+fmtTok(ctx.reportedMaxTokens);
   const win=(o)=>o&&o.utilization!=null?Math.round(o.utilization)+'%':'unknown';
   const usageText='5h '+win(u.five_hour)+' · weekly '+win(u.seven_day);
   const gitText=g.ok?(g.branch+'@'+(g.head||'?')+' · '+(g.dirty?('dirty '+g.file_count+' files'):'clean')):(g.error||'unknown');
@@ -3930,6 +4858,94 @@ function addStatus(ev){const s=atBottom(),st=ev.status||{},se=st.session||{},sv=
 function addRecap(t){const s=atBottom();const d=document.createElement('div');d.className='recap';
   d.innerHTML='<span class="rk">※ recap:</span> <span class="rt"></span>';
   d.querySelector('.rt').textContent=t;stream.appendChild(d);if(s)scroll();}
+const AGENT_DONE=new Set(['completed','interrupted','errored','shutdown','notfound']);
+function agentRows(){return Object.values(subagents).filter(a=>a&&a.threadId).sort((a,b)=>{
+  const aa=agentActive(a),bb=agentActive(b);
+  if(aa!==bb)return aa?-1:1;
+  return (b.updatedAt||0)-(a.updatedAt||0);});}
+function agentState(a){return (''+(a&&a.state||'running')).toLowerCase();}
+function agentActive(a){return a&&a.active!==false&&!AGENT_DONE.has(agentState(a));}
+function agentDot(a){const st=agentState(a);
+  if(st==='completed')return 'ok';
+  if(st==='errored'||st==='notfound')return 'bad';
+  return agentActive(a)?'run':'';}
+function agentMeta(a){const bits=[];
+  if(a.state)bits.push(a.state);
+  if(a.model)bits.push(a.model);
+  if(a.reasoningEffort)bits.push(a.reasoningEffort);
+  if(a.updatedAt)bits.push(reltime(a.updatedAt));
+  return bits.join(' · ');}
+function mergeSubagents(list,reset){
+  if(reset){subagents={};subagentCurrent='';}
+  (list||[]).forEach(a=>{if(a&&a.threadId)subagents[a.threadId]=Object.assign({},subagents[a.threadId]||{},a);});
+  const rows=agentRows();
+  if(subagentCurrent&&!subagents[subagentCurrent])subagentCurrent='';
+  if(!subagentCurrent&&rows.length)subagentCurrent=rows[0].threadId;
+  renderSubagentBadge();renderSubagents();}
+function renderSubagentBadge(){const btn=$('#agentbtn');if(!btn)return;
+  const rows=agentRows(),active=rows.filter(agentActive).length;
+  btn.classList.toggle('on',rows.length>0);btn.classList.toggle('busy',active>0);
+  $('#agentN').textContent=active||rows.length||0;
+  btn.title=rows.length?('subagents: '+active+' active / '+rows.length+' total'):'subagents';
+  if(!rows.length&&agentPanelOpen())closeSubagents();}
+function agentPanelOpen(){const p=$('#agentPanel');return p&&p.classList.contains('open');}
+function openSubagents(threadId){if(threadId)subagentCurrent=threadId;
+  const p=$('#agentPanel');if(!p)return;
+  $('#drawer').classList.remove('open');
+  p.classList.add('open');renderSubagents();
+  if(subagentCurrent)loadSubagentThread(subagentCurrent);}
+function closeSubagents(){const p=$('#agentPanel');if(p)p.classList.remove('open');}
+function renderSubagents(){
+  const list=$('#agentList'),detail=$('#agentDetail'),meta=$('#agentMeta');if(!list||!detail)return;
+  const rows=agentRows();if(!subagentCurrent&&rows.length)subagentCurrent=rows[0].threadId;
+  const active=rows.filter(agentActive),done=rows.filter(a=>!agentActive(a));
+  if(meta)meta.textContent=rows.length?(active.length+' active · '+rows.length+' total'):'';
+  if(!rows.length){list.innerHTML='<div class="empty">no subagents yet</div>';detail.innerHTML='<div class="empty">select a subagent</div>';return;}
+  const section=(title,items)=>items.length?('<div class="agsec">'+title+'</div>'+
+    items.map(a=>agentRowHTML(a)).join('')):'';
+  list.innerHTML=section('active',active)+section('done',done);
+  list.querySelectorAll('.agrow').forEach(el=>el.onclick=()=>{subagentCurrent=el.dataset.tid;renderSubagents();loadSubagentThread(subagentCurrent);});
+}
+function agentRowHTML(a){
+  const sub=a.message||a.prompt||a.title||a.threadId||'';
+  return '<div class="agrow '+(subagentCurrent===a.threadId?'on ':'')+(agentActive(a)?'':'done')+'" data-tid="'+escAttr(a.threadId)+'">'+
+    '<span class="agdot '+agentDot(a)+'"></span><div class="agm"><div class="agn">'+esc(a.label||'subagent')+'</div>'+
+    '<div class="ags">'+esc(agentMeta(a)+(sub?(' · '+sub):''))+'</div></div></div>';
+}
+function loadSubagentThread(threadId){
+  if(!threadId)return;
+  const d=$('#agentDetail');if(d)d.innerHTML='<div class="empty">loading subagent thread...</div>';
+  wsSend({type:'subagent_read',threadId:threadId,limit:160});}
+function renderSubagentThread(m){
+  if(!m||!m.threadId)return;
+  if(m.subagent)mergeSubagents([m.subagent]);
+  if(subagentCurrent&&m.threadId!==subagentCurrent)return;
+  subagentCurrent=m.threadId;renderSubagents();
+  const d=$('#agentDetail');if(!d)return;
+  const a=subagents[m.threadId]||m.subagent||{},thread=m.thread||{},msgs=m.messages||[];
+  const title=a.label||thread.name||thread.preview||'subagent';
+  const bits=[a.state||thread.status,a.model,a.reasoningEffort,thread.cwd||a.cwd].filter(Boolean).join(' · ');
+  let h='<div class="aghead"><div class="agt">'+esc(title)+'</div><div class="agsub">'+esc(bits||m.threadId)+'</div></div>';
+  if(!m.ok&&m.error&&!msgs.length){d.innerHTML=h+'<div class="empty">'+esc(m.error)+'</div>';return;}
+  if(m.error)h+='<div class="errline">'+esc(m.error)+'</div>';
+  if(!msgs.length){d.innerHTML=h+'<div class="empty">no visible subagent messages yet</div>';return;}
+  h+='<div class="agmsgs">'+msgs.map(agentMsgHTML).join('')+'</div>';
+  d.innerHTML=h;typesetMath(d);d.scrollTop=d.scrollHeight;
+}
+function agentMsgHTML(x){
+  const role=(x.role||'tool').toLowerCase(),kind=x.kind?(' · '+x.kind):'',status=x.status?(' · '+x.status):'';
+  const label=(role==='assistant'?'assistant':role)+kind+status;
+  const body=(role==='tool')
+    ? '<pre><code>'+esc(x.txt||'')+'</code></pre>'
+    : md(x.txt||'');
+  return '<div class="agmsg '+escAttr(role)+'"><div class="agr">'+esc(label)+'</div><div class="agtxt">'+body+'</div></div>';}
+function addSubagentMarker(ev){
+  const a=ev.subagent||{};if(a.threadId)mergeSubagents([a]);
+  const s=atBottom(),d=document.createElement('div');d.className='agmark';
+  d.innerHTML='<span>Agents</span><span>'+esc(a.label||'subagent')+'</span><span class="mut">'+
+    esc(ev.activity||a.state||'updated')+' — open</span>';
+  d.onclick=()=>openSubagents(a.threadId||'');
+  stream.appendChild(d);if(s)scroll();}
 /* turn-complete footer line — ✻ {past verb} for {N}s · {YYYY-MM-DD HH:MM:SS} UTC (server-stamped) */
 function utcStamp(sec){const d=new Date(sec*1000),p=n=>String(n).padStart(2,'0');
   return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+
@@ -3950,9 +4966,56 @@ function addTool(ev){const s=atBottom();const c=document.createElement('div');c.
   c.querySelector('.th').onclick=()=>{const open=c.classList.toggle('open');
     if(open&&!c._bodyDone){c._bodyDone=1;c.querySelector('.res').insertAdjacentHTML('beforebegin',toolBody(c._ev));}};
   stream.appendChild(c);if(ev.toolId)tools[ev.toolId]=c;if(s)scroll();}
-function addResult(ev){const c=tools[ev.toolId];if(!c)return;if(ev.isError)c.classList.add('err');
-  const b=(ev.content||'').trim();c.querySelector('.res').innerHTML='<div class="reslabel">'+(ev.isError?'error ⤵':'output ⤵')+
-    '</div><pre><code>'+esc(b.length>2200?b.slice(0,2200)+'\n…':b)+'</code></pre>';}
+function resultBits(ev){const bits=[];if(ev.status)bits.push(ev.status);
+  if(ev.exitCode!==undefined&&ev.exitCode!==null)bits.push('exit '+ev.exitCode);
+  if(ev.durationMs!=null)bits.push(fmtSecs(ev.durationMs));return bits;}
+function resultMeta(ev){const bits=resultBits(ev);return bits.length?'<span class="resmeta">'+esc(bits.join(' · '))+'</span>':'';}
+function clipOut(t){t=t||'';return t.length>2200?t.slice(0,2200)+'\n…':t;}
+function setToolOutput(c,label,text,isError,ev){const r=c&&c.querySelector('.res');if(!r)return;
+  r.innerHTML='<div class="reslabel">'+label+' ⤵'+(ev?resultMeta(ev):'')+'</div><pre><code>'+
+    esc(clipOut((text||'').trim()))+'</code></pre>';if(isError)c.classList.add('err');}
+function updateToolHeader(c,ev){if(!c||!ev)return;
+  const old=c._ev||{},merged=Object.assign({},old,ev);c._ev=merged;
+  const ico=c.querySelector('.ico');if(ico&&merged.tool)ico.textContent=ICON[merged.tool]||'🔧';
+  const tn=c.querySelector('.tn');if(tn&&merged.tool)tn.textContent=merged.tool;
+  const tp=c.querySelector('.tp,.ef');if(tp)tp.textContent=primaryArg(merged.input)||merged.tool||'';
+  const cnt=c.querySelector('.cnt'),cn=counts(merged);if(cnt)cnt.innerHTML=cn?('<span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span>'):'';}
+function updateTool(ev){let c=tools[ev.toolId];if(!c){
+    if(EDIT_TOOLS.has(ev.tool)){addEditCard(ev);addMarker(ev);}else addTool(ev);return;}
+  updateToolHeader(c,ev);
+  if(c.classList.contains('ecard')){
+    const shouldBuild=c._bodyDone||(drawerOpen()&&!gitTab());
+    if(shouldBuild){c._bodyDone=1;c.querySelector('.ed').innerHTML=toolBody(c._ev);}
+  }}
+function addResult(ev){const c=tools[ev.toolId];if(!c)return;c.classList.add('done');if(ev.isError)c.classList.add('err');
+  const b=((ev.content!=null?ev.content:c._output)||'').trim();
+  if(b||ev.isError||c._output)setToolOutput(c,ev.isError?'error':'output',b,ev.isError,ev);
+  else if(resultBits(ev).length){const r=c.querySelector('.res');
+    if(r)r.innerHTML='<div class="reslabel">done'+resultMeta(ev)+'</div>';}}
+function appendToolDelta(ev){let c=tools[ev.toolId];if(!c){addTool({kind:'tool_use',tool:'Bash',input:{command:ev.toolId||'process output'},toolId:ev.toolId});c=tools[ev.toolId];}
+  if(!c)return;c._output=(c._output||'')+(ev.delta||'');
+  if(c._output.length>12000)c._output=c._output.slice(c._output.length-12000);
+  setToolOutput(c,ev.stream==='stderr'?'stderr':'output',c._output,false,null);
+  if(ev.capReached)addToolProgress({toolId:ev.toolId,text:'output cap reached'});}
+function addToolProgress(ev){const c=tools[ev.toolId];if(!c||!ev.text)return;
+  let p=c.querySelector('.progress');
+  if(!p){p=document.createElement('div');p.className='progress';
+    const host=c.querySelector('.tb')||c.querySelector('.ed')||c;const res=host.querySelector('.res');
+    host.insertBefore(p,res||host.firstChild);}
+  p.textContent+=(p.textContent?'\n':'')+ev.text;}
+function addTurnDiff(ev){if(!ev.diff)return;const id=ev.turnId||'turn-current';let c=turnDiffCards[id];
+  if(!c){if(editCount===0)$('#edits').innerHTML='';
+    c=document.createElement('div');c.className='ecard turndiff';
+    c.innerHTML='<div class="eh"><span>✏️</span><span class="ef">Turn diff</span></div><div class="ed"></div><div class="res"></div>';
+    $('#edits').appendChild(c);turnDiffCards[id]=c;editCount++;updateEditBadge();}
+  c.querySelector('.ed').innerHTML=diffHtml(ev.diff);
+  if(!replaying){const ed=$('#edits');ed.scrollTop=ed.scrollHeight;}}
+function applySettings(ev){if(ev.display_model||ev.model){activeModel=(ev.model&&ev.model!=='default')?ev.model:(ev.display_model||activeModel);setResolvedModel(ev.display_model||ev.model);}
+  if(ev.effort)setEffortPill(ev.effort);if(ev.cwd){cwd=ev.cwd;bindProject(cwd);}}
+function applyThreadStatus(ev){const st=(''+(ev.status||'')).toLowerCase();
+  if(st==='active')setBusy(true);else if(st==='idle'||st==='notloaded')setBusy(false);}
+function addModelReroute(ev){if(ev.to){activeModel=ev.to;setResolvedModel(ev.to);}
+  addNotice('model rerouted'+(ev.from?(' from '+ev.from):'')+(ev.to?(' to '+ev.to):'')+(ev.reason?(' · '+ev.reason):''));}
 
 function statset(t){const el=$('#thinking');if(!el)return;
   const w=el.querySelector('.word');if(w)w.textContent=t;
@@ -4049,6 +5112,9 @@ function fmtSecs(ms){const s=Math.max(0,Math.round(ms/1000));if(s<60)return s+'s
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;
+  textItems={};thinkItems={};planItems={};turnDiffCards={};
+  const pd=$('#planDock');if(pd){pd.hidden=true;pd.innerHTML='';}
+  mergeSubagents([],true);
   queued={};renderQueue();stopThinking();}
 
 /* file edits → out of chat, into the Changes drawer */
@@ -4121,15 +5187,24 @@ function fmtCompacted(ev){let s='🗜 context compacted';
 function route(ev){
   /* if activity resumes while we think we're idle (e.g. the CLI ran an injected
      queued message as its own turn), step back into the busy state */
-  if(!running&&(ev.kind==='assistant_text'||ev.kind==='thinking'||ev.kind==='tool_use'))setBusy(true);
+  if(!running&&['assistant_text','assistant_delta','assistant_update','thinking','thinking_delta',
+      'thinking_update','plan','plan_delta','plan_text','tool_use','tool_delta','tool_progress',
+      'tool_update'].includes(ev.kind))setBusy(true);
   if(ev.kind==='user_text')addUser(ev.text,ev.images);
   else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;curCC=ev.session_id||curCC;
     if(!replaying)activeModel=(ev.model&&ev.model!=='default'?ev.model:(ev.display_model||activeModel));
     const modelName=ev.display_model||ev.model||'';if(modelName)setResolvedModel(modelName);
     addNotice('● session ready · '+modelName+(ev.effort?' · '+ev.effort+' effort':'')+' · '+(ev.cwd||''));}
-  else if(ev.kind==='assistant_text')addAsst(ev.text);
-  else if(ev.kind==='thinking')addThink(ev.text);
+  else if(ev.kind==='assistant_text'){if(ev.itemId)upsertAsst({itemId:ev.itemId,text:ev.text});else addAsst(ev.text);}
+  else if(ev.kind==='assistant_delta'||ev.kind==='assistant_update')upsertAsst(ev);
+  else if(ev.kind==='thinking'){if(ev.itemId)upsertThink({itemId:ev.itemId,text:ev.text});else addThink(ev.text);}
+  else if(ev.kind==='thinking_delta'||ev.kind==='thinking_update')upsertThink(ev);
+  else if(ev.kind==='plan'||ev.kind==='plan_delta'||ev.kind==='plan_text')upsertPlan(ev);
+  else if(ev.kind==='turn_diff')addTurnDiff(ev);
   else if(ev.kind==='tool_use'){if(EDIT_TOOLS.has(ev.tool)){addEditCard(ev);addMarker(ev);}else addTool(ev);}
+  else if(ev.kind==='tool_update')updateTool(ev);
+  else if(ev.kind==='tool_delta')appendToolDelta(ev);
+  else if(ev.kind==='tool_progress')addToolProgress(ev);
   else if(ev.kind==='tool_result')addResult(ev);
   else if(ev.kind==='approval')addApproval(ev);
   else if(ev.kind==='approval_resolved')resolveApprovalCard(ev.aid,ev.allow,ev.always);
@@ -4144,6 +5219,14 @@ function route(ev){
   else if(ev.kind==='notice')addNotice(ev.text);
   else if(ev.kind==='status')addStatus(ev);
   else if(ev.kind==='recap')addRecap(ev.text);
+  else if(ev.kind==='settings')applySettings(ev);
+  else if(ev.kind==='thread_status')applyThreadStatus(ev);
+  else if(ev.kind==='model_rerouted')addModelReroute(ev);
+  else if(ev.kind==='subagents')mergeSubagents(ev.subagents||[]);
+  else if(ev.kind==='subagent_activity')addSubagentMarker(ev);
+  else if(ev.kind==='safety_buffering')addNotice('model safety buffering'+(ev.fasterModel?(' · faster fallback '+ev.fasterModel):''));
+  else if(ev.kind==='goal')addGoal(ev);
+  else if(ev.kind==='thread_lifecycle')addNotice((ev.method||'thread lifecycle').replace('thread/','thread '));
 }
 
 /* persistent server-side session: attach / reattach / switch */
@@ -4152,21 +5235,24 @@ function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;$('#d
 function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);loadDraft(sid);
     activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');setEffortPill(m.effort);renderCtx(null);statset('ready');
+    mergeSubagents(m.subagents||[],true);
     addNotice('new session « '+(m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');reqList();loadTree();}
   else if(m.type==='attached'){clearUI();pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
     activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setEffortPill(m.effort);renderCtx(m.ctx);renderUsage(m.usage);statset(m.ended?'ended':'ready');
     replaying=true;m.events.forEach(route);replaying=false;
+    mergeSubagents(m.subagents||[]);
     compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);loadDraft(sid);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
     else{ta.disabled=false;sendBtn.disabled=false;addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
     scroll();requestAnimationFrame(scroll);reqList();loadTree();}
   else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;ready=false;activeModel='default';setBusy(false);setCurname('');renderCtx(null);statset('idle');
+    mergeSubagents([],true);
     addNotice('that session is no longer running — pick it under “Resume from disk”, or ＋ New.');reqList();loadTree();}
   else if(m.type==='events')m.events.forEach(route);
   else if(m.type==='stderr')addErr(m.text);
   else if(m.type==='error'){pendingStart=false;addErr('⚠ '+m.error);}
-  else if(m.type==='exit'){if(!pendingStart){markEnded('session process exited (code '+m.code+')');setCurname('');}reqList();loadTree();}
-  else if(m.type==='ended'){dropDraft(m.id);if(m.id&&m.id===sid){sid=null;activeModel='default';setCurname('');markEnded('session ended');}reqList();loadTree();}
+  else if(m.type==='exit'){if(!pendingStart){markEnded('session process exited (code '+m.code+')');setCurname('');mergeSubagents([],true);}reqList();loadTree();}
+  else if(m.type==='ended'){dropDraft(m.id);if(m.id&&m.id===sid){sid=null;activeModel='default';setCurname('');markEnded('session ended');mergeSubagents([],true);}reqList();loadTree();}
   else if(m.type==='resumable_deleted'){
     if(pmanBatch){pmanBatch.done++;
       if(m.ok)pmanBatch.ok++;else pmanBatch.err.push(m.error||'?');
@@ -4179,6 +5265,7 @@ function onMsg(e){const m=JSON.parse(e.data);
   else if(m.type==='sessions')renderLive(m.sessions);
   else if(m.type==='context')renderCtx(m.ctx);
   else if(m.type==='usage')renderUsage(m.usage);
+  else if(m.type==='subagent_thread')renderSubagentThread(m);
   else if(m.type==='tokens'){tokUp=m.up||0;tokOut=m.out||0;tokShow=true;
     if(m.word!=null&&m.word!==lastWordSeed){lastWordSeed=m.word;if(running&&!compacting)setWord(m.word);}}
   else if(m.type==='projects'){projData=m.projects||[];renderSidebar();}
@@ -4211,8 +5298,6 @@ function renderCtx(c){const el=$('#ctx');
   el.className='ctx';el.style.display='inline-flex';
   el.innerHTML='<span class="ulabel">Context</span>'+cellBar(pct)+'<span>'+pct+'%</span>';
   let title='context '+(c.totalTokens||'?')+' / '+(c.maxTokens||'?')+' tokens ('+pct+'%)'+(c.model?' · '+c.model:'');
-  if(c.configuredMaxTokens&&c.configuredMaxTokens!==c.reportedMaxTokens)title+=' · configured '+fmtTok(c.configuredMaxTokens);
-  if(c.reportedMaxTokens&&c.reportedMaxTokens!==c.maxTokens)title+=' · reported '+fmtTok(c.reportedMaxTokens);
   el.title=title;
   setResolvedModel(c.model, c.maxTokens);}
 function fmtDur(ms){if(ms==null||ms<=0)return '0m';const m=Math.floor(ms/60000),h=Math.floor(m/60);
@@ -4874,7 +5959,7 @@ window.addEventListener('paste',handlePaste);
 sendBtn.onclick=sendMsg;
 $('#stop').onclick=doInterrupt;
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'&&running&&!srchOpen()&&!$('#cwdac').classList.contains('on')){e.preventDefault();doInterrupt();}});
+  if(e.key==='Escape'&&running&&!srchOpen()&&!agentPanelOpen()&&!$('#cwdac').classList.contains('on')){e.preventDefault();doInterrupt();}});
 $('#newbtn').onclick=newSession;
 /* color theme: apply + persist (the <head> script already set it pre-paint) */
 function applyTheme(t){if(t&&t!=='dark')document.documentElement.setAttribute('data-theme',t);
@@ -4884,6 +5969,8 @@ function applyTheme(t){if(t&&t!=='dark')document.documentElement.setAttribute('d
   applyTheme(t);})();
 $('#navtoggle').onclick=toggleSidebar;
 $('#sb-backdrop').onclick=closeSidebar;
+$('#agentbtn').onclick=()=>agentPanelOpen()?closeSubagents():openSubagents();
+$('#agentClose').onclick=closeSubagents;
 /* effort pill: model/list decides which depths this model supports. */
 $('#effort').onclick=ev=>{ev.stopPropagation();toggleCardMenu(ev.currentTarget,
   effortOptionsFor(currentEffortModel()).map(e=>({label:(e===curEffort?'● ':'○ ')+e,fn:()=>setEffort(e)})));};
@@ -4923,7 +6010,7 @@ applySecCollapse();
 /* dismiss the ⋯ card menu on outside-click, Escape, scroll or resize */
 document.addEventListener('click',e=>{if(!e.target.closest('#cardMenu')&&!e.target.closest('.skebab'))closeCardMenu();});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeCardMenu();
-  if(fimpOpened())fimpClose();if(pmanOpened())pmanClose();}});
+  if(fimpOpened())fimpClose();if(pmanOpened())pmanClose();if(agentPanelOpen())closeSubagents();}});
 window.addEventListener('resize',closeCardMenu);
 window.addEventListener('scroll',closeCardMenu,true);
 /* model/mode pickers set the NEW-session default only (persisted). A running
@@ -4943,6 +6030,8 @@ $('#dclose').onclick=()=>$('#drawer').classList.remove('open');
    openers → excluded, else the opening click would immediately re-close it. */
 document.addEventListener('click',e=>{
   if(drawerOpen()&&!e.target.closest('#drawer')&&!e.target.closest('.emark'))$('#drawer').classList.remove('open');});
+document.addEventListener('click',e=>{
+  if(agentPanelOpen()&&!e.target.closest('#agentPanel')&&!e.target.closest('#agentbtn')&&!e.target.closest('.agmark'))closeSubagents();});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&drawerOpen())$('#drawer').classList.remove('open');});
 $('#grefresh').onclick=refreshGit;
 $('#project').onchange=()=>{const c=$('#project').value==='__custom__';
