@@ -20,6 +20,9 @@ a Codex-style chat where code and conversation stay visually separated.
   whole working tree.
 - **Multi-session sidebar** — Live / Favorites / Recent / In-folder sections.
   Each card has a `⋮` menu: rename, favorite, delete, end.
+- **Session tabs** — keep a compact working set across projects. Clicking a Live
+  session opens or activates its tab; closing a tab leaves the Codex process
+  running in the sidebar until you explicitly end it.
 - **Resumable sessions** — reopen a project and pick up a previous Codex thread
   (rollouts under `~/.codex/sessions` restore history and the right `cwd`).
 - **History search** — `Ctrl/Cmd+K` searches indexed Codex history across all

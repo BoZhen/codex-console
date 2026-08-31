@@ -1,3 +1,4 @@
+import inspect
 import os
 import unittest
 
@@ -34,6 +35,18 @@ class AppServerV2EventTests(unittest.TestCase):
         self.assertEqual(
             [event["kind"] for event in session.log],
             ["assistant_delta", "assistant_delta"])
+
+    def test_incremental_attach_uses_monotonic_event_sequences(self):
+        session, _ = _session()
+        session._push([{"kind": "notice", "text": "one"}])
+        first_seq = session.log[-1]["_seq"]
+        session._push([{"kind": "notice", "text": "two"}])
+
+        events, incremental = session.events_since(first_seq)
+
+        self.assertTrue(incremental)
+        self.assertEqual([event["text"] for event in events], ["two"])
+        self.assertGreater(events[0]["_seq"], first_seq)
 
     def test_command_actions_classify_pipeline_reads_as_read(self):
         session, _ = _session()
@@ -297,6 +310,26 @@ class AppServerV2EventTests(unittest.TestCase):
         self.assertIn("if(lang==='math'){", html)
         self.assertNotIn("lang==='latex'||lang==='tex'", html)
         self.assertIn("bl.push('<pre><code>'+esc(c.replace", html)
+
+    def test_session_tabs_open_live_sessions_without_resuming(self):
+        html = codex_console.CONSOLE_HTML
+        socket_source = inspect.getsource(codex_console.ChatSocket.on_message)
+
+        self.assertIn('id="sessionTabs"', html)
+        self.assertIn('role="tablist"', html)
+        self.assertIn("function ensureSessionTab(s,active)", html)
+        self.assertIn("function closeSessionTab(id)", html)
+        self.assertIn("function openLiveSession(s)", html)
+        self.assertIn("sessionViewCache=new Map()", html)
+        self.assertIn("function stashSessionView(id)", html)
+        self.assertIn("function restoreSessionView(id)", html)
+        self.assertIn("ensureSessionTab(s,false);switchSession(s.id)", html)
+        self.assertIn("const req={type:'attach',id:id}", html)
+        self.assertIn("if(cached)req.after_seq", html)
+        self.assertIn("wsSend({type:'detach'})", html)
+        self.assertNotIn("stab-project", html)
+        self.assertIn('elif mt == "detach":', socket_source)
+        self.assertIn("self.session.detach(self)", socket_source)
 
     def test_file_change_patch_updates_existing_change_card(self):
         session, _ = _session()

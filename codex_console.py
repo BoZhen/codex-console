@@ -2312,6 +2312,7 @@ class ChatSession:
         self.effort = _sanitize_effort(effort, effort_model)   # reasoning effort (per-turn)
         self.proc = None                # the `codex app-server` subprocess
         self.log = []                   # normalized-event history, for replay
+        self.event_seq = 0              # monotonic sequence for incremental tab attach
         self.viewers = set()            # attached ChatSockets
         self.busy = False
         self.ended = False
@@ -2365,6 +2366,8 @@ class ChatSession:
                 self.ctx = dict(self.transcript_meta["ctx"])
             self.log = load_transcript_events(self.resume_cc)
             for ev in self.log:
+                self.event_seq += 1
+                ev["_seq"] = self.event_seq
                 if ev.get("kind") == "subagent_activity":
                     agent = dict(ev.get("subagent") or {})
                     tid = agent.get("threadId")
@@ -3479,10 +3482,30 @@ class ChatSession:
                 self.viewers.discard(v)
 
     def _push(self, evs):
+        for ev in evs:
+            self.event_seq += 1
+            ev["_seq"] = self.event_seq
         self.log.extend(evs)
         if len(self.log) > 1500:
             self.log = self.log[-1500:]
         self._emit({"type": "events", "events": evs})
+
+    def events_since(self, after_seq=None):
+        """Return an incremental replay when the requested sequence is retained."""
+        if after_seq is None:
+            return self.log, False
+        try:
+            after = int(after_seq)
+        except (TypeError, ValueError):
+            return self.log, False
+        if after < 0 or after > self.event_seq:
+            return self.log, False
+        if not self.log:
+            return [], True
+        first = int(self.log[0].get("_seq") or 1)
+        if after < first - 1:
+            return self.log, False
+        return [ev for ev in self.log if int(ev.get("_seq") or 0) > after], True
 
     def terminate(self):
         self.ended = True
@@ -3670,7 +3693,15 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "name": os.path.basename(cwd) or cwd,
                        "model": sess.model or "default", "display_model": sess.display_model,
                        "mode": sess.mode, "effort": sess.effort,
+                       "activity": sess.last_activity,
+                       "event_seq": sess.event_seq,
                        "subagents": sess.subagents_snapshot()})
+        elif mt == "detach":
+            old = self.session
+            if old:
+                old.detach(self)
+                self.session = None
+            self._say({"type": "detached", "id": old.id if old else None})
         elif mt == "attach":
             sess = CHAT_SESSIONS.get(msg.get("id"))
             if not sess:
@@ -3680,14 +3711,17 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                 self.session.detach(self)
             self.session = sess
             sess.attach(self)
+            events, events_delta = sess.events_since(msg.get("after_seq"))
             self._say({"type": "attached", "id": sess.id, "cwd": sess.cwd,
                        "name": os.path.basename(sess.cwd) or sess.cwd, "cc": sess.cc_id,
                        "title": sess.title(), "ctx": sess.ctx, "usage": sess.usage,
                        "model": sess.model or "default", "display_model": sess.display_model,
                        "mode": sess.mode,
-                       "busy": sess.busy, "ended": sess.ended, "events": sess.log,
+                       "busy": sess.busy, "ended": sess.ended, "events": events,
+                       "events_delta": events_delta, "event_seq": sess.event_seq,
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
                        "compacting": sess.compacting,
+                       "activity": sess.last_activity,
                        "subagents": sess.subagents_snapshot()})
             # returning to an idle session that's been quiet a while → recap it now
             # (the periodic sweep may not have ticked yet); guarded against busy/dup
@@ -3733,8 +3767,10 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "model": sess.model or "default", "display_model": sess.display_model,
                        "mode": sess.mode,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
+                       "events_delta": False, "event_seq": sess.event_seq,
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
                        "compacting": sess.compacting, "resumed": True,
+                       "activity": sess.last_activity,
                        "subagents": sess.subagents_snapshot()})
         elif mt == "subagent_read" and self.session:
             res = await self.session.read_subagent_thread(
@@ -3846,7 +3882,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                  "cc": s.cc_id, "model": s.model or "default", "display_model": s.display_model,
                  "mode": s.mode,
                  "effort": s.effort, "title": s.title(),
-                 "busy": s.busy, "ended": s.ended}
+                 "busy": s.busy, "ended": s.ended,
+                 "activity": s.last_activity, "event_seq": s.event_seq}
                 for s in CHAT_SESSIONS.values()]})
 
     def on_close(self):
@@ -4218,6 +4255,26 @@ pre code{background:none;border:none;padding:0}
 }
 #shell{flex:1;display:flex;min-height:0;position:relative}
 #mainCol{flex:1;display:flex;flex-direction:column;min-width:0}
+#sessionTabs{height:38px;flex:0 0 38px;display:flex;align-items:stretch;overflow-x:auto;overflow-y:hidden;
+  background:var(--bg2);border-bottom:1px solid var(--line);scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+#sessionTabs[hidden]{display:none}
+.stab{height:37px;flex:0 0 auto;max-width:250px;display:flex;align-items:center;border-right:1px solid var(--line);
+  background:var(--bg2);color:var(--mut);position:relative}
+.stab.active{background:var(--bg);color:var(--fg);box-shadow:inset 0 -2px var(--acc)}
+.stab.unread:not(.active){color:var(--fg)}
+.stab-main{height:37px;min-width:90px;max-width:216px;display:flex;align-items:center;gap:7px;padding:0 5px 0 10px;
+  border:0;background:transparent;color:inherit;font:inherit;cursor:pointer;overflow:hidden}
+.stab-dot{width:7px;height:7px;flex:none;border-radius:50%;background:var(--add)}
+.stab-dot.busy{background:var(--tool);box-shadow:0 0 5px var(--tool);animation:pulse 1s infinite}
+.stab-dot.ended{background:var(--mut);box-shadow:none}
+.stab-text{min-width:0;display:flex;align-items:baseline;overflow:hidden;white-space:nowrap}
+.stab-label{font-size:12.5px;overflow:hidden;text-overflow:ellipsis}
+.stab-unread{display:none;width:5px;height:5px;flex:none;border-radius:50%;background:var(--acc)}
+.stab.unread:not(.active) .stab-unread{display:inline-block}
+.stab-close{width:27px;height:27px;flex:none;display:inline-flex;align-items:center;justify-content:center;border:0;
+  background:transparent;color:var(--mut);font-size:15px;line-height:1;cursor:pointer;padding:0}
+.stab-close:hover{color:var(--fg);background:var(--bg3)}
+@media(max-width:680px){.stab{max-width:190px}.stab-main{max-width:158px}}
 #sidebar{width:var(--sbw,270px);flex-shrink:0;background:var(--bg2);border-right:1px solid var(--line);display:flex;flex-direction:column;overflow-y:auto}
 #sidebar.collapsed{display:none}
 /* desktop: drag handle on the sidebar's right edge to resize */
@@ -4469,7 +4526,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 @media(prefers-reduced-motion:reduce){
   *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;
     transition-duration:.01ms!important}
-  .dot.busy,.srow .sdot.busy,#thinking .glyph{animation:none!important;opacity:1!important}
+  .dot.busy,.srow .sdot.busy,.stab-dot.busy,#thinking .glyph{animation:none!important;opacity:1!important}
 }
 </style>
 <link rel="stylesheet" href="/static/katex/katex.min.css">
@@ -4565,6 +4622,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     </div>
   </div></div>
   <div id="mainCol">
+    <div id="sessionTabs" role="tablist" aria-label="Open sessions" hidden></div>
     <div id="chat"><div class="plandock" id="planDock" hidden></div><div class="wrap" id="stream"></div></div>
     <div id="composer">
       <div class="pillrow">
@@ -4638,10 +4696,15 @@ let activeModel='default';
 let showThink=false;
 let liveSessions=[], projData=[], HOMEDIR='';
 let subagents={}, subagentCurrent='';
+let currentCtx=null,sessionViewCache=new Map(),restoredViewId='';
 /* which project groups are expanded — per device, survives reloads */
 let pExp=new Set();try{pExp=new Set(JSON.parse(localStorage.getItem('al_pexp')||'[]'));}catch(e){}
 const EDIT_TOOLS=new Set(['Edit','MultiEdit','Write','NotebookEdit','apply_patch']);
 const SKEY='al_session';
+const TABSKEY='al_session_tabs';
+let sessionTabState=[],tabsValidated=false;
+try{const savedTabs=JSON.parse(localStorage.getItem(TABSKEY)||'[]');
+  if(Array.isArray(savedTabs))sessionTabState=savedTabs.filter(t=>t&&typeof t.id==='string').slice(0,24);}catch(e){}
 
 function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function escAttr(s){return esc(s).replace(/"/g,'&quot;');}
@@ -5039,6 +5102,7 @@ function bindProject(p){if(!p)return;const sel=$('#project');let ok=false;
   if(!ok){const o=document.createElement('option');o.value=p;o.textContent='● '+p.split('/').slice(-2).join('/');sel.insertBefore(o,sel.firstChild);}
   sel.value=p;}
 function setBusy(b,wordSeed,elapsedMs){running=b;$('#dot').className='dot '+(b?'busy':(ready?'on':''));
+  setSessionTabBusy(sid,b);
   $('#thinking').classList.toggle('busy',b);
   if(!b&&ready)statset('ready');      /* busy: startThinking owns the word + timer */
   ta.disabled=!ready;
@@ -5197,7 +5261,8 @@ function fmtCompacted(ev){let s='🗜 context compacted';
   if(ev.trigger)s+=' · '+(ev.trigger==='auto'?'auto':'manual');
   if(ev.ms)s+=' · '+Math.round(ev.ms/1000)+'s';
   return s;}
-function route(ev){
+function route(ev){const seq=Number(ev&&ev._seq||0),tab=sessionTabById(sid);
+  if(seq&&tab){tab.lastSeq=Math.max(Number(tab.lastSeq||0),seq);tab.serverSeq=Math.max(Number(tab.serverSeq||0),seq);}
   /* if activity resumes while we think we're idle (e.g. the CLI ran an injected
      queued message as its own turn), step back into the busy state */
   if(!running&&['assistant_text','assistant_delta','assistant_update','thinking','thinking_delta',
@@ -5248,24 +5313,31 @@ function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;$('#d
 function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);loadDraft(sid);
     activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');setEffortPill(m.effort);renderCtx(null);statset('ready');
+    const startedTab=ensureSessionTab(m,true);if(startedTab){startedTab.lastSeq=Number(m.event_seq||0);startedTab.serverSeq=startedTab.lastSeq;persistSessionTabs();}restoredViewId=m.id;
     mergeSubagents(m.subagents||[],true);
     addNotice('new session « '+(m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');reqList();loadTree();}
-  else if(m.type==='attached'){clearUI();pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
+  else if(m.type==='attached'){const incremental=!!m.events_delta&&restoredViewId===m.id,stick=incremental&&atBottom();
+    if(!incremental){clearUI();restoredViewId='';}pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
     activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setEffortPill(m.effort);renderCtx(m.ctx);renderUsage(m.usage);statset(m.ended?'ended':'ready');
+    ensureSessionTab(m,true);
     replaying=true;m.events.forEach(route);replaying=false;flushAsstRenders(!m.busy);
-    mergeSubagents(m.subagents||[]);
+    mergeSubagents(m.subagents||[],incremental);
     compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);loadDraft(sid);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
-    else{ta.disabled=false;sendBtn.disabled=false;addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
-    scroll();requestAnimationFrame(scroll);reqList();loadTree();}
+    else{ta.disabled=false;sendBtn.disabled=false;if(!incremental)addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
+    const attachedTab=sessionTabById(m.id);if(attachedTab){attachedTab.lastSeq=Number(m.event_seq||attachedTab.lastSeq||0);attachedTab.serverSeq=attachedTab.lastSeq;persistSessionTabs();}
+    restoredViewId=m.id;if(incremental){if(stick){scroll();requestAnimationFrame(scroll);}}else restoreSessionTabView(m.id);reqList();loadTree();}
+  else if(m.type==='detached'){if(!sid){ready=false;ta.disabled=true;sendBtn.disabled=true;statset('idle');}}
   else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;ready=false;activeModel='default';setBusy(false);setCurname('');renderCtx(null);statset('idle');
+    if(m.id){sessionViewCache.delete(m.id);const i=sessionTabState.findIndex(t=>t.id===m.id);if(i>=0){sessionTabState.splice(i,1);persistSessionTabs();renderSessionTabs();}}
     mergeSubagents([],true);
     addNotice('that session is no longer running — pick it under “Resume from disk”, or ＋ New.');reqList();loadTree();}
   else if(m.type==='events')m.events.forEach(route);
   else if(m.type==='stderr')addErr(m.text);
   else if(m.type==='error'){pendingStart=false;addErr('⚠ '+m.error);}
-  else if(m.type==='exit'){if(!pendingStart){markEnded('session process exited (code '+m.code+')');setCurname('');mergeSubagents([],true);}reqList();loadTree();}
-  else if(m.type==='ended'){dropDraft(m.id);if(m.id&&m.id===sid){sid=null;activeModel='default';setCurname('');markEnded('session ended');mergeSubagents([],true);}reqList();loadTree();}
+  else if(m.type==='exit'){if(!pendingStart){const t=sessionTabById(sid);if(t){t.busy=false;t.ended=true;persistSessionTabs();renderSessionTabs();}
+      markEnded('session process exited (code '+m.code+')');setCurname('');mergeSubagents([],true);}reqList();loadTree();}
+  else if(m.type==='ended'){dropDraft(m.id);if(m.id)closeSessionTab(m.id);else if(sid){sid=null;activeModel='default';setCurname('');markEnded('session ended');mergeSubagents([],true);}reqList();loadTree();}
   else if(m.type==='resumable_deleted'){
     if(pmanBatch){pmanBatch.done++;
       if(m.ok)pmanBatch.ok++;else pmanBatch.err.push(m.error||'?');
@@ -5274,7 +5346,7 @@ function onMsg(e){const m=JSON.parse(e.data);
           (pmanBatch.err.length?(' · '+pmanBatch.err.length+' failed: '+pmanBatch.err[0]):''));
         pmanBatch=null;reqList();loadTree();}}
     else{addNotice(m.ok?'🗑 session moved to trash':('delete failed: '+(m.error||'?')));loadTree();}}
-  else if(m.type==='renamed'){if(m.ok){if(m.cc&&m.cc===curCC&&m.name)setCurname(m.name);addNotice('✎ renamed');reqList();loadTree();}else addNotice('rename failed');}
+  else if(m.type==='renamed'){if(m.ok){if(m.cc&&m.cc===curCC&&m.name)setCurname(m.name);renameSessionTabs(m.cc,m.name);addNotice('✎ renamed');reqList();loadTree();}else addNotice('rename failed');}
   else if(m.type==='sessions')renderLive(m.sessions);
   else if(m.type==='context')renderCtx(m.ctx);
   else if(m.type==='usage')renderUsage(m.usage);
@@ -5285,8 +5357,9 @@ function onMsg(e){const m=JSON.parse(e.data);
 }
 function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
   ws=new WebSocket(proto+'//'+location.host+'/ws/chat');
-  ws.onopen=()=>{clearTimeout(reconnectT);$('#dot').className='dot '+(ready?'on':'');if(cb)cb();reqList();
-    const saved=localStorage.getItem(SKEY);if(saved&&!sid&&!pendingStart){statset('reattaching…');ws.send(JSON.stringify({type:'attach',id:saved}));}};
+  ws.onopen=()=>{clearTimeout(reconnectT);$('#dot').className='dot '+(ready?'on':'');reqList();
+    if(cb)cb();else{const saved=localStorage.getItem(SKEY);if(saved&&!pendingStart){const req={type:'attach',id:saved},tab=sessionTabById(saved);
+      if(restoredViewId===saved&&tab)req.after_seq=Number(tab.lastSeq||0);else statset('reattaching…');ws.send(JSON.stringify(req));}}};
   ws.onclose=()=>{$('#dot').className='dot';statset('disconnected');ta.disabled=true;sendBtn.disabled=true;
     clearTimeout(reconnectT);reconnectT=setTimeout(()=>openWs(),1800);};
   ws.onmessage=onMsg;}
@@ -5295,6 +5368,83 @@ function reqList(){wsSend({type:'list'});}
 function reltime(ts){const s=(Date.now()/1000)-ts;if(s<60)return Math.round(s)+'s';
   if(s<3600)return Math.round(s/60)+'m';if(s<86400)return Math.round(s/3600)+'h';return Math.round(s/86400)+'d';}
 function setCurname(t){$('#curname').textContent=t||'— no session —';}
+function sessionTabById(id){return sessionTabState.find(t=>t.id===id)||null;}
+function takeChildren(el){const f=document.createDocumentFragment();if(el)while(el.firstChild)f.appendChild(el.firstChild);return f;}
+function restoreChildren(el,frag){if(!el)return;el.innerHTML='';if(frag)el.appendChild(frag);}
+function stashSessionView(id){if(!id)return false;const t=sessionTabById(id);if(!t)return false;
+  flushAsstRenders(false);rememberActiveTabView();
+  sessionViewCache.set(id,{stream:takeChildren(stream),plan:takeChildren($('#planDock')),planHidden:$('#planDock').hidden,
+    edits:takeChildren($('#edits')),git:takeChildren($('#gitc')),tools:tools,editCount:editCount,textItems:textItems,
+    thinkItems:thinkItems,planItems:planItems,turnDiffCards:turnDiffCards,subagents:subagents,
+    subagentCurrent:subagentCurrent,queued:queued,ctx:currentCtx,cwd:cwd,cc:curCC,model:activeModel,
+    effort:curEffort,ready:ready,running:running,compacting:compacting,word:lastWordSeed,
+    elapsed:running?Math.max(0,Date.now()-thinkStart):0,tokUp:tokUp,tokOut:tokOut,tokShow:tokShow,
+    title:$('#curname').textContent||t.title||'session'});
+  persistSessionTabs();return true;}
+function restoreSessionView(id){const v=sessionViewCache.get(id);if(!v)return false;
+  restoreChildren(stream,v.stream);restoreChildren($('#planDock'),v.plan);$('#planDock').hidden=!!v.planHidden;
+  restoreChildren($('#edits'),v.edits);restoreChildren($('#gitc'),v.git);
+  tools=v.tools||{};editCount=v.editCount||0;textItems=v.textItems||{};thinkItems=v.thinkItems||{};
+  planItems=v.planItems||{};turnDiffCards=v.turnDiffCards||{};subagents=v.subagents||{};
+  subagentCurrent=v.subagentCurrent||'';queued=v.queued||{};cwd=v.cwd||'';curCC=v.cc||null;
+  activeModel=v.model||'default';tokUp=v.tokUp||0;tokOut=v.tokOut||0;tokShow=!!v.tokShow;
+  ready=!!v.ready;compacting=!!v.compacting;bindProject(cwd);setCurname(v.title);renderCtx(v.ctx);setEffortPill(v.effort);
+  updateEditBadge();renderQueue();renderSubagentBadge();renderSubagents();running=false;setBusy(!!v.running,v.word,v.elapsed);
+  loadDraft(id);restoreSessionTabView(id);restoredViewId=id;return true;}
+function persistSessionTabs(){try{localStorage.setItem(TABSKEY,JSON.stringify(sessionTabState));}catch(e){}}
+function renderSessionTabs(){const host=$('#sessionTabs');if(!host)return;
+  host.hidden=!sessionTabState.length||(!tabsValidated&&!sid);host.innerHTML='';if(host.hidden)return;
+  sessionTabState.forEach((t,i)=>{const active=t.id===sid,wrap=document.createElement('div');
+    wrap.className='stab'+(active?' active':'')+(t.unread?' unread':'');wrap.dataset.id=t.id;wrap.setAttribute('role','none');
+    const main=document.createElement('button');main.type='button';main.className='stab-main';main.setAttribute('role','tab');
+    main.setAttribute('aria-selected',active?'true':'false');main.tabIndex=active||(!sid&&i===0)?0:-1;
+    main.title=t.title||'session';
+    const dot=document.createElement('span');dot.className='stab-dot'+(t.busy?' busy':'')+(t.ended?' ended':'');
+    const text=document.createElement('span');text.className='stab-text';
+    const label=document.createElement('span');label.className='stab-label';label.textContent=t.title||'session';text.appendChild(label);
+    const unread=document.createElement('span');unread.className='stab-unread';unread.setAttribute('aria-label','new activity');
+    main.append(dot,text,unread);main.onclick=()=>switchSession(t.id);
+    const close=document.createElement('button');close.type='button';close.className='stab-close';close.textContent='×';
+    close.title='Close tab';close.setAttribute('aria-label','Close '+(t.title||'session')+' tab');
+    close.onclick=ev=>{ev.stopPropagation();closeSessionTab(t.id);};wrap.append(main,close);host.appendChild(wrap);});
+  const current=host.querySelector('.stab.active');if(current)current.scrollIntoView({block:'nearest',inline:'nearest'});}
+function ensureSessionTab(s,active){if(!s||!s.id)return null;let t=sessionTabById(s.id);
+  if(!t){t={id:s.id,cc:s.cc||null,title:s.title||s.name||'session',cwd:s.cwd||'',
+    busy:!!s.busy,ended:!!s.ended,activity:Number(s.activity||0),serverSeq:Number(s.event_seq||0),lastSeq:0,
+    unread:false,visited:false,scrollTop:0,atBottom:true};sessionTabState.push(t);}
+  const prev=Number(t.activity||0),next=Number(s.activity||prev||0);
+  const serverSeq=Number(s.event_seq||t.serverSeq||0);if(!active&&s.id!==sid&&serverSeq>Number(t.lastSeq||0))t.unread=true;
+  t.cc=s.cc||t.cc||null;t.title=s.title||s.name||t.title||'session';t.cwd=s.cwd||t.cwd||'';
+  if(s.busy!=null)t.busy=!!s.busy;if(s.ended!=null)t.ended=!!s.ended;t.activity=next;t.serverSeq=serverSeq;
+  if(active){t.unread=false;t.seenActivity=next;}
+  tabsValidated=true;persistSessionTabs();renderSessionTabs();return t;}
+function syncSessionTabs(list){const by=new Map((list||[]).map(s=>[s.id,s]));
+  sessionTabState.forEach(t=>{if(!by.has(t.id))sessionViewCache.delete(t.id);});sessionTabState=sessionTabState.filter(t=>by.has(t.id));
+  sessionTabState.forEach(t=>{const s=by.get(t.id),prev=Number(t.activity||0),next=Number(s.activity||prev||0),serverSeq=Number(s.event_seq||t.serverSeq||0);
+    if(t.id!==sid&&serverSeq>Number(t.lastSeq||0))t.unread=true;t.cc=s.cc||t.cc;t.title=s.title||s.name||t.title;t.cwd=s.cwd||t.cwd;
+    t.busy=!!s.busy;t.ended=!!s.ended;t.activity=next;t.serverSeq=serverSeq;if(t.id===sid){t.unread=false;t.seenActivity=next;}});
+  tabsValidated=true;persistSessionTabs();renderSessionTabs();}
+function rememberActiveTabView(){const t=sessionTabById(sid),chat=$('#chat');if(!t||!chat)return;
+  t.scrollTop=chat.scrollTop;t.atBottom=chat.scrollHeight-chat.scrollTop-chat.clientHeight<140;t.visited=true;persistSessionTabs();}
+function restoreSessionTabView(id){const t=sessionTabById(id),chat=$('#chat');
+  if(t&&t.visited&&!t.atBottom){const y=Math.max(0,Number(t.scrollTop||0));chat.scrollTop=Math.min(y,Math.max(0,chat.scrollHeight-chat.clientHeight));
+    requestAnimationFrame(()=>{chat.scrollTop=Math.min(y,Math.max(0,chat.scrollHeight-chat.clientHeight));});}
+  else{scroll();requestAnimationFrame(scroll);}}
+function setSessionTabBusy(id,busy){const t=sessionTabById(id);if(!t||t.busy===!!busy)return;t.busy=!!busy;persistSessionTabs();renderSessionTabs();}
+function renameSessionTabs(cc,title){if(!cc||!title)return;let changed=false;sessionTabState.forEach(t=>{if(t.cc===cc){t.title=title;
+    const view=sessionViewCache.get(t.id);if(view)view.title=title;changed=true;}});
+  if(changed){persistSessionTabs();renderSessionTabs();}}
+function closeSessionTab(id){const idx=sessionTabState.findIndex(t=>t.id===id);if(idx<0)return;const active=id===sid;
+  if(active){saveDraft();rememberActiveTabView();}sessionViewCache.delete(id);sessionTabState.splice(idx,1);persistSessionTabs();renderSessionTabs();if(!active)return;
+  const next=sessionTabState[Math.min(idx,sessionTabState.length-1)];if(next){switchSession(next.id);return;}
+  clearUI();sid=null;curCC=null;cwd='';activeModel='default';running=false;compacting=false;localStorage.removeItem(SKEY);
+  setCurname('');statset('idle');ta.disabled=true;sendBtn.disabled=true;wsSend({type:'detach'});renderSessionTabs();}
+function openLiveSession(s){if(!s||!s.id)return;ensureSessionTab(s,false);switchSession(s.id);}
+function sessionTabKeydown(ev){if(!['ArrowLeft','ArrowRight','Home','End'].includes(ev.key))return;
+  const tabs=[...$('#sessionTabs').querySelectorAll('.stab-main')];if(!tabs.length)return;let i=tabs.indexOf(ev.target);if(i<0)return;
+  if(ev.key==='Home')i=0;else if(ev.key==='End')i=tabs.length-1;else i=(i+(ev.key==='ArrowRight'?1:-1)+tabs.length)%tabs.length;
+  ev.preventDefault();tabs[i].focus();tabs[i].click();}
+$('#sessionTabs').addEventListener('keydown',sessionTabKeydown);
 function fmtTok(n){if(n==null)return '?';
   if(n>=1e6)return (n/1e6).toFixed(1).replace(/\.0$/,'')+'M';
   if(n>=1000)return (n/1000).toFixed(n>=1e4?0:1)+'k';
@@ -5305,7 +5455,7 @@ function cellBar(pct){const p=Math.max(0,Math.min(100,pct)),lit=Math.min(5,Math.
   let s='<span class="cells lv-'+meterLvl(p)+'">';
   for(let i=1;i<=5;i++)s+='<span class="cell'+(i<=lit?' on':'')+'"></span>';
   return s+'</span>';}
-function renderCtx(c){const el=$('#ctx');
+function renderCtx(c){currentCtx=c||null;const el=$('#ctx');
   if(!c||c.percentage==null){el.style.display='none';return;}
   const pct=Math.round(c.percentage);
   el.className='ctx';el.style.display='inline-flex';
@@ -5462,7 +5612,7 @@ function toggleSec(id){const el=$('#'+id);if(!el)return;el.classList.toggle('col
 function applySecCollapse(){let c={};try{c=JSON.parse(localStorage.getItem(SECKEY)||'{}');}catch(e){}
   ['secFav','secRecent'].forEach(id=>{const el=$('#'+id);if(el)el.classList.toggle('collapsed',!!c[id]);});}
 
-function renderLive(list){liveSessions=list||[];renderSidebar();}
+function renderLive(list){liveSessions=list||[];syncSessionTabs(liveSessions);renderSidebar();}
 
 /* ── project-grouped sidebar ──────────────────────────────────────────────
    A sidebar row is a FOLDER, and the sessions whose cwd is exactly that folder
@@ -5563,8 +5713,8 @@ function liveSessRow(s){const r=document.createElement('div');
   r.innerHTML='<span class="sdot '+dot+'"></span><div class="smeta">'+
     '<div class="sname">'+esc(s.title||s.name||'new session')+'</div></div>'+
     '<span class="skebab" title="more">⋮</span>';
-  r.querySelector('.smeta').onclick=()=>switchSession(s.id);
-  r.querySelector('.sdot').onclick=()=>switchSession(s.id);
+  r.querySelector('.smeta').onclick=()=>openLiveSession(s);
+  r.querySelector('.sdot').onclick=()=>openLiveSession(s);
   r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();const kebab=ev.currentTarget;
     const items=[{label:'⚙ Configure',fn:()=>openConfigure(s,kebab)},
       {label:'✎ Rename',fn:()=>renameSession(s.cc,s.title||s.name)}];
@@ -5849,9 +5999,15 @@ function acMove(d){const els=$('#cwdac').querySelectorAll('.acitem');if(!els.len
 function acQuery(){clearTimeout(acTimer);const q=$('#cwd').value;
   acTimer=setTimeout(()=>fetch('api/dircomplete?q='+encodeURIComponent(q)).then(r=>r.json()).then(acRender).catch(acClose),130);}
 
-function switchSession(id){if(!id||id===sid)return;saveDraft();clearUI();statset('switching…');wsSend({type:'attach',id:id});
+function switchSession(id){if(!id)return;if(id===sid){const current=sessionTabById(id);if(current){current.unread=false;persistSessionTabs();renderSessionTabs();}
+    if(window.innerWidth<=860)closeSidebar();return;}
+  const live=liveSessions.find(s=>s.id===id);if(live)ensureSessionTab(live,false);stashSessionView(sid);saveDraft();clearUI();restoredViewId='';
+  sid=id;const target=sessionTabById(id);if(target)target.unread=false;localStorage.setItem(SKEY,id);persistSessionTabs();renderSessionTabs();
+  const cached=restoreSessionView(id);if(!cached)statset('switching…');
+  const go=()=>{const req={type:'attach',id:id};if(cached)req.after_seq=Number(target&&target.lastSeq||0);wsSend(req);};
+  if(ws&&ws.readyState===1)go();else openWs(go);
   if(window.innerWidth<=860)closeSidebar();}
-function resumeSession(s){if(!s||!s.cc)return;saveDraft();clearUI();pendingStart=true;sid=null;statset('resuming…');
+function resumeSession(s){if(!s||!s.cc)return;stashSessionView(sid);saveDraft();clearUI();restoredViewId='';pendingStart=true;sid=null;renderSessionTabs();statset('resuming…');
   const go=()=>wsSend({type:'resume',cc:s.cc,cwd:s.cwd,model:$('#model').value,mode:$('#mode').value});
   if(ws&&ws.readyState===1)go();else openWs(go);
   if(window.innerWidth<=860)closeSidebar();}
@@ -5860,14 +6016,14 @@ function newSession(){const proj=$('#project').value;const dir=proj==='__custom_
   /* keep any current session alive in the background — just spin up another */
   const model=$('#model').value,effort=effortForModel(curEffort,model);
   curEffort=effort;localStorage.setItem('al_effort',effort);setEffortPill(effort);
-  saveDraft();clearUI();pendingStart=true;sid=null;
+  stashSessionView(sid);saveDraft();clearUI();restoredViewId='';pendingStart=true;sid=null;renderSessionTabs();
   const start=()=>wsSend({type:'start',cwd:dir,model:model,mode:$('#mode').value,effort:effort});
   if(ws&&ws.readyState===1)start();else openWs(start);statset('starting…');
   if(window.innerWidth<=860)closeSidebar();}
 function endSessionById(id,name){if(!id)return;
   if(!confirm('End session '+(name?'« '+name+' »':'')+'?\nIts codex process stops; you can still resume it from disk later.'))return;
   wsSend({type:'end',id:id});
-  if(id===sid){sid=null;setCurname('');markEnded('session ended');}
+  if(id===sid){setCurname('');markEnded('session ended');}
   reqList();loadTree();}
 /* image attachments: paste (Ctrl/Cmd+V) an image into the composer */
 let pendingImages=[];
