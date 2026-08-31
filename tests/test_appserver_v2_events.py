@@ -279,6 +279,25 @@ class AppServerV2EventTests(unittest.TestCase):
         self.assertIn("return ['done','●']", html)
         self.assertIn("return ['active','◐']", html)
 
+    def test_streaming_math_is_batched_and_typeset_only_when_stable(self):
+        html = codex_console.CONSOLE_HTML
+
+        self.assertIn("const STREAM_RENDER_MS=50", html)
+        self.assertIn("function scheduleAsstRender()", html)
+        self.assertIn("function flushAsstRenders(final)", html)
+        self.assertIn("if(final)typesetMath(rec.el,!replaying)", html)
+        self.assertIn("flushAsstRenders(true);compacting=false", html)
+        self.assertIn(".msg.asst.streaming .b{text-wrap:wrap}", html)
+        self.assertNotIn(
+            "b.innerHTML=md(rec.text);typesetMath(rec.el)", html)
+
+    def test_fenced_latex_and_tex_remain_source_code(self):
+        html = codex_console.CONSOLE_HTML
+
+        self.assertIn("if(lang==='math'){", html)
+        self.assertNotIn("lang==='latex'||lang==='tex'", html)
+        self.assertIn("bl.push('<pre><code>'+esc(c.replace", html)
+
     def test_file_change_patch_updates_existing_change_card(self):
         session, _ = _session()
 

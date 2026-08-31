@@ -3978,6 +3978,7 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .msg.user{display:flex;justify-content:flex-end}
 .msg.user .b{background:var(--sel);border:1px solid var(--selln);border-radius:10px;padding:8px 12px;max-width:85%;white-space:pre-wrap}
 .msg.asst .b{color:var(--fg);text-wrap:pretty}
+.msg.asst.streaming .b{text-wrap:wrap}
 .think{color:var(--think);font-style:italic;font-size:13px;border-left:2px solid var(--line);padding:3px 0 3px 10px;margin-bottom:12px;white-space:pre-wrap}
 .think.hide{display:none}
 .notice{color:var(--mut);font-size:11.5px;margin:6px 0}
@@ -4694,7 +4695,7 @@ function md(src){
   src=src||''; const bl=[], ml=[], il=[], ll=[];
   src=src.replace(/```(\w*)\n?([\s\S]*?)```/g,(m,l,c)=>{
     const lang=(l||'').toLowerCase();
-    if(lang==='math'||lang==='latex'||lang==='tex'){   /* fenced math (GitHub/Zulip ```math convention; codex emits this) → display equation */
+    if(lang==='math'){   /* fenced math (GitHub/Zulip ```math convention) → display equation */
       let mc=c.replace(/\n$/,'').trim();
       /* codex often nests display/inline delimiters INSIDE the fence; strip one
          layer (the fence already means display math, and a literal \[ … \] passed
@@ -4736,8 +4737,9 @@ function _mathObserver(){if(_mathObs)return _mathObs;
     {root:$('#chat'),rootMargin:'1200px 0px'});return _mathObs;}
 function _renderMathEl(el){if(!window.katex||el.dataset.done)return;el.dataset.done='1';
   try{katex.render(el.textContent,el,{displayMode:el.dataset.d==='1',throwOnError:false,errorColor:'#f85149'});}catch(e){}}
-function typesetMath(root){if(!window.katex)return;
-  root.querySelectorAll('.math:not([data-done])').forEach(el=>_mathObserver().observe(el));}
+function typesetMath(root,eager){if(!window.katex)return;
+  root.querySelectorAll('.math:not([data-done])').forEach(el=>{
+    if(eager)_renderMathEl(el);else _mathObserver().observe(el);});}
 function diffHtml(t){return t.split('\n').map(l=>{let c='dl-ctx';
   if(l.startsWith('@@')||l.startsWith('diff ')||l.startsWith('+++')||l.startsWith('---')||l.startsWith('***'))c='dl-hdr';
   else if(l.startsWith('+'))c='dl-add';else if(l.startsWith('-'))c='dl-del';
@@ -4784,20 +4786,30 @@ function toolBody(ev){const i=ev.input||{},t=ev.tool;
   if(typeof i==='string')return '<pre><code>'+esc(i)+'</code></pre>';
   return '<pre><code>'+esc(JSON.stringify(i,null,2))+'</code></pre>';}
 
-let textItems={},thinkItems={},planItems={},turnDiffCards={};
+let textItems={},thinkItems={},planItems={},turnDiffCards={},asstRenderT=0;
+const STREAM_RENDER_MS=50;
 function addUser(text,nImg){const s=atBottom();const d=document.createElement('div');d.className='msg user';
   d.innerHTML='<div class="b">'+esc(text)+'</div>'+(nImg?'<div class="imgs">🖼 '+nImg+' image'+(nImg>1?'s':'')+' attached</div>':'');
   stream.appendChild(d);scroll();}
 function addAsst(text){const s=atBottom();const d=document.createElement('div');d.className='msg asst';
-  d.innerHTML='<div class="b bubble">'+md(text)+'</div>';typesetMath(d);stream.appendChild(d);if(s)scroll();}
+  d.innerHTML='<div class="b bubble">'+md(text)+'</div>';typesetMath(d,!replaying);stream.appendChild(d);if(s)scroll();}
 function addThink(text){const s=atBottom();const d=document.createElement('div');d.className='think'+(showThink?'':' hide');d.dataset.t=1;
   d.textContent=text;stream.appendChild(d);if(s)scroll();}
+function renderAsst(rec,final){const stick=!replaying&&(rec.stick||final)&&atBottom();
+  const b=rec.el.querySelector('.bubble');b.innerHTML=md(rec.text);rec.dirty=false;rec.stick=false;
+  if(final)typesetMath(rec.el,!replaying);if(final)rec.el.classList.remove('streaming');
+  if(stick){scroll();if(final)requestAnimationFrame(scroll);}}
+function flushAsstRenders(final){if(asstRenderT){clearTimeout(asstRenderT);asstRenderT=0;}
+  Object.values(textItems).forEach(rec=>{
+    if(rec.dirty||(final&&rec.el.classList.contains('streaming')))renderAsst(rec,final);});}
+function scheduleAsstRender(){if(replaying||asstRenderT)return;
+  asstRenderT=setTimeout(()=>{asstRenderT=0;flushAsstRenders(false);},STREAM_RENDER_MS);}
 function upsertAsst(ev){const id=ev.itemId||'asst-'+Object.keys(textItems).length;
   let rec=textItems[id],s=atBottom();
   if(!rec){const d=document.createElement('div');d.className='msg asst streaming';
-    d.innerHTML='<div class="b bubble"></div>';stream.appendChild(d);rec=textItems[id]={el:d,text:''};}
-  rec.text=ev.text!=null?ev.text:(rec.text+(ev.delta||''));const b=rec.el.querySelector('.bubble');
-  b.innerHTML=md(rec.text);typesetMath(rec.el);if(ev.text!=null)rec.el.classList.remove('streaming');if(s)scroll();}
+    d.innerHTML='<div class="b bubble"></div>';stream.appendChild(d);rec=textItems[id]={el:d,text:'',dirty:false,stick:false};}
+  rec.text=ev.text!=null?ev.text:(rec.text+(ev.delta||''));rec.dirty=true;rec.stick=rec.stick||s;
+  if(ev.text!=null)renderAsst(rec,true);else scheduleAsstRender();}
 function upsertThink(ev){const id=ev.itemId||'think-'+Object.keys(thinkItems).length;
   let rec=thinkItems[id],s=atBottom();
   if(!rec){const d=document.createElement('div');d.className='think'+(showThink?'':' hide')+' streaming';
@@ -5112,6 +5124,7 @@ function fmtSecs(ms){const s=Math.max(0,Math.round(ms/1000));if(s<60)return s+'s
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;
+  if(asstRenderT){clearTimeout(asstRenderT);asstRenderT=0;}
   textItems={};thinkItems={};planItems={};turnDiffCards={};
   const pd=$('#planDock');if(pd){pd.hidden=true;pd.innerHTML='';}
   mergeSubagents([],true);
@@ -5213,7 +5226,7 @@ function route(ev){
   else if(ev.kind==='turn_start'){tokShow=false;setBusy(true,ev.word,0);}
   else if(ev.kind==='compacting'){compacting=true;setBusy(true,ev.word,0);}
   else if(ev.kind==='compacted'){compacting=false;addNotice(fmtCompacted(ev));if(ev.trigger!=='auto')setBusy(false);}
-  else if(ev.kind==='turn_done'){compacting=false;setBusy(false);if(ev.done_word)addDone(ev.done_word,ev.dur_ms||0,ev.done_at);if(drawerOpen()&&gitTab())refreshGit();}
+  else if(ev.kind==='turn_done'){flushAsstRenders(true);compacting=false;setBusy(false);if(ev.done_word)addDone(ev.done_word,ev.dur_ms||0,ev.done_at);if(drawerOpen()&&gitTab())refreshGit();}
   else if(ev.kind==='queued')addQueued(ev);
   else if(ev.kind==='dequeued'||ev.kind==='unqueued')removeQueued(ev.qid);
   else if(ev.kind==='notice')addNotice(ev.text);
@@ -5239,7 +5252,7 @@ function onMsg(e){const m=JSON.parse(e.data);
     addNotice('new session « '+(m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');reqList();loadTree();}
   else if(m.type==='attached'){clearUI();pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
     activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setEffortPill(m.effort);renderCtx(m.ctx);renderUsage(m.usage);statset(m.ended?'ended':'ready');
-    replaying=true;m.events.forEach(route);replaying=false;
+    replaying=true;m.events.forEach(route);replaying=false;flushAsstRenders(!m.busy);
     mergeSubagents(m.subagents||[]);
     compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);loadDraft(sid);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
