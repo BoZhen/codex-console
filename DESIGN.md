@@ -42,8 +42,8 @@
 
 ## Components
 - Existing components to reuse: LIVE session rows, busy dots, close/menu controls, session title, context/status header
-- New/changed components: horizontal session tab strip labeled only by session name; tab activation and close-view actions; compact older-content marker with a history-search action
-- Variants and states: active, background-ready, background-busy, unread, stale/ended
+- New/changed components: horizontal session tab strip labeled only by session name; tab activation and close-view actions; compact older-content marker with a history-search action; collapsible sticky Plan dock
+- Variants and states: active, background-ready, background-busy, unread, stale/ended; Plan expanded or collapsed to active work only
 - Token/component ownership: inline CSS and JS in `codex_console.py`; no new dependency or design-system layer
 
 ## Accessibility
@@ -62,7 +62,7 @@
 - Loading: newly resumed session tab shows its existing switching/resuming status
 - Empty: hide the strip when no tab is open
 - Error: failed attach removes stale live tabs and leaves the user in an explicit no-session state
-- Success: activating a live tab updates chat, project binding, draft, model, and context; long sessions retain a bounded recent DOM window with explicit access to indexed history
+- Success: activating a live tab updates chat, project binding, draft, model, and context; long sessions retain a bounded recent DOM window with explicit access to indexed history; a collapsed Plan shows only current active work and updates in place; a fully completed Plan remains visible briefly and then clears itself
 - Disabled: ended/stale tabs cannot send messages
 - Offline/slow network: tabs remain visible while the socket reconnects; no session is ended by disconnect
 

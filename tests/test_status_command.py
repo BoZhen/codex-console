@@ -9,6 +9,73 @@ import codex_console
 
 
 class StatusCommandTests(unittest.TestCase):
+    def test_usage_windows_are_classified_by_duration(self):
+        usage = codex_console._fmt_usage({
+            "limitId": "codex",
+            "primary": {
+                "usedPercent": 45,
+                "windowDurationMins": 10_080,
+                "resetsAt": 1_788_752_148,
+            },
+            "secondary": None,
+        }, model="gpt-5.6-sol")
+
+        self.assertNotIn("five_hour", usage)
+        self.assertEqual(usage["seven_day"]["utilization"], 45)
+        self.assertEqual(usage["seven_day"]["window_minutes"], 10_080)
+        self.assertEqual(usage["limit_id"], "codex")
+
+    def test_usage_selects_model_specific_limit_bucket(self):
+        payload = {
+            "rateLimits": {
+                "limitId": "codex",
+                "primary": {"usedPercent": 45, "windowDurationMins": 10_080},
+                "secondary": None,
+            },
+            "rateLimitsByLimitId": {
+                "codex_bengalfox": {
+                    "limitId": "codex_bengalfox",
+                    "limitName": "GPT-5.3-Codex-Spark",
+                    "primary": {"usedPercent": 90, "windowDurationMins": 300},
+                    "secondary": {"usedPercent": 86, "windowDurationMins": 10_080},
+                },
+            },
+        }
+
+        regular = codex_console._fmt_usage(payload, model="gpt-5.6-sol")
+        spark = codex_console._fmt_usage(payload, model="gpt-5.3-codex-spark")
+
+        self.assertEqual(regular["limit_id"], "codex")
+        self.assertNotIn("five_hour", regular)
+        self.assertEqual(regular["seven_day"]["utilization"], 45)
+        self.assertEqual(spark["limit_id"], "codex_bengalfox")
+        self.assertEqual(spark["five_hour"]["utilization"], 90)
+        self.assertEqual(spark["seven_day"]["utilization"], 86)
+
+    def test_spark_updates_do_not_overwrite_global_codex_usage(self):
+        old_usage = codex_console._CODEX_USAGE
+        old_by_limit = codex_console._CODEX_USAGE_BY_LIMIT
+        try:
+            codex_console._CODEX_USAGE = {}
+            codex_console._CODEX_USAGE_BY_LIMIT = {}
+            codex_console._set_usage({
+                "limitId": "codex",
+                "primary": {"usedPercent": 45, "windowDurationMins": 10_080},
+            }, model="gpt-5.6-sol")
+            codex_console._set_usage({
+                "limitId": "codex_bengalfox",
+                "limitName": "GPT-5.3-Codex-Spark",
+                "primary": {"usedPercent": 90, "windowDurationMins": 300},
+                "secondary": {"usedPercent": 86, "windowDurationMins": 10_080},
+            }, model="gpt-5.3-codex-spark")
+
+            self.assertEqual(codex_console.fetch_usage()["seven_day"]["utilization"], 45)
+            self.assertNotIn("five_hour", codex_console.fetch_usage())
+            self.assertIn("codex_bengalfox", codex_console._CODEX_USAGE_BY_LIMIT)
+        finally:
+            codex_console._CODEX_USAGE = old_usage
+            codex_console._CODEX_USAGE_BY_LIMIT = old_by_limit
+
     def test_status_is_local_even_while_busy_and_masks_auth(self):
         session = codex_console.ChatSession(
             "sid", os.getcwd(), "default", "full-access", effort="xhigh")

@@ -148,15 +148,62 @@ def _summarize_changes(changes):
                 out.append(str(c))
     return "\n".join(out) if out else _txt(changes)
 
-# rolling usage limits, fed by codex `account/rateLimits/*` (primary=5h, secondary=weekly)
+# rolling usage limits, fed by codex `account/rateLimits/*`
 _CODEX_USAGE = {}
-def _fmt_usage(rl):
-    """Normalize a codex rateLimits payload → {five_hour, seven_day}. The reset
-    time is converted to epoch MILLIS (codex reports seconds; the browser's
-    new Date() expects millis)."""
-    rl = rl or {}
-    if isinstance(rl.get("rateLimits"), dict):     # tolerate a wrapped read-response
-        rl = rl["rateLimits"]
+_CODEX_USAGE_BY_LIMIT = {}
+
+def _usage_limit_candidates(rl):
+    """Return distinct limit buckets from a read response or one update event."""
+    raw = rl or {}
+    candidates = []
+    if isinstance(raw, dict) and ("primary" in raw or "secondary" in raw):
+        candidates.append(raw)
+    if isinstance(raw.get("rateLimits"), dict):
+        candidates.append(raw["rateLimits"])
+    for limit_id, bucket in (raw.get("rateLimitsByLimitId") or {}).items():
+        if not isinstance(bucket, dict):
+            continue
+        if bucket.get("limitId"):
+            candidates.append(bucket)
+        else:
+            candidates.append({**bucket, "limitId": limit_id})
+    distinct, seen = [], set()
+    for bucket in candidates:
+        key = bucket.get("limitId") or id(bucket)
+        if key in seen:
+            continue
+        seen.add(key)
+        distinct.append(bucket)
+    return distinct
+
+
+def _select_usage_limit(rl, model=""):
+    candidates = _usage_limit_candidates(rl)
+    if not candidates:
+        return None
+    wants_spark = "spark" in str(model or "").lower()
+    def is_spark(bucket):
+        label = "%s %s" % (bucket.get("limitId") or "", bucket.get("limitName") or "")
+        label = label.lower()
+        return "spark" in label or "bengalfox" in label
+    matching = [bucket for bucket in candidates if is_spark(bucket) == wants_spark]
+    if not matching:
+        # An identifiable model-specific update for another bucket is stale for
+        # this session and must not replace its active usage display.
+        identifiable = any(bucket.get("limitId") or bucket.get("limitName")
+                           for bucket in candidates)
+        return None if identifiable else candidates[0]
+    if not wants_spark:
+        return next((bucket for bucket in matching
+                     if bucket.get("limitId") == "codex"), matching[0])
+    return matching[0]
+
+
+def _fmt_usage(rl, model=""):
+    """Normalize rate limits by actual window duration and model limit bucket."""
+    bucket = _select_usage_limit(rl, model)
+    if not bucket:
+        return {}
     def win(d):
         if not isinstance(d, dict) or d.get("usedPercent") is None:
             return None
@@ -164,19 +211,30 @@ def _fmt_usage(rl):
         return {"utilization": d.get("usedPercent"),
                 "resets_at": int(ra) * 1000 if isinstance(ra, (int, float)) else None,
                 "window_minutes": d.get("windowDurationMins")}
-    out = {}
-    p, s = win(rl.get("primary")), win(rl.get("secondary"))
-    if p:
-        out["five_hour"] = p
-    if s:
-        out["seven_day"] = s
+    out = {"limit_id": bucket.get("limitId"),
+           "limit_name": bucket.get("limitName")}
+    for slot, fallback in (("primary", "five_hour"), ("secondary", "seven_day")):
+        value = win(bucket.get(slot))
+        if not value:
+            continue
+        minutes = value.get("window_minutes")
+        key = "five_hour" if minutes == 300 else "seven_day" if minutes == 10080 else fallback if minutes is None else None
+        if key:
+            out[key] = value
+        else:
+            out.setdefault("other_windows", []).append(value)
+    if not any(key in out for key in ("five_hour", "seven_day", "other_windows")):
+        return {}
     return out
 
-def _set_usage(rl):
+def _set_usage(rl, model=""):
     global _CODEX_USAGE
-    out = _fmt_usage(rl)
+    out = _fmt_usage(rl, model=model)
     if out:
-        _CODEX_USAGE = out
+        limit_id = out.get("limit_id") or "codex"
+        _CODEX_USAGE_BY_LIMIT[limit_id] = out
+        if limit_id == "codex":
+            _CODEX_USAGE = out
     return out
 
 
@@ -3154,7 +3212,7 @@ class ChatSession:
         """Rolling usage limits (codex `account/rateLimits/*`): update the global
         (for the /api/usage poll + fresh page loads) AND push live to viewers so
         the header's 5h + weekly meters refresh immediately, not just every 60s."""
-        u = _set_usage(rl)
+        u = _set_usage(rl, model=self.display_model or self.model)
         if u:
             self.usage = u
             self._emit({"type": "usage", "usage": u})
@@ -4037,13 +4095,19 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .plandock .plan{margin:0;box-shadow:0 7px 18px rgba(0,0,0,.18)}
 .plan{border:1px solid var(--infoln);border-radius:8px;margin:7px 0 12px;background:var(--infobg);overflow:hidden}
 .plan .ph{display:flex;align-items:center;gap:7px;padding:7px 10px;color:var(--usr);font-weight:650}
+.plan .ptitle{flex:1;min-width:0}
+.plan .ptoggle{width:25px;height:24px;flex:none;display:inline-flex;align-items:center;justify-content:center;border:0;
+  background:transparent;color:var(--mut);cursor:pointer;font-size:14px;padding:0}
+.plan .ptoggle:hover{color:var(--usr);background:var(--bg3)}
 .plan .pex{padding:0 10px 7px;color:var(--mut);font-size:12.5px;white-space:pre-wrap}
 .plan .psteps{display:flex;flex-direction:column;border-top:1px solid var(--infoln)}
 .plan .pst{display:grid;grid-template-columns:22px 1fr;gap:6px;align-items:start;padding:6px 10px;font-size:13px;line-height:1.35}
 .plan .pst + .pst{border-top:1px solid color-mix(in srgb,var(--infoln) 55%,transparent)}
 .plan .pi{font-family:var(--fmono);color:var(--mut)}
 .plan .pst.done .pi{color:var(--addfg)}.plan .pst.active .pi{color:var(--tool)}.plan .pst.todo .pi{color:var(--mut)}
+.plan .pempty{padding:7px 10px;border-top:1px solid var(--infoln);font-size:12px;color:var(--mut)}
 .plan .ptext{padding:8px 10px;border-top:1px solid var(--infoln);white-space:pre-wrap;font-family:var(--fmono);font-size:12px;color:var(--fg)}
+.plan.collapsed .ptext{max-height:3.2em;overflow:hidden}
 .streaming{opacity:.95}
 .localstatus{border:1px solid var(--line);border-radius:8px;margin:8px 0 12px;background:var(--bg2);padding:9px 10px;font-size:12px;line-height:1.45}
 .localstatus .sh{display:flex;align-items:center;gap:8px;color:var(--fg);font-weight:650;margin-bottom:7px}
@@ -4865,9 +4929,10 @@ function toolBody(ev){const i=ev.input||{},t=ev.tool;
   if(typeof i==='string')return '<pre><code>'+esc(i)+'</code></pre>';
   return '<pre><code>'+esc(JSON.stringify(i,null,2))+'</code></pre>';}
 
-let textItems={},thinkItems={},planItems={},turnDiffCards={},asstRenderT=0;
+let textItems={},thinkItems={},planItems={},turnDiffCards={},asstRenderT=0,planCollapsed=false,planHideT=0;
 let windowHidden=0,windowHiddenChars=0,windowTrimT=0;
 const STREAM_RENDER_MS=50;
+const PLAN_HIDE_MS=2000;
 const CHAT_WINDOW_ITEMS=320,CHAT_WINDOW_CHARS=750000,CHAT_WINDOW_MIN_ITEMS=40;
 function renderWindowMarker(){let marker=stream.querySelector(':scope > .window-note');
   if(!windowHidden){if(marker)marker.remove();return;}
@@ -4926,25 +4991,34 @@ function planStepClass(st){st=(''+(st||'')).toLowerCase();
   if(st.includes('complete')||st==='done')return ['done','●'];
   if(st.includes('progress')||st==='active')return ['active','◐'];
   return ['todo','○'];}
-function planHTML(ev,rec){let h='<div class="ph">☑ Plan</div>';
-  if(ev.explanation)h+='<div class="pex">'+esc(ev.explanation)+'</div>';
-  if(Array.isArray(ev.plan)&&ev.plan.length){h+='<div class="psteps">';
-    ev.plan.forEach(x=>{const pc=planStepClass(x.status),step=x.step||x.text||'';
+function planHTML(ev,rec){let h='<div class="ph"><span class="ptitle">☑ Plan</span><button type="button" class="ptoggle" '+
+  'aria-expanded="'+(!planCollapsed)+'" title="'+(planCollapsed?'Expand plan':'Collapse plan')+'">'+(planCollapsed?'🔽':'🔼')+'</button></div>';
+  if(!planCollapsed&&ev.explanation)h+='<div class="pex">'+esc(ev.explanation)+'</div>';
+  if(Array.isArray(ev.plan)&&ev.plan.length){const steps=planCollapsed?ev.plan.filter(x=>planStepClass(x.status)[0]==='active'):ev.plan;
+    if(steps.length){h+='<div class="psteps">';steps.forEach(x=>{const pc=planStepClass(x.status),step=x.step||x.text||'';
       h+='<div class="pst '+pc[0]+'"><span class="pi">'+pc[1]+'</span><span>'+esc(step)+'</span></div>';});
-    h+='</div>';}
+      h+='</div>';}else if(planCollapsed)h+='<div class="pempty">No active task</div>';}
   else{const text=(ev.text!=null?ev.text:(rec&&rec.text)||'')+(ev.delta||'');
     h+='<div class="ptext">'+esc(text||'planning…')+'</div>';}
   return h;}
+function renderCurrentPlan(){const rec=planItems['plan-current'],host=$('#planDock');if(!rec||!host)return;
+  host.hidden=false;host.innerHTML='<div class="plan '+(planCollapsed?'collapsed ':'')+(rec.streaming?'streaming':'')+'">'+planHTML(rec,rec)+'</div>';
+  const toggle=host.querySelector('.ptoggle');if(toggle)toggle.onclick=togglePlanCollapsed;}
+function togglePlanCollapsed(){planCollapsed=!planCollapsed;const tab=sessionTabById(sid);
+  if(tab){tab.planCollapsed=planCollapsed;persistSessionTabs();}renderCurrentPlan();}
+function planAllCompleted(plan){return Array.isArray(plan)&&plan.length>0&&plan.every(x=>planStepClass(x.status)[0]==='done');}
+function schedulePlanAutoHide(rec){if(planHideT){clearTimeout(planHideT);planHideT=0;}if(!planAllCompleted(rec&&rec.plan))return;
+  const host=$('#planDock');if(replaying){if(host)host.hidden=true;return;}const planSid=sid;
+  planHideT=setTimeout(()=>{planHideT=0;const current=planItems['plan-current'];
+    if(sid===planSid&&current&&planAllCompleted(current.plan)){const dock=$('#planDock');if(dock)dock.hidden=true;}},PLAN_HIDE_MS);}
 function upsertPlan(ev){const id='plan-current';
   let rec=planItems[id],s=atBottom(),host=$('#planDock');
-  if(!rec)rec=planItems[id]={text:'',explanation:'',plan:null};
+  if(!rec)rec=planItems[id]={text:'',explanation:'',plan:null,streaming:false};
   if(!host)return;
   if(ev.text!=null)rec.text=ev.text;else if(ev.delta)rec.text+=ev.delta;
   if(ev.explanation!=null)rec.explanation=ev.explanation;
   if(Array.isArray(ev.plan))rec.plan=ev.plan;
-  const stable={text:rec.text,explanation:rec.explanation,plan:rec.plan};
-  host.hidden=false;
-  host.innerHTML='<div class="plan '+((ev.plan||ev.text!=null)?'':'streaming')+'">'+planHTML(stable,rec)+'</div>';
+  rec.streaming=!(Array.isArray(ev.plan)||ev.text!=null);renderCurrentPlan();schedulePlanAutoHide(rec);
   if(s)scroll();}
 function addGoal(ev){const g=ev.goal;if(!g){addNotice('goal cleared');return;}
   const used=g.tokensUsed!=null?(' · '+fmtTok(g.tokensUsed)+(g.tokenBudget?('/'+fmtTok(g.tokenBudget)):'')+' tokens'):'';
@@ -4955,7 +5029,8 @@ function addStatus(ev){const s=atBottom(),st=ev.status||{},se=st.session||{},sv=
   const state=se.ended?'ended':(se.compacting?'compacting':(se.busy?'busy '+fmtSecs((se.turn_age||0)*1000):'ready'));
   let ctxText=ctx.percentage!=null?(ctx.percentage+'% · '+fmtTok(ctx.totalTokens)+' / '+fmtTok(ctx.maxTokens)):'unknown';
   const win=(o)=>o&&o.utilization!=null?Math.round(o.utilization)+'%':'unknown';
-  const usageText='5h '+win(u.five_hour)+' · weekly '+win(u.seven_day);
+  const usageBits=[];if(u.five_hour&&u.five_hour.utilization!=null)usageBits.push('5h '+win(u.five_hour));
+  if(u.seven_day&&u.seven_day.utilization!=null)usageBits.push('weekly '+win(u.seven_day));const usageText=usageBits.join(' · ')||'unknown';
   const gitText=g.ok?(g.branch+'@'+(g.head||'?')+' · '+(g.dirty?('dirty '+g.file_count+' files'):'clean')):(g.error||'unknown');
   const rows=[
     ['state',state],['cwd',se.cwd||cwd||''],['thread',se.thread_id||'not started'],
@@ -5232,8 +5307,9 @@ function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;
   if(asstRenderT){clearTimeout(asstRenderT);asstRenderT=0;}
+  if(planHideT){clearTimeout(planHideT);planHideT=0;}
   if(windowTrimT){clearTimeout(windowTrimT);windowTrimT=0;}windowHidden=0;windowHiddenChars=0;
-  textItems={};thinkItems={};planItems={};turnDiffCards={};
+  textItems={};thinkItems={};planItems={};turnDiffCards={};planCollapsed=false;
   const pd=$('#planDock');if(pd){pd.hidden=true;pd.innerHTML='';}
   mergeSubagents([],true);
   queued={};renderQueue();stopThinking();}
@@ -5358,13 +5434,14 @@ function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;$('#d
 function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);loadDraft(sid);
     activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');setEffortPill(m.effort);renderCtx(null);statset('ready');
-    const startedTab=ensureSessionTab(m,true);if(startedTab){startedTab.lastSeq=Number(m.event_seq||0);startedTab.serverSeq=startedTab.lastSeq;persistSessionTabs();}restoredViewId=m.id;
+    const startedTab=ensureSessionTab(m,true);planCollapsed=!!(startedTab&&startedTab.planCollapsed);
+    if(startedTab){startedTab.lastSeq=Number(m.event_seq||0);startedTab.serverSeq=startedTab.lastSeq;persistSessionTabs();}restoredViewId=m.id;
     mergeSubagents(m.subagents||[],true);
     addNotice('new session « '+(m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');reqList();loadTree();}
   else if(m.type==='attached'){const incremental=!!m.events_delta&&restoredViewId===m.id,stick=incremental&&atBottom();
     if(!incremental){clearUI();restoredViewId='';}pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
     activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setEffortPill(m.effort);renderCtx(m.ctx);renderUsage(m.usage);statset(m.ended?'ended':'ready');
-    ensureSessionTab(m,true);
+    const attachedMeta=ensureSessionTab(m,true);planCollapsed=!!(attachedMeta&&attachedMeta.planCollapsed);
     if(!incremental&&m.events&&m.events.length)windowHidden=Math.max(0,Number(m.events[0]._seq||1)-1);
     replaying=true;m.events.forEach(route);replaying=false;flushAsstRenders(!m.busy);
     trimChatWindow(true);
@@ -5420,12 +5497,14 @@ function takeChildren(el){const f=document.createDocumentFragment();if(el)while(
 function restoreChildren(el,frag){if(!el)return;el.innerHTML='';if(frag)el.appendChild(frag);}
 function stashSessionView(id){if(!id)return false;const t=sessionTabById(id);if(!t)return false;
   flushAsstRenders(false);trimChatWindow(true);rememberActiveTabView();
+  if(planHideT){clearTimeout(planHideT);planHideT=0;const rec=planItems['plan-current'];
+    if(rec&&planAllCompleted(rec.plan))$('#planDock').hidden=true;}
   sessionViewCache.set(id,{stream:takeChildren(stream),plan:takeChildren($('#planDock')),planHidden:$('#planDock').hidden,
     edits:takeChildren($('#edits')),git:takeChildren($('#gitc')),tools:tools,editCount:editCount,textItems:textItems,
     thinkItems:thinkItems,planItems:planItems,turnDiffCards:turnDiffCards,subagents:subagents,
     subagentCurrent:subagentCurrent,queued:queued,ctx:currentCtx,cwd:cwd,cc:curCC,model:activeModel,
     effort:curEffort,ready:ready,running:running,compacting:compacting,word:lastWordSeed,
-    windowHidden:windowHidden,windowHiddenChars:windowHiddenChars,
+    windowHidden:windowHidden,windowHiddenChars:windowHiddenChars,planCollapsed:planCollapsed,
     elapsed:running?Math.max(0,Date.now()-thinkStart):0,tokUp:tokUp,tokOut:tokOut,tokShow:tokShow,
     title:$('#curname').textContent||t.title||'session'});
   persistSessionTabs();return true;}
@@ -5436,6 +5515,7 @@ function restoreSessionView(id){const v=sessionViewCache.get(id);if(!v)return fa
   planItems=v.planItems||{};turnDiffCards=v.turnDiffCards||{};subagents=v.subagents||{};
   subagentCurrent=v.subagentCurrent||'';queued=v.queued||{};cwd=v.cwd||'';curCC=v.cc||null;
   windowHidden=Number(v.windowHidden||0);windowHiddenChars=Number(v.windowHiddenChars||0);
+  planCollapsed=!!v.planCollapsed;
   activeModel=v.model||'default';tokUp=v.tokUp||0;tokOut=v.tokOut||0;tokShow=!!v.tokShow;
   ready=!!v.ready;compacting=!!v.compacting;bindProject(cwd);setCurname(v.title);renderCtx(v.ctx);setEffortPill(v.effort);
   updateEditBadge();renderQueue();renderSubagentBadge();renderSubagents();running=false;setBusy(!!v.running,v.word,v.elapsed);
@@ -5460,7 +5540,7 @@ function renderSessionTabs(){const host=$('#sessionTabs');if(!host)return;
 function ensureSessionTab(s,active){if(!s||!s.id)return null;let t=sessionTabById(s.id);
   if(!t){t={id:s.id,cc:s.cc||null,title:s.title||s.name||'session',cwd:s.cwd||'',
     busy:!!s.busy,ended:!!s.ended,activity:Number(s.activity||0),serverSeq:Number(s.event_seq||0),lastSeq:0,
-    unread:false,visited:false,scrollTop:0,atBottom:true};sessionTabState.push(t);}
+    unread:false,visited:false,scrollTop:0,atBottom:true,planCollapsed:false};sessionTabState.push(t);}
   const prev=Number(t.activity||0),next=Number(s.activity||prev||0);
   const serverSeq=Number(s.event_seq||t.serverSeq||0);if(!active&&s.id!==sid&&serverSeq>Number(t.lastSeq||0))t.unread=true;
   t.cc=s.cc||t.cc||null;t.title=s.title||s.name||t.title||'session';t.cwd=s.cwd||t.cwd||'';
@@ -5527,7 +5607,8 @@ function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour,w=u&&u.seven
     if(o&&o.utilization!=null){const rem=o.resets_at?fmtDur(new Date(o.resets_at)-Date.now()):'';
       t+=(t?'\n':'')+lbl+': '+Math.round(o.utilization)+'% used'+(rem?(' · resets in '+rem):'');}});
   el.title=t;}
-function loadUsage(){fetch('api/usage').then(r=>r.json()).then(j=>renderUsage(j.usage)).catch(()=>{});}
+function loadUsage(){if(sid&&ready)return;
+  fetch('api/usage').then(r=>r.json()).then(j=>renderUsage(j.usage)).catch(()=>{});}
 /* The installed Codex app-server is the model source of truth. Both model
    pickers consume this shared catalog, so newly released/account-enabled models
    appear without editing the console. `default` remains a universal offline

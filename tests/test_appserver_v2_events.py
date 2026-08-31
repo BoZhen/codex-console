@@ -308,6 +308,16 @@ class AppServerV2EventTests(unittest.TestCase):
         self.assertIn("host.hidden=false", html)
         self.assertIn("return ['done','●']", html)
         self.assertIn("return ['active','◐']", html)
+        self.assertIn("function togglePlanCollapsed()", html)
+        self.assertIn("class=\"ptoggle\"", html)
+        self.assertIn("aria-expanded=\"'+(!planCollapsed)+'\"", html)
+        self.assertIn("filter(x=>planStepClass(x.status)[0]==='active')", html)
+        self.assertIn("No active task", html)
+        self.assertIn("(planCollapsed?'🔽':'🔼')", html)
+        self.assertNotIn("(planCollapsed?'▸':'▾')", html)
+        self.assertIn("const PLAN_HIDE_MS=2000", html)
+        self.assertIn("function planAllCompleted(plan)", html)
+        self.assertIn("function schedulePlanAutoHide(rec)", html)
 
     def test_streaming_math_is_batched_and_typeset_only_when_stable(self):
         html = codex_console.CONSOLE_HTML

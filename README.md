@@ -39,6 +39,8 @@ a Codex-style chat where code and conversation stay visually separated.
   Tool user-input questions render as in-browser cards.
 - **Message queue / steering** — type while the agent is busy; the message is
   injected into the running turn at the next tool boundary (`turn/steer`).
+- **Live Plan dock** — the current task list stays pinned above chat, updates in
+  place, and can collapse to only the active task when a long plan obscures chat.
 - **Local slash commands** — `/compact` compacts the Codex thread and `/status`
   shows session, model, service, usage, and git state without sending a turn.
 - **Model-aware reasoning effort** — the `🧠` pill and session-card picker use
