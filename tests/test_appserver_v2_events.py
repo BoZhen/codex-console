@@ -48,6 +48,23 @@ class AppServerV2EventTests(unittest.TestCase):
         self.assertEqual([event["text"] for event in events], ["two"])
         self.assertGreater(events[0]["_seq"], first_seq)
 
+    def test_completed_item_bookkeeping_is_bounded(self):
+        session, _ = _session()
+        for index in range(codex_console.ITEM_HISTORY_LIMIT + 40):
+            session._items[f"done-{index}"] = {
+                "completed": True,
+                "text": "x" * 100,
+            }
+        session._items["active"] = {"completed": False, "text": "running"}
+
+        session._prune_items(force=True)
+
+        completed = [item for item in session._items.values()
+                     if item.get("completed")]
+        self.assertEqual(len(completed), codex_console.ITEM_HISTORY_LIMIT)
+        self.assertIn("active", session._items)
+        self.assertNotIn("done-0", session._items)
+
     def test_command_actions_classify_pipeline_reads_as_read(self):
         session, _ = _session()
         command = "nl -ba codex_console.py | sed -n '390,470p'"
@@ -330,6 +347,17 @@ class AppServerV2EventTests(unittest.TestCase):
         self.assertNotIn("stab-project", html)
         self.assertIn('elif mt == "detach":', socket_source)
         self.assertIn("self.session.detach(self)", socket_source)
+
+    def test_chat_dom_window_is_bounded_without_pruning_live_controls(self):
+        html = codex_console.CONSOLE_HTML
+
+        self.assertIn("CHAT_WINDOW_ITEMS=320", html)
+        self.assertIn("CHAT_WINDOW_CHARS=750000", html)
+        self.assertIn("function trimChatWindow(force)", html)
+        self.assertIn("function windowProtected(el)", html)
+        self.assertIn(".tool:not(.done)", html)
+        self.assertIn(".approval:not(.done)", html)
+        self.assertIn("Search full session history", html)
 
     def test_file_change_patch_updates_existing_change_card(self):
         session, _ = _session()

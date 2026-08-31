@@ -98,6 +98,7 @@ HAVE_CODEX = bool(CODEX_BIN and os.path.exists(CODEX_BIN))
 
 CAP = 12000          # cap per long string field sent to the browser
 RESULT_CAP = 6000    # cap per tool_result body
+ITEM_HISTORY_LIMIT = max(32, int(_env("ITEM_HISTORY_LIMIT", "256") or 256))
 # asyncio StreamReader's default line limit is 64KB. The codex app-server frames
 # each JSON-RPC message as one newline-delimited line, and a single notification
 # (e.g. an item/completed carrying a big command output, file read, or diff) can
@@ -2851,6 +2852,14 @@ class ChatSession:
             book["type"] = item_type
         return book
 
+    def _prune_items(self, force=False):
+        """Bound completed item accumulators without touching active protocol state."""
+        limit = ITEM_HISTORY_LIMIT if force else ITEM_HISTORY_LIMIT * 2
+        completed = [iid for iid, book in self._items.items()
+                     if book.get("completed")]
+        for iid in completed[:max(0, len(completed) - limit)]:
+            self._items.pop(iid, None)
+
     def _on_item_delta(self, item_id, kind, delta, turn_id=None):
         if not item_id or not delta:
             return
@@ -2920,6 +2929,7 @@ class ChatSession:
             if book.get("completed"):
                 return
             book["completed"] = True
+            self._prune_items()
         if it == "userMessage":
             return                          # echoed locally by _echo_user
         if it == "agentMessage":
@@ -3102,6 +3112,7 @@ class ChatSession:
         self.turn_id = None
         self.compacting = False
         self.last_activity = time.time()
+        self._prune_items(force=True)
         self._push([ev])
         self._drain_queue()
 
@@ -4043,6 +4054,11 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .recap{color:var(--mut);font-size:12px;margin:7px 0;line-height:1.45}
 .recap .rk{font-weight:600;letter-spacing:.2px}
 .recap .rt{font-style:italic;opacity:.92}
+.window-note{display:flex;align-items:center;gap:8px;color:var(--mut);font-size:11.5px;padding:5px 0 8px;
+  margin:0 0 10px;border-bottom:1px solid var(--line)}
+.window-note span{flex:1;min-width:0}
+.window-note button{width:26px;height:24px;flex:none;border:0;background:transparent;color:var(--mut);cursor:pointer;font-size:13px}
+.window-note button:hover{color:var(--acc);background:var(--bg3)}
 .doneline{color:var(--mut);font-size:11.5px;margin:6px 0}
 .doneline .dg{color:var(--tool)}
 
@@ -4850,7 +4866,34 @@ function toolBody(ev){const i=ev.input||{},t=ev.tool;
   return '<pre><code>'+esc(JSON.stringify(i,null,2))+'</code></pre>';}
 
 let textItems={},thinkItems={},planItems={},turnDiffCards={},asstRenderT=0;
+let windowHidden=0,windowHiddenChars=0,windowTrimT=0;
 const STREAM_RENDER_MS=50;
+const CHAT_WINDOW_ITEMS=320,CHAT_WINDOW_CHARS=750000,CHAT_WINDOW_MIN_ITEMS=40;
+function renderWindowMarker(){let marker=stream.querySelector(':scope > .window-note');
+  if(!windowHidden){if(marker)marker.remove();return;}
+  if(!marker){marker=document.createElement('div');marker.className='window-note';marker.dataset.windowMarker='1';stream.prepend(marker);}
+  marker.innerHTML='<span>'+windowHidden+' earlier item'+(windowHidden===1?'':'s')+' hidden to keep this tab responsive</span>'+
+    '<button type="button" title="Search full session history" aria-label="Search full session history">🕘</button>';
+  marker.querySelector('button').onclick=()=>{openSearch();$('#srchscope').value='session';$('#srchq').focus();};}
+function windowProtected(el){return el.matches('.streaming,.tool:not(.done),.approval:not(.done),.question:not(.done)');}
+function sweepWindowRefs(){const edits=$('#edits'),kept=el=>el&&(stream.contains(el)||(edits&&edits.contains(el)));
+  Object.keys(textItems).forEach(k=>{if(!kept(textItems[k]&&textItems[k].el))delete textItems[k];});
+  Object.keys(thinkItems).forEach(k=>{if(!kept(thinkItems[k]&&thinkItems[k].el))delete thinkItems[k];});
+  Object.keys(tools).forEach(k=>{if(!kept(tools[k]))delete tools[k];});
+  Object.keys(turnDiffCards).forEach(k=>{if(!kept(turnDiffCards[k]))delete turnDiffCards[k];});}
+function trimChatWindow(force){if(replaying&&!force)return;if(windowTrimT){clearTimeout(windowTrimT);windowTrimT=0;}
+  let items=[...stream.children].filter(el=>!el.dataset.windowMarker),chars=items.reduce((n,el)=>n+(el.textContent||'').length,0);
+  if(items.length<=CHAT_WINDOW_ITEMS&&chars<=CHAT_WINDOW_CHARS){renderWindowMarker();return;}
+  const chat=$('#chat'),beforeHeight=chat.scrollHeight,beforeTop=chat.scrollTop,stick=atBottom();let removed=0,removedChars=0;
+  while((items.length>CHAT_WINDOW_ITEMS||chars>CHAT_WINDOW_CHARS)&&items.length>CHAT_WINDOW_MIN_ITEMS){
+    const i=items.findIndex(el=>!windowProtected(el));if(i<0)break;const el=items.splice(i,1)[0],n=(el.textContent||'').length;
+    if(_mathObs)el.querySelectorAll('.math').forEach(node=>_mathObs.unobserve(node));
+    chars-=n;removedChars+=n;removed++;el.remove();}
+  if(removed){windowHidden+=removed;windowHiddenChars+=removedChars;renderWindowMarker();sweepWindowRefs();
+    const lost=Math.max(0,beforeHeight-chat.scrollHeight);if(stick)scroll();else chat.scrollTop=Math.max(0,beforeTop-lost);}
+  else renderWindowMarker();}
+function scheduleChatWindowTrim(){if(replaying||windowTrimT)return;
+  windowTrimT=setTimeout(()=>trimChatWindow(false),120);}
 function addUser(text,nImg){const s=atBottom();const d=document.createElement('div');d.className='msg user';
   d.innerHTML='<div class="b">'+esc(text)+'</div>'+(nImg?'<div class="imgs">🖼 '+nImg+' image'+(nImg>1?'s':'')+' attached</div>':'');
   stream.appendChild(d);scroll();}
@@ -5189,6 +5232,7 @@ function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;
   if(asstRenderT){clearTimeout(asstRenderT);asstRenderT=0;}
+  if(windowTrimT){clearTimeout(windowTrimT);windowTrimT=0;}windowHidden=0;windowHiddenChars=0;
   textItems={};thinkItems={};planItems={};turnDiffCards={};
   const pd=$('#planDock');if(pd){pd.hidden=true;pd.innerHTML='';}
   mergeSubagents([],true);
@@ -5305,6 +5349,7 @@ function route(ev){const seq=Number(ev&&ev._seq||0),tab=sessionTabById(sid);
   else if(ev.kind==='safety_buffering')addNotice('model safety buffering'+(ev.fasterModel?(' · faster fallback '+ev.fasterModel):''));
   else if(ev.kind==='goal')addGoal(ev);
   else if(ev.kind==='thread_lifecycle')addNotice((ev.method||'thread lifecycle').replace('thread/','thread '));
+  scheduleChatWindowTrim();
 }
 
 /* persistent server-side session: attach / reattach / switch */
@@ -5320,7 +5365,9 @@ function onMsg(e){const m=JSON.parse(e.data);
     if(!incremental){clearUI();restoredViewId='';}pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
     activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setEffortPill(m.effort);renderCtx(m.ctx);renderUsage(m.usage);statset(m.ended?'ended':'ready');
     ensureSessionTab(m,true);
+    if(!incremental&&m.events&&m.events.length)windowHidden=Math.max(0,Number(m.events[0]._seq||1)-1);
     replaying=true;m.events.forEach(route);replaying=false;flushAsstRenders(!m.busy);
+    trimChatWindow(true);
     mergeSubagents(m.subagents||[],incremental);
     compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);loadDraft(sid);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
@@ -5372,12 +5419,13 @@ function sessionTabById(id){return sessionTabState.find(t=>t.id===id)||null;}
 function takeChildren(el){const f=document.createDocumentFragment();if(el)while(el.firstChild)f.appendChild(el.firstChild);return f;}
 function restoreChildren(el,frag){if(!el)return;el.innerHTML='';if(frag)el.appendChild(frag);}
 function stashSessionView(id){if(!id)return false;const t=sessionTabById(id);if(!t)return false;
-  flushAsstRenders(false);rememberActiveTabView();
+  flushAsstRenders(false);trimChatWindow(true);rememberActiveTabView();
   sessionViewCache.set(id,{stream:takeChildren(stream),plan:takeChildren($('#planDock')),planHidden:$('#planDock').hidden,
     edits:takeChildren($('#edits')),git:takeChildren($('#gitc')),tools:tools,editCount:editCount,textItems:textItems,
     thinkItems:thinkItems,planItems:planItems,turnDiffCards:turnDiffCards,subagents:subagents,
     subagentCurrent:subagentCurrent,queued:queued,ctx:currentCtx,cwd:cwd,cc:curCC,model:activeModel,
     effort:curEffort,ready:ready,running:running,compacting:compacting,word:lastWordSeed,
+    windowHidden:windowHidden,windowHiddenChars:windowHiddenChars,
     elapsed:running?Math.max(0,Date.now()-thinkStart):0,tokUp:tokUp,tokOut:tokOut,tokShow:tokShow,
     title:$('#curname').textContent||t.title||'session'});
   persistSessionTabs();return true;}
@@ -5387,6 +5435,7 @@ function restoreSessionView(id){const v=sessionViewCache.get(id);if(!v)return fa
   tools=v.tools||{};editCount=v.editCount||0;textItems=v.textItems||{};thinkItems=v.thinkItems||{};
   planItems=v.planItems||{};turnDiffCards=v.turnDiffCards||{};subagents=v.subagents||{};
   subagentCurrent=v.subagentCurrent||'';queued=v.queued||{};cwd=v.cwd||'';curCC=v.cc||null;
+  windowHidden=Number(v.windowHidden||0);windowHiddenChars=Number(v.windowHiddenChars||0);
   activeModel=v.model||'default';tokUp=v.tokUp||0;tokOut=v.tokOut||0;tokShow=!!v.tokShow;
   ready=!!v.ready;compacting=!!v.compacting;bindProject(cwd);setCurname(v.title);renderCtx(v.ctx);setEffortPill(v.effort);
   updateEditBadge();renderQueue();renderSubagentBadge();renderSubagents();running=false;setBusy(!!v.running,v.word,v.elapsed);

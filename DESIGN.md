@@ -42,7 +42,7 @@
 
 ## Components
 - Existing components to reuse: LIVE session rows, busy dots, close/menu controls, session title, context/status header
-- New/changed components: horizontal session tab strip labeled only by session name; tab activation and close-view actions
+- New/changed components: horizontal session tab strip labeled only by session name; tab activation and close-view actions; compact older-content marker with a history-search action
 - Variants and states: active, background-ready, background-busy, unread, stale/ended
 - Token/component ownership: inline CSS and JS in `codex_console.py`; no new dependency or design-system layer
 
@@ -62,7 +62,7 @@
 - Loading: newly resumed session tab shows its existing switching/resuming status
 - Empty: hide the strip when no tab is open
 - Error: failed attach removes stale live tabs and leaves the user in an explicit no-session state
-- Success: activating a live tab updates chat, project binding, draft, model, and context
+- Success: activating a live tab updates chat, project binding, draft, model, and context; long sessions retain a bounded recent DOM window with explicit access to indexed history
 - Disabled: ended/stale tabs cannot send messages
 - Offline/slow network: tabs remain visible while the socket reconnects; no session is ended by disconnect
 
@@ -74,7 +74,7 @@
 ## Implementation constraints
 - Framework/styling system: single Python file with inline vanilla HTML/CSS/JS
 - Design-token constraints: reuse existing CSS custom properties
-- Performance constraints: restore an opened tab from its in-memory DOM cache before networking; use sequenced incremental `attach`, not `resume` or full replay, to catch up background activity
+- Performance constraints: restore an opened tab from its in-memory DOM cache before networking; use sequenced incremental `attach`, not `resume` or full replay, to catch up background activity; bound each chat DOM by rendered-item and text-size budgets while never pruning unresolved interactive cards
 - Compatibility constraints: existing sidebar, drafts, approvals, model/context state, and service restart behavior must remain intact
 - Test/screenshot expectations: source-level regression tests, JavaScript syntax check, unit suite, and desktop/mobile visual smoke check when practical
 

@@ -23,6 +23,9 @@ a Codex-style chat where code and conversation stay visually separated.
 - **Session tabs** — keep a compact working set across projects. Clicking a Live
   session opens or activates its tab; closing a tab leaves the Codex process
   running in the sidebar until you explicitly end it.
+- **Bounded long-session UI** — old rendered activity is unloaded after the chat
+  reaches its item/text budget, while indexed history and rollout JSONL remain
+  available; completed app-server item accumulators are also bounded.
 - **Resumable sessions** — reopen a project and pick up a previous Codex thread
   (rollouts under `~/.codex/sessions` restore history and the right `cwd`).
 - **History search** — `Ctrl/Cmd+K` searches indexed Codex history across all
@@ -79,6 +82,7 @@ Open `http://<host>:7704`, pick a project dir, and start chatting.
 | `CODEX_CONSOLE_RECAP_IDLE_SEC` | `300` | idle seconds before a recap is generated |
 | `CODEX_CONSOLE_RECAP_MODEL` | `gpt-5.3-codex-spark` | model used for recap generation |
 | `CODEX_CONSOLE_RECAP_TIMEOUT_SEC` | `45` | timeout for the one-shot recap generator |
+| `CODEX_CONSOLE_ITEM_HISTORY_LIMIT` | `256` | completed app-server item accumulators retained per live session |
 
 ### The codex binary
 
