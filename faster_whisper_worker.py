@@ -13,6 +13,8 @@ _PUNCTUATION = ",.!?;:，。！？；：、…"
 _TERMINAL_PUNCTUATION = ".!?。！？"
 _NONTERMINAL_PUNCTUATION = ",;:，；：、"
 _TRAILING_CLOSERS = "'\"”’）)]}】」』"
+_COMMA_PAUSE_SECONDS = 0.5
+_PERIOD_PAUSE_SECONDS = 1.2
 _QUESTION_PREFIX = re.compile(
     r"^(?:请问)?(?:是否|能否|可否|有没有|有沒有|是不是|能不能|可不可以|"
     r"为什么|為什麼|为何|為何|怎么|怎麼|怎样|怎樣|如何|哪里|哪裡|哪儿|"
@@ -93,11 +95,13 @@ def _join_segments(segments, language, pause_punctuation=False):
         current = "".join(out).rstrip()
         gap = ((float(start) - previous_end)
                if start is not None and previous_end is not None else 0.0)
-        if (gap >= 0.65 and current and not _has_terminal_punctuation(current)
+        if (gap >= _COMMA_PAUSE_SECONDS
+                and current and not _has_terminal_punctuation(current)
                 and current[-1] not in _PUNCTUATION
                 and piece.lstrip()[:1] not in _PUNCTUATION):
             out.append(("。" if is_chinese else ".")
-                       if gap >= 1.4 else ("，" if is_chinese else ","))
+                       if gap >= _PERIOD_PAUSE_SECONDS
+                       else ("，" if is_chinese else ","))
         out.append(piece)
         if end is not None:
             previous_end = float(end)

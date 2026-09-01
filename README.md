@@ -102,7 +102,7 @@ python codex_console.py
 | `CODEX_CONSOLE_TRANSCRIBE_COMPUTE_TYPE` | `default` | CTranslate2 compute type, such as `float16` or `int8` |
 | `CODEX_CONSOLE_TRANSCRIBE_LANGUAGE` | auto | Optional fixed transcription language |
 | `CODEX_CONSOLE_TRANSCRIBE_CHINESE_CONVERSION` | `none` | Chinese conversion: `none`, `t2s`, or `tw2sp` |
-| `CODEX_CONSOLE_TRANSCRIBE_PAUSE_PUNCTUATION` | `0` | Add pause and inferred final punctuation to transcripts |
+| `CODEX_CONSOLE_TRANSCRIBE_PAUSE_PUNCTUATION` | `0` | Add pause punctuation (comma at 0.5s, period at 1.2s) and infer final punctuation |
 | `CODEX_CONSOLE_TRANSCRIBE_LD_LIBRARY_PATH` | unset | Additional CUDA library directories for the worker |
 | `CODEX_CONSOLE_TRANSCRIBE_MAX_MB` | `16` | Maximum audio upload size |
 | `CODEX_CONSOLE_TRANSCRIBE_MAX_SEC` | `120` | Maximum browser recording duration |

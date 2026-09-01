@@ -56,18 +56,35 @@ class TranscriberManagerTests(unittest.TestCase):
                 manager.shutdown()
 
     def test_pause_timestamps_add_punctuation_without_changing_words(self):
+        self.assertEqual(faster_whisper_worker._COMMA_PAUSE_SECONDS, 0.5)
+        self.assertEqual(faster_whisper_worker._PERIOD_PAUSE_SECONDS, 1.2)
         segment = SimpleNamespace(
             text="重新启动服务",
             words=[
                 SimpleNamespace(word="重新", start=0.0, end=0.4),
-                SimpleNamespace(word="启动", start=0.45, end=0.9),
-                SimpleNamespace(word="服务", start=1.7, end=2.1),
-                SimpleNamespace(word="现在", start=3.7, end=4.1),
+                SimpleNamespace(word="启动", start=0.45, end=1.0),
+                SimpleNamespace(word="服务", start=1.5, end=2.0),
+                SimpleNamespace(word="现在", start=3.2, end=3.7),
             ],
         )
         text = faster_whisper_worker._join_segments(
             [segment], "zh", pause_punctuation=True)
         self.assertEqual(text, "重新启动，服务。现在。")
+
+        below_thresholds = SimpleNamespace(
+            text="甲乙丙丁",
+            words=[
+                SimpleNamespace(word="甲", start=0.0, end=1.0),
+                SimpleNamespace(word="乙", start=1.49, end=2.0),
+                SimpleNamespace(word="丙", start=3.19, end=4.0),
+                SimpleNamespace(word="丁", start=5.2, end=5.5),
+            ],
+        )
+        self.assertEqual(
+            faster_whisper_worker._join_segments(
+                [below_thresholds], "zh", pause_punctuation=True),
+            "甲乙，丙。丁。",
+        )
 
         punctuated = SimpleNamespace(text="已经完成。", words=[])
         self.assertEqual(
