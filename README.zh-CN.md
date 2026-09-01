@@ -133,3 +133,6 @@ Codex Console 可能暴露所选项目目录中的 Codex 对话记录、源码�
 ## 许可证
 
 [MIT](LICENSE)
+
+仓库内的 Microsoft Fluent Emoji 麦克风资源沿用上游 MIT 许可证；详见
+[资源许可证](static/icons/fluentui-emoji-LICENSE.txt)。

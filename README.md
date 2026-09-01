@@ -146,3 +146,6 @@ publish it through that feature.
 ## License
 
 [MIT](LICENSE)
+
+The bundled Microsoft Fluent Emoji microphone asset retains its upstream MIT
+license; see [the asset license](static/icons/fluentui-emoji-LICENSE.txt).

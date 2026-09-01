@@ -193,6 +193,9 @@ class VoiceFrontendContractTests(unittest.TestCase):
     def test_voice_input_is_editable_session_scoped_and_never_auto_sends(self):
         html = codex_console.CONSOLE_HTML
         self.assertIn('id="voiceBtn"', html)
+        self.assertIn("const VOICE_MIC_ICON=", html)
+        self.assertIn("/static/icons/fluent-studio-microphone.png", html)
+        self.assertIn("stroke-width:2.25", html)
         self.assertIn("navigator.mediaDevices.getUserMedia", html)
         self.assertIn("new MediaRecorder", html)
         self.assertIn("fetch('api/transcribe'", html)

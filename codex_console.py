@@ -4572,6 +4572,10 @@ pre code{background:none;border:none;padding:0}
   flex:none;display:inline-flex;align-items:center;justify-content:center;font-size:16px;cursor:pointer;padding:0}
 #attachBtn:hover,#voiceBtn:hover{color:var(--fg);border-color:var(--acc)}
 #attachBtn:disabled,#voiceBtn:disabled{opacity:.45;cursor:default;border-color:var(--line)}
+#voiceBtn{color:var(--acc)}
+#voiceBtn .voice-mic-icon{width:24px;height:24px;display:block;object-fit:contain}
+#voiceBtn svg{width:20px;height:20px;display:block;fill:none;stroke:currentColor;stroke-width:2.25;stroke-linecap:round;stroke-linejoin:round}
+#voiceBtn:not(:disabled):hover{color:var(--fg);background:var(--nobg)}
 #voiceBtn.recording{color:var(--del);border-color:var(--del);background:var(--nobg)}
 #voiceBar{height:28px;display:flex;align-items:center;gap:7px;padding:0 2px 7px;color:var(--mut);font:11.5px var(--fmono)}
 #voiceBar[hidden]{display:none}
@@ -5108,7 +5112,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
       <div class="wrap2">
       <input type="file" id="attachmentPicker" accept="image/png,image/jpeg,image/gif,image/webp,text/*,application/json,application/xml,application/javascript,application/x-yaml,.py,.ipynb,.js,.jsx,.ts,.tsx,.json,.jsonl,.yaml,.yml,.toml,.md,.rst,.tex,.bib,.c,.h,.cpp,.hpp,.cc,.rs,.go,.java,.kt,.kts,.sh,.bash,.zsh,.fish,.sql,.html,.css,.scss,.less,.xml,.csv,.tsv,.ini,.cfg,.conf,.log,.diff,.patch,.mk" multiple hidden>
       <button id="attachBtn" type="button" title="Attach images, text, or code files" aria-label="Attach files" disabled>📎</button>
-      <button id="voiceBtn" type="button" title="Voice input" aria-label="Start voice input" disabled>🎙</button>
+      <button id="voiceBtn" type="button" title="Voice input" aria-label="Start voice input" disabled><img class="voice-mic-icon" src="/static/icons/fluent-studio-microphone.png" alt=""></button>
       <textarea id="ta" rows="1" placeholder="Type a message…" disabled></textarea>
       <button id="stop" title="interrupt / stop" style="display:none">⏹</button>
       <button id="send" disabled>➤</button>
@@ -6644,6 +6648,8 @@ function dropDraft(id){if(id&&drafts[id]){delete drafts[id];persistDrafts();}}
    writes only into the originating session's editable draft. */
 let voiceCaps={enabled:false,available:false,maxBytes:16*1024*1024,maxSeconds:120,reason:'loading voice input…'};
 let voiceJob=null,voiceSeq=0;
+const VOICE_MIC_ICON='<img class="voice-mic-icon" src="/static/icons/fluent-studio-microphone.png" alt="">';
+const VOICE_STOP_ICON='<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="1"></rect></svg>';
 function voiceShortcutLabel(){return 'Alt+M';}
 function voiceUnavailableReason(){
   if(!window.isSecureContext)return 'Voice input requires HTTPS';
@@ -6654,7 +6660,7 @@ function voiceUnavailableReason(){
 function fmtVoiceTime(ms){const s=Math.max(0,Math.floor(ms/1000));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0');}
 function syncVoiceButton(){if(!voiceBtn)return;const reason=voiceUnavailableReason(),recording=voiceJob&&voiceJob.mode==='recording';
   voiceBtn.disabled=!!reason||(!ready&&!recording)||!!(voiceJob&&voiceJob.mode!=='recording');
-  voiceBtn.classList.toggle('recording',!!recording);voiceBtn.textContent=recording?'■':'🎙';
+  voiceBtn.classList.toggle('recording',!!recording);voiceBtn.innerHTML=recording?VOICE_STOP_ICON:VOICE_MIC_ICON;
   voiceBtn.title=reason||((recording?'Stop and transcribe':'Voice input')+' · '+voiceShortcutLabel());
   voiceBtn.setAttribute('aria-label',reason||(recording?'Stop voice recording':'Start voice input'));
   voiceBtn.setAttribute('aria-keyshortcuts','Alt+M');}
