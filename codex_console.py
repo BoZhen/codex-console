@@ -5568,7 +5568,7 @@ function renderSubagents(){
   const section=(title,items)=>items.length?('<div class="agsec">'+title+'</div>'+
     items.map(a=>agentRowHTML(a)).join('')):'';
   list.innerHTML=section('active',active)+section('done',done);
-  list.querySelectorAll('.agrow').forEach(el=>el.onclick=()=>{subagentCurrent=el.dataset.tid;renderSubagents();loadSubagentThread(subagentCurrent);});
+  list.querySelectorAll('.agrow').forEach(el=>el.onclick=ev=>{ev.stopPropagation();subagentCurrent=el.dataset.tid;renderSubagents();loadSubagentThread(subagentCurrent);});
 }
 function agentRowHTML(a){
   const sub=a.message||a.prompt||a.title||a.threadId||'';
@@ -7007,7 +7007,8 @@ $('#dclose').onclick=()=>$('#drawer').classList.remove('open');
 document.addEventListener('click',e=>{
   if(drawerOpen()&&!e.target.closest('#drawer')&&!e.target.closest('.emark'))$('#drawer').classList.remove('open');});
 document.addEventListener('click',e=>{
-  if(agentPanelOpen()&&!e.target.closest('#agentPanel')&&!e.target.closest('#agentbtn')&&!e.target.closest('.agmark'))closeSubagents();});
+  const path=e.composedPath?e.composedPath():[];
+  if(agentPanelOpen()&&!path.includes($('#agentPanel'))&&!e.target.closest('#agentbtn')&&!e.target.closest('.agmark'))closeSubagents();});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&drawerOpen())$('#drawer').classList.remove('open');});
 $('#grefresh').onclick=refreshGit;
 $('#project').onchange=()=>{const c=$('#project').value==='__custom__';

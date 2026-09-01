@@ -193,7 +193,8 @@ def _preserve_confirmed_prefix(previous, current, confirmed):
     tail = current[tail_start:]
     if confirmed[-1:].isspace() and tail[:1].isspace():
         tail = tail[1:]
-    return confirmed + tail
+    merged = confirmed + tail
+    return current if len(merged) < len(current) else merged
 
 
 def _purge_live_states(states, now):

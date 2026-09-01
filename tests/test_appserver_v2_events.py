@@ -298,6 +298,8 @@ class AppServerV2EventTests(unittest.TestCase):
         self.assertIn("subagent_read", html)
         self.assertIn("subagent_thread", html)
         self.assertIn("addSubagentMarker", html)
+        self.assertIn("el.onclick=ev=>{ev.stopPropagation();subagentCurrent", html)
+        self.assertIn("const path=e.composedPath?e.composedPath():[]", html)
 
     def test_frontend_plan_is_pinned_and_updates_in_place(self):
         html = codex_console.CONSOLE_HTML

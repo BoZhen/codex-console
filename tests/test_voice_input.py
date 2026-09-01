@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import sys
 import tempfile
 import textwrap
@@ -171,6 +172,45 @@ class TranscriberManagerTests(unittest.TestCase):
             previous, merged, confirmed, language="zh")
         self.assertTrue(advanced.startswith(confirmed))
         self.assertLessEqual(len(merged) - len(advanced), 10)
+
+    def test_final_transcript_cannot_be_shortened_by_confirmed_prefix_merge(self):
+        cases = [
+            ("嗯嗯", "这个地方需要改一下", "嗯嗯"),
+            ("so the", "What I meant was the threshold is too high", "so the"),
+            ("我想", "其实我想说的是这个功能很重要", "我想"),
+        ]
+        for previous, current, confirmed in cases:
+            with self.subTest(previous=previous, current=current):
+                self.assertEqual(
+                    faster_whisper_worker._preserve_confirmed_prefix(
+                        previous, current, confirmed),
+                    current,
+                )
+
+    def test_confirmed_prefix_merge_still_handles_growth_and_contraction(self):
+        self.assertEqual(
+            faster_whisper_worker._preserve_confirmed_prefix(
+                "重新启动服务", "重新启动服务器现在就做", "重新启动服"),
+            "重新启动服务器现在就做",
+        )
+        self.assertEqual(
+            faster_whisper_worker._preserve_confirmed_prefix(
+                "重新启动服务器现在就做", "重新启动服务", "重新启动服务器现在"),
+            "重新启动服务器现在",
+        )
+
+    def test_confirmed_prefix_merge_never_shortens_fresh_transcript(self):
+        rng = random.Random(20260901)
+        alphabet = "重启服务现在测试功能嗯我想说abcdef .,，。"
+        for _ in range(2000):
+            previous = "".join(rng.choice(alphabet)
+                               for _ in range(rng.randrange(25)))
+            current = "".join(rng.choice(alphabet)
+                              for _ in range(rng.randrange(25)))
+            confirmed = previous[:rng.randrange(len(previous) + 1)]
+            result = faster_whisper_worker._preserve_confirmed_prefix(
+                previous, current, confirmed)
+            self.assertGreaterEqual(len(result), len(current))
 
     def test_early_restart_word_locks_before_a_late_regression(self):
         correct = "重启完了，测试测试，看看能不能回车发送"
