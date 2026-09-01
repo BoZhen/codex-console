@@ -1,5 +1,7 @@
 # Codex Console
 
+English | [简体中文](README.zh-CN.md)
+
 A browser interface for the OpenAI Codex CLI. It runs `codex app-server`, keeps
 Codex sessions alive in the background, and presents conversation, tool calls,
 plans, file changes, and session state in one interface.
