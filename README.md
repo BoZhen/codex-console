@@ -35,7 +35,8 @@ plans, file changes, and session state in one interface.
 - **Context and rate-limit meters** from app-server usage events.
 - **Local `/status` and `/compact` commands**.
 - **Optional idle recap cards** generated after a configurable quiet period.
-- **Optional local file links** through a separate web-file-manager instance.
+- **Optional local file links** through
+  [web-file-manager](https://github.com/BoZhen/web-file-manager).
 - **Multiple color themes** with a single-file frontend and no build step.
 
 ## Requirements
