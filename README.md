@@ -7,7 +7,7 @@ Codex sessions alive in the background, and presents conversation, tool calls,
 plans, file changes, and session state in one interface.
 
 <p align="center">
-  <img src="docs/codex-console-overview.png" alt="Codex Console interface with project sidebar, session tabs, Plan, and grouped tool activity" width="600">
+  <img src="docs/codex-console-overview.png" alt="Codex Console interface with project sidebar, session tabs, Plan, grouped tool activity, and voice input" width="600">
 </p>
 
 ## Features

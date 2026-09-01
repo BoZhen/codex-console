@@ -7,7 +7,7 @@ OpenAI Codex CLI 的浏览器界面。它运行 `codex app-server`，让 Codex s
 状态。
 
 <p align="center">
-  <img src="docs/codex-console-overview.png" alt="包含项目侧栏、session 标签页、Plan 和分组工具活动的 Codex Console 界面" width="600">
+  <img src="docs/codex-console-overview.png" alt="包含项目侧栏、session 标签页、Plan、分组工具活动和语音输入的 Codex Console 界面" width="600">
 </p>
 
 ## 功能
