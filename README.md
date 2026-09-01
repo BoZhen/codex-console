@@ -32,6 +32,8 @@ plans, file changes, and session state in one interface.
 - **Image, text, and code attachments** from desktop or mobile. Images can also
   be pasted from the clipboard. Text and code files are sent as bounded,
   filename-labelled text input.
+- **Optional local voice input** that records in the browser, transcribes with
+  faster-whisper, and inserts editable text into the originating session draft.
 - **Live model catalog and reasoning effort controls** from the installed Codex
   app-server.
 - **Context and rate-limit meters** from app-server usage events.
@@ -52,6 +54,11 @@ Install the Python dependency:
 ```bash
 python -m pip install tornado
 ```
+
+Local voice transcription is optional. Install `faster-whisper` in the Python
+runtime configured for the transcription worker; install `opencc` there as well
+when Chinese script normalization is enabled. Browser microphone access requires
+HTTPS or localhost.
 
 ## Run
 
@@ -87,6 +94,20 @@ python codex_console.py
 | `CODEX_CONSOLE_RECAP_MODEL` | `gpt-5.3-codex-spark` | Recap model |
 | `CODEX_CONSOLE_RECAP_TIMEOUT_SEC` | `45` | Recap timeout |
 | `CODEX_CONSOLE_ITEM_HISTORY_LIMIT` | `256` | Completed live-item records retained per session |
+| `CODEX_CONSOLE_TRANSCRIBE` | `0` | Enable local voice transcription |
+| `CODEX_CONSOLE_TRANSCRIBE_PYTHON` | current Python | Python executable containing `faster-whisper` |
+| `CODEX_CONSOLE_TRANSCRIBE_MODEL` | unset | Local CTranslate2 model directory or model identifier |
+| `CODEX_CONSOLE_TRANSCRIBE_DEVICE` | `auto` | CTranslate2 device, such as `cpu` or `cuda` |
+| `CODEX_CONSOLE_TRANSCRIBE_DEVICE_INDEX` | `0` | GPU index used by the worker |
+| `CODEX_CONSOLE_TRANSCRIBE_COMPUTE_TYPE` | `default` | CTranslate2 compute type, such as `float16` or `int8` |
+| `CODEX_CONSOLE_TRANSCRIBE_LANGUAGE` | auto | Optional fixed transcription language |
+| `CODEX_CONSOLE_TRANSCRIBE_CHINESE_CONVERSION` | `none` | Chinese conversion: `none`, `t2s`, or `tw2sp` |
+| `CODEX_CONSOLE_TRANSCRIBE_PAUSE_PUNCTUATION` | `0` | Add pause and inferred final punctuation to transcripts |
+| `CODEX_CONSOLE_TRANSCRIBE_LD_LIBRARY_PATH` | unset | Additional CUDA library directories for the worker |
+| `CODEX_CONSOLE_TRANSCRIBE_MAX_MB` | `16` | Maximum audio upload size |
+| `CODEX_CONSOLE_TRANSCRIBE_MAX_SEC` | `120` | Maximum browser recording duration |
+| `CODEX_CONSOLE_TRANSCRIBE_TIMEOUT_SEC` | `180` | Transcription request timeout |
+| `CODEX_CONSOLE_TRANSCRIBE_IDLE_SEC` | `600` | Worker idle time before releasing model memory |
 
 ## Data
 
@@ -97,7 +118,9 @@ python codex_console.py
 Before sending, attachment bodies remain in browser memory. Sent text and code
 attachments become part of the Codex turn and may be stored in its rollout
 JSONL. Images are written to temporary files before being passed to app-server
-as local image input.
+as local image input. Voice recordings use permission-restricted temporary
+files and are deleted after transcription; transcribed text enters Codex only
+after the user sends the edited draft.
 
 ## Security
 
@@ -114,8 +137,8 @@ publish it through that feature.
 
 ## Implementation Notes
 
-- The application is a single `codex_console.py` file with inline HTML, CSS,
-  and JavaScript.
+- The server and inline frontend live in `codex_console.py`; optional local
+  transcription runs in the isolated `faster_whisper_worker.py` process.
 - KaTeX is vendored under `static/katex` for offline math rendering.
 - Codex Console prefers the native Codex executable installed with the npm
   package and accepts an explicit override through `CODEX_CONSOLE_CODEX`.

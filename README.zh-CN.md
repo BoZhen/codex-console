@@ -26,6 +26,8 @@ OpenAI Codex CLI 的浏览器界面。它运行 `codex app-server`，让 Codex s
 - **消息排队和中途引导**，可在当前 turn 运行期间继续发送消息。
 - **图片、文本和代码附件**，支持桌面端和移动端。图片也可从剪贴板粘贴；
   文本和代码文件会作为有长度限制、带文件名标识的文本输入发送。
+- **可选的本地语音输入**，在浏览器中录音，通过 faster-whisper 转写，并将
+  可编辑文本写入发起录音的 session 草稿。
 - **实时模型列表和思考深度控制**，数据来自已安装的 Codex app-server。
 - **上下文和用量计量**，数据来自 app-server 使用量事件。
 - **本地 `/status` 和 `/compact` 命令**。
@@ -45,6 +47,10 @@ OpenAI Codex CLI 的浏览器界面。它运行 `codex app-server`，让 Codex s
 ```bash
 python -m pip install tornado
 ```
+
+本地语音转写为可选功能。请在为转写 worker 配置的 Python 运行环境中安装
+`faster-whisper`；启用中文文字规范化时还需安装 `opencc`。浏览器麦克风需要
+HTTPS 或 localhost。
 
 ## 运行
 
@@ -79,6 +85,20 @@ python codex_console.py
 | `CODEX_CONSOLE_RECAP_MODEL` | `gpt-5.3-codex-spark` | Recap 模型 |
 | `CODEX_CONSOLE_RECAP_TIMEOUT_SEC` | `45` | Recap 超时时间 |
 | `CODEX_CONSOLE_ITEM_HISTORY_LIMIT` | `256` | 每个 session 保留的已完成 app-server item 数量 |
+| `CODEX_CONSOLE_TRANSCRIBE` | `0` | 启用本地语音转写 |
+| `CODEX_CONSOLE_TRANSCRIBE_PYTHON` | 当前 Python | 包含 `faster-whisper` 的 Python 可执行文件 |
+| `CODEX_CONSOLE_TRANSCRIBE_MODEL` | 未设置 | 本地 CTranslate2 模型目录或模型标识 |
+| `CODEX_CONSOLE_TRANSCRIBE_DEVICE` | `auto` | CTranslate2 设备，例如 `cpu` 或 `cuda` |
+| `CODEX_CONSOLE_TRANSCRIBE_DEVICE_INDEX` | `0` | Worker 使用的 GPU 编号 |
+| `CODEX_CONSOLE_TRANSCRIBE_COMPUTE_TYPE` | `default` | CTranslate2 计算类型，例如 `float16` 或 `int8` |
+| `CODEX_CONSOLE_TRANSCRIBE_LANGUAGE` | 自动检测 | 可选的固定转写语言 |
+| `CODEX_CONSOLE_TRANSCRIBE_CHINESE_CONVERSION` | `none` | 中文转换方式：`none`、`t2s` 或 `tw2sp` |
+| `CODEX_CONSOLE_TRANSCRIBE_PAUSE_PUNCTUATION` | `0` | 根据语音停顿和问句模式补充标点 |
+| `CODEX_CONSOLE_TRANSCRIBE_LD_LIBRARY_PATH` | 未设置 | Worker 使用的额外 CUDA 库目录 |
+| `CODEX_CONSOLE_TRANSCRIBE_MAX_MB` | `16` | 音频上传大小上限 |
+| `CODEX_CONSOLE_TRANSCRIBE_MAX_SEC` | `120` | 浏览器录音时长上限 |
+| `CODEX_CONSOLE_TRANSCRIBE_TIMEOUT_SEC` | `180` | 转写请求超时时间 |
+| `CODEX_CONSOLE_TRANSCRIBE_IDLE_SEC` | `600` | Worker 闲置多久后释放模型内存 |
 
 ## 数据
 
@@ -88,7 +108,8 @@ python codex_console.py
 
 发送前，附件内容仅保存在浏览器内存中。发送后的文本和代码附件会成为 Codex
 turn 的一部分，并可能存储在对应的 rollout JSONL 中。图片在作为本地图片输入
-传递给 app-server 前，会写入临时文件。
+传递给 app-server 前，会写入临时文件。语音录音使用权限受限的临时文件，并在
+转写后删除；转写文本只有在用户发送编辑后的草稿时才会进入 Codex。
 
 ## 安全
 
@@ -103,7 +124,8 @@ Codex Console 可能暴露所选项目目录中的 Codex 对话记录、源码�
 
 ## 实现说明
 
-- 应用由单个 `codex_console.py` 文件组成，其中内嵌 HTML、CSS 和 JavaScript。
+- 服务端和内嵌前端位于 `codex_console.py`；可选的本地转写在隔离的
+  `faster_whisper_worker.py` 进程中运行。
 - KaTeX 位于 `static/katex` 下，用于离线渲染数学公式。
 - Codex Console 优先使用随 npm 包安装的原生 Codex 可执行文件，也支持通过
   `CODEX_CONSOLE_CODEX` 显式指定。

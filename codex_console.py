@@ -21,12 +21,14 @@ import json
 import os
 import queue
 import re
+import select
 import secrets
 import shlex
 import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -105,6 +107,29 @@ MAX_IMAGE_B64_CHARS = ((MAX_IMAGE_BYTES + 2) // 3) * 4
 MAX_TEXT_FILE_BYTES = 512 * 1024
 MAX_TEXT_FILES_TOTAL_BYTES = 2 * 1024 * 1024
 WEBSOCKET_MAX_MESSAGE_SIZE = 64 * 1024 * 1024
+TRANSCRIBE_ENABLED = (_env("TRANSCRIBE", "0") or "0").lower() not in (
+    "0", "false", "no", "off")
+TRANSCRIBE_PYTHON = os.path.expanduser(_env("TRANSCRIBE_PYTHON", sys.executable))
+TRANSCRIBE_MODEL = os.path.expanduser(_env("TRANSCRIBE_MODEL", ""))
+TRANSCRIBE_DEVICE = _env("TRANSCRIBE_DEVICE", "auto") or "auto"
+TRANSCRIBE_DEVICE_INDEX = int(_env("TRANSCRIBE_DEVICE_INDEX", "0") or "0")
+TRANSCRIBE_COMPUTE_TYPE = _env("TRANSCRIBE_COMPUTE_TYPE", "default") or "default"
+TRANSCRIBE_LANGUAGE = _env("TRANSCRIBE_LANGUAGE", "")
+TRANSCRIBE_CHINESE_CONVERSION = (
+    _env("TRANSCRIBE_CHINESE_CONVERSION", "none") or "none").lower()
+TRANSCRIBE_PAUSE_PUNCTUATION = (
+    _env("TRANSCRIBE_PAUSE_PUNCTUATION", "0") or "0").lower() not in (
+        "0", "false", "no", "off")
+TRANSCRIBE_LD_LIBRARY_PATH = _env("TRANSCRIBE_LD_LIBRARY_PATH", "")
+TRANSCRIBE_MAX_BYTES = max(
+    1024 * 1024, int(_env("TRANSCRIBE_MAX_MB", "16") or "16") * 1024 * 1024)
+TRANSCRIBE_MAX_SECONDS = max(10, int(_env("TRANSCRIBE_MAX_SEC", "120") or "120"))
+TRANSCRIBE_TIMEOUT_SECONDS = max(
+    30, int(_env("TRANSCRIBE_TIMEOUT_SEC", "180") or "180"))
+TRANSCRIBE_IDLE_SECONDS = max(
+    30, int(_env("TRANSCRIBE_IDLE_SEC", "600") or "600"))
+TRANSCRIBE_WORKER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "faster_whisper_worker.py")
 # asyncio StreamReader's default line limit is 64KB. The codex app-server frames
 # each JSON-RPC message as one newline-delimited line, and a single notification
 # (e.g. an item/completed carrying a big command output, file read, or diff) can
@@ -2140,6 +2165,279 @@ class AuthMixin:
         self.set_header("WWW-Authenticate", 'Basic realm="codex-console"')
         self.finish()
         return False
+
+
+def _transcribe_status():
+    if not TRANSCRIBE_ENABLED:
+        return {"enabled": False, "available": False,
+                "reason": "voice transcription is disabled"}
+    python_path = (TRANSCRIBE_PYTHON if os.path.isabs(TRANSCRIBE_PYTHON)
+                   else shutil.which(TRANSCRIBE_PYTHON))
+    if not python_path or not os.path.isfile(python_path):
+        return {"enabled": True, "available": False,
+                "reason": "transcription runtime is unavailable"}
+    if not TRANSCRIBE_MODEL:
+        return {"enabled": True, "available": False,
+                "reason": "transcription model is not configured"}
+    if TRANSCRIBE_CHINESE_CONVERSION not in ("none", "t2s", "tw2sp"):
+        return {"enabled": True, "available": False,
+                "reason": "Chinese transcription conversion is invalid"}
+    if (os.path.isabs(TRANSCRIBE_MODEL)
+            and not os.path.isfile(os.path.join(TRANSCRIBE_MODEL, "model.bin"))):
+        return {"enabled": True, "available": False,
+                "reason": "transcription model is unavailable"}
+    if not os.path.isfile(TRANSCRIBE_WORKER):
+        return {"enabled": True, "available": False,
+                "reason": "transcription worker is unavailable"}
+    return {"enabled": True, "available": True, "reason": ""}
+
+
+class TranscriberManager:
+    """Own one lazy worker so model memory is released when that worker idles out."""
+
+    def __init__(self, python_path=None, worker_path=None, model=None,
+                 device=None, device_index=None, compute_type=None,
+                 language=None, chinese_conversion=None,
+                 pause_punctuation=None,
+                 idle_seconds=None, timeout_seconds=None,
+                 max_seconds=None, library_path=None):
+        self.python_path = python_path or TRANSCRIBE_PYTHON
+        self.worker_path = worker_path or TRANSCRIBE_WORKER
+        self.model = model or TRANSCRIBE_MODEL
+        self.device = device or TRANSCRIBE_DEVICE
+        self.device_index = (TRANSCRIBE_DEVICE_INDEX if device_index is None
+                             else int(device_index))
+        self.compute_type = compute_type or TRANSCRIBE_COMPUTE_TYPE
+        self.language = TRANSCRIBE_LANGUAGE if language is None else language
+        self.chinese_conversion = (TRANSCRIBE_CHINESE_CONVERSION
+                                   if chinese_conversion is None
+                                   else chinese_conversion)
+        self.pause_punctuation = (TRANSCRIBE_PAUSE_PUNCTUATION
+                                  if pause_punctuation is None
+                                  else bool(pause_punctuation))
+        self.idle_seconds = idle_seconds or TRANSCRIBE_IDLE_SECONDS
+        self.timeout_seconds = timeout_seconds or TRANSCRIBE_TIMEOUT_SECONDS
+        self.max_seconds = max_seconds or TRANSCRIBE_MAX_SECONDS
+        self.library_path = (TRANSCRIBE_LD_LIBRARY_PATH if library_path is None
+                             else library_path)
+        self.proc = None
+        self._lock = threading.Lock()
+
+    def _start_locked(self):
+        if self.proc and self.proc.poll() is None:
+            return self.proc
+        self._stop_locked()
+        python_path = (self.python_path if os.path.isabs(self.python_path)
+                       else shutil.which(self.python_path))
+        if not python_path:
+            raise RuntimeError("transcription runtime is unavailable")
+        command = [
+            python_path, "-u", self.worker_path,
+            "--model", self.model,
+            "--device", self.device,
+            "--device-index", str(self.device_index),
+            "--compute-type", self.compute_type,
+            "--idle-seconds", str(self.idle_seconds),
+            "--max-seconds", str(self.max_seconds),
+        ]
+        if self.language:
+            command += ["--language", self.language]
+        if self.chinese_conversion and self.chinese_conversion != "none":
+            command += ["--chinese-conversion", self.chinese_conversion]
+        if self.pause_punctuation:
+            command.append("--pause-punctuation")
+        env = os.environ.copy()
+        if self.library_path:
+            env["LD_LIBRARY_PATH"] = self.library_path + (
+                (":" + env["LD_LIBRARY_PATH"]) if env.get("LD_LIBRARY_PATH") else "")
+        if os.path.isdir(self.model):
+            env["HF_HUB_OFFLINE"] = "1"
+        self.proc = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1,
+            env=env)
+        return self.proc
+
+    def _stop_locked(self):
+        proc, self.proc = self.proc, None
+        if not proc:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def shutdown(self):
+        with self._lock:
+            self._stop_locked()
+
+    def transcribe(self, path):
+        with self._lock:
+            proc = self._start_locked()
+            request_id = secrets.token_hex(8)
+            try:
+                proc.stdin.write(json.dumps({
+                    "type": "transcribe", "id": request_id, "path": path}) + "\n")
+                proc.stdin.flush()
+            except Exception as exc:
+                self._stop_locked()
+                raise RuntimeError("transcription worker did not start") from exc
+            readable, _, _ = select.select(
+                [proc.stdout], [], [], self.timeout_seconds)
+            if not readable:
+                self._stop_locked()
+                raise TimeoutError("transcription timed out")
+            line = proc.stdout.readline()
+            if not line:
+                self._stop_locked()
+                raise RuntimeError("transcription worker exited")
+            try:
+                result = json.loads(line)
+            except Exception as exc:
+                self._stop_locked()
+                raise RuntimeError("invalid transcription worker response") from exc
+            if result.get("id") != request_id:
+                self._stop_locked()
+                raise RuntimeError("mismatched transcription worker response")
+            if not result.get("ok"):
+                error = RuntimeError(result.get("error") or "transcription failed")
+                error.code = result.get("code") or ""
+                raise error
+            return result
+
+
+_TRANSCRIBER = TranscriberManager()
+_TRANSCRIBER_GATE = threading.BoundedSemaphore(1)
+_AUDIO_TYPES = {
+    "audio/webm": ".webm", "video/webm": ".webm",
+    "audio/mp4": ".m4a", "video/mp4": ".m4a",
+    "audio/ogg": ".ogg", "audio/wav": ".wav", "audio/x-wav": ".wav",
+    "application/octet-stream": ".audio",
+}
+
+
+@tornado.web.stream_request_body
+class TranscribeHandler(AuthMixin, tornado.web.RequestHandler):
+    def initialize(self):
+        self._upload = None
+        self._upload_path = ""
+        self._upload_bytes = 0
+
+    def _json(self, payload, status=200):
+        self.set_status(status)
+        self.set_header("Content-Type", "application/json")
+        self.set_header("Cache-Control", "no-store")
+        self.write(json.dumps(payload, ensure_ascii=False))
+
+    def write_error(self, status_code, **kwargs):
+        exc_info = kwargs.get("exc_info")
+        reason = exc_info[1] if exc_info else None
+        message = getattr(reason, "reason", "") or self._reason or "request failed"
+        if not self._finished:
+            self._json({"ok": False, "error": message}, status_code)
+
+    def prepare(self):
+        if not self._ok_auth() or self.request.method != "POST":
+            return
+        status = _transcribe_status()
+        if not status["available"]:
+            raise tornado.web.HTTPError(503, reason=status["reason"])
+        content_length = self.request.headers.get("Content-Length", "")
+        try:
+            if content_length and int(content_length) > TRANSCRIBE_MAX_BYTES:
+                raise tornado.web.HTTPError(413, reason="audio exceeds the upload limit")
+        except ValueError:
+            raise tornado.web.HTTPError(400, reason="invalid content length")
+        media_type = self.request.headers.get("Content-Type", "").split(";", 1)[0].lower()
+        suffix = _AUDIO_TYPES.get(media_type)
+        if not suffix:
+            raise tornado.web.HTTPError(415, reason="unsupported audio type")
+        upload = tempfile.NamedTemporaryFile(
+            prefix="codex-console-voice-", suffix=suffix, delete=False)
+        os.chmod(upload.name, 0o600)
+        self._upload = upload
+        self._upload_path = upload.name
+
+    def data_received(self, chunk):
+        if not self._upload:
+            return
+        self._upload_bytes += len(chunk)
+        if self._upload_bytes > TRANSCRIBE_MAX_BYTES:
+            self._upload.close()
+            self._upload = None
+            raise tornado.web.HTTPError(413, reason="audio exceeds the upload limit")
+        self._upload.write(chunk)
+
+    def get(self):
+        if not self._ok_auth():
+            return
+        status = _transcribe_status()
+        self._json({
+            "ok": True, **status,
+            "maxBytes": TRANSCRIBE_MAX_BYTES,
+            "maxSeconds": TRANSCRIBE_MAX_SECONDS,
+        })
+
+    async def post(self):
+        if not self._upload or not self._upload_bytes:
+            raise tornado.web.HTTPError(400, reason="empty audio")
+        self._upload.close()
+        self._upload = None
+        try:
+            duration_ms = int(self.request.headers.get("X-Audio-Duration-Ms", "0") or "0")
+        except ValueError:
+            duration_ms = 0
+        if duration_ms > (TRANSCRIBE_MAX_SECONDS + 2) * 1000:
+            raise tornado.web.HTTPError(413, reason="recording is too long")
+        if not _TRANSCRIBER_GATE.acquire(blocking=False):
+            raise tornado.web.HTTPError(429, reason="another transcription is running")
+        try:
+            loop = tornado.ioloop.IOLoop.current()
+            result = await loop.run_in_executor(
+                None, _TRANSCRIBER.transcribe, self._upload_path)
+        except TimeoutError as exc:
+            raise tornado.web.HTTPError(504, reason=str(exc))
+        except Exception as exc:
+            if getattr(exc, "code", "") == "too_long":
+                raise tornado.web.HTTPError(413, reason=str(exc))
+            raise tornado.web.HTTPError(500, reason=(str(exc) or "transcription failed")[:1000])
+        finally:
+            _TRANSCRIBER_GATE.release()
+        if not (result.get("text") or "").strip():
+            raise tornado.web.HTTPError(422, reason="no speech detected")
+        self._json({
+            "ok": True,
+            "text": result.get("text") or "",
+            "language": result.get("language") or "",
+            "duration": result.get("duration"),
+            "elapsed": result.get("elapsed"),
+        })
+
+    def on_finish(self):
+        if self._upload:
+            try:
+                self._upload.close()
+            except Exception:
+                pass
+            self._upload = None
+        if self._upload_path:
+            try:
+                os.unlink(self._upload_path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+            self._upload_path = ""
 
 
 # ───────────────────────── handlers ─────────────────────────
@@ -4267,13 +4565,21 @@ pre code{background:none;border:none;padding:0}
 #queue .qmsg .qtext{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #queue .qmsg .qx{flex:none;color:var(--mut);font-size:13px;padding:0 2px}
 #queue .qmsg:hover .qx{color:var(--del)}
-#ta{flex:1;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:10px;
+#ta{flex:1;min-width:0;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:10px;
   padding:9px 12px;font-size:14px;font-family:inherit;resize:none;max-height:160px;line-height:1.4}
 #ta:focus{outline:1px solid var(--acc)}
-#attachBtn{background:var(--bg3);color:var(--mut);border:1px solid var(--line);border-radius:10px;width:38px;height:38px;
+#attachBtn,#voiceBtn{background:var(--bg3);color:var(--mut);border:1px solid var(--line);border-radius:10px;width:38px;height:38px;
   flex:none;display:inline-flex;align-items:center;justify-content:center;font-size:16px;cursor:pointer;padding:0}
-#attachBtn:hover{color:var(--fg);border-color:var(--acc)}
-#attachBtn:disabled{opacity:.45;cursor:default;border-color:var(--line)}
+#attachBtn:hover,#voiceBtn:hover{color:var(--fg);border-color:var(--acc)}
+#attachBtn:disabled,#voiceBtn:disabled{opacity:.45;cursor:default;border-color:var(--line)}
+#voiceBtn.recording{color:var(--del);border-color:var(--del);background:var(--nobg)}
+#voiceBar{height:28px;display:flex;align-items:center;gap:7px;padding:0 2px 7px;color:var(--mut);font:11.5px var(--fmono)}
+#voiceBar[hidden]{display:none}
+#voiceBar .vmark{width:7px;height:7px;border-radius:50%;background:var(--del);flex:none}
+#voiceBar.transcribing .vmark{background:var(--acc);animation:pulse 1.1s ease-in-out infinite}
+#voiceLabel{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#voiceCancel{width:24px;height:24px;border:0;background:transparent;color:var(--mut);cursor:pointer;padding:0;font-size:13px}
+#voiceCancel:hover{color:var(--del);background:var(--nobg)}
 #send{background:var(--acc);color:var(--onacc);border:none;border-radius:10px;width:38px;height:38px;flex:none;display:inline-flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;cursor:pointer}
 #send:disabled{background:var(--line);color:var(--mut);cursor:default}
 
@@ -4798,9 +5104,11 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
       </div>
       <div id="queue"></div>
       <div id="attach"></div>
+      <div id="voiceBar" hidden><span class="vmark"></span><span id="voiceLabel"></span><button id="voiceCancel" type="button" title="Cancel voice input" aria-label="Cancel voice input">✕</button></div>
       <div class="wrap2">
       <input type="file" id="attachmentPicker" accept="image/png,image/jpeg,image/gif,image/webp,text/*,application/json,application/xml,application/javascript,application/x-yaml,.py,.ipynb,.js,.jsx,.ts,.tsx,.json,.jsonl,.yaml,.yml,.toml,.md,.rst,.tex,.bib,.c,.h,.cpp,.hpp,.cc,.rs,.go,.java,.kt,.kts,.sh,.bash,.zsh,.fish,.sql,.html,.css,.scss,.less,.xml,.csv,.tsv,.ini,.cfg,.conf,.log,.diff,.patch,.mk" multiple hidden>
       <button id="attachBtn" type="button" title="Attach images, text, or code files" aria-label="Attach files" disabled>📎</button>
+      <button id="voiceBtn" type="button" title="Voice input" aria-label="Start voice input" disabled>🎙</button>
       <textarea id="ta" rows="1" placeholder="Type a message…" disabled></textarea>
       <button id="stop" title="interrupt / stop" style="display:none">⏹</button>
       <button id="send" disabled>➤</button>
@@ -4850,7 +5158,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 
 <script>
 const $=s=>document.querySelector(s);
-const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send'), attachBtn=$('#attachBtn'), attachmentPicker=$('#attachmentPicker');
+const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send'), attachBtn=$('#attachBtn'), voiceBtn=$('#voiceBtn'), attachmentPicker=$('#attachmentPicker');
 let ws=null, running=false, ready=false, compacting=false, cwd='', tools={};
 let tokUp=0,tokOut=0,tokShow=false;   /* live streaming token counts shown in the pill */
 let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
@@ -5331,13 +5639,12 @@ function bindProject(p){if(!p)return;const sel=$('#project');let ok=false;
   for(const o of sel.options){if(o.value===p){ok=true;break;}}
   if(!ok){const o=document.createElement('option');o.value=p;o.textContent='● '+p.split('/').slice(-2).join('/');sel.insertBefore(o,sel.firstChild);}
   sel.value=p;}
+function setComposerEnabled(on){ta.disabled=!on;sendBtn.disabled=!on;attachBtn.disabled=!on;syncVoiceButton();}
 function setBusy(b,wordSeed,elapsedMs){running=b;$('#dot').className='dot '+(b?'busy':(ready?'on':''));
   setSessionTabBusy(sid,b);
   $('#thinking').classList.toggle('busy',b);
   if(!b&&ready)statset('ready');      /* busy: startThinking owns the word + timer */
-  ta.disabled=!ready;
-  sendBtn.disabled=!ready;            /* send stays available while busy → queues */
-  attachBtn.disabled=!ready;
+  setComposerEnabled(ready);           /* send stays available while busy → queues */
   $('#stop').style.display=b?'':'none';   /* interrupt button only while busy */
   sendBtn.style.display='';               /* send always visible */
   if(b)startThinking(wordSeed,elapsedMs);else stopThinking();}
@@ -5419,6 +5726,7 @@ function fmtSecs(ms){const s=Math.max(0,Math.round(ms/1000));if(s<60)return s+'s
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
 function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;
+  setComposerEnabled(false);
   if(asstRenderT){clearTimeout(asstRenderT);asstRenderT=0;}
   if(planHideT){clearTimeout(planHideT);planHideT=0;}
   if(windowTrimT){clearTimeout(windowTrimT);windowTrimT=0;}windowHidden=0;windowHiddenChars=0;
@@ -5542,7 +5850,7 @@ function route(ev){const seq=Number(ev&&ev._seq||0),tab=sessionTabById(sid);
 }
 
 /* persistent server-side session: attach / reattach / switch */
-function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;attachBtn.disabled=true;$('#dot').className='dot';statset('ended');
+function markEnded(msg){ready=false;setComposerEnabled(false);$('#dot').className='dot';statset('ended');
   localStorage.removeItem(SKEY);if(msg)addNotice(msg);}
 function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);loadDraft(sid);
@@ -5561,10 +5869,10 @@ function onMsg(e){const m=JSON.parse(e.data);
     mergeSubagents(m.subagents||[],incremental);
     compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);loadDraft(sid);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
-    else{ta.disabled=false;sendBtn.disabled=false;attachBtn.disabled=false;if(!incremental)addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
+    else{setComposerEnabled(true);if(!incremental)addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
     const attachedTab=sessionTabById(m.id);if(attachedTab){attachedTab.lastSeq=Number(m.event_seq||attachedTab.lastSeq||0);attachedTab.serverSeq=attachedTab.lastSeq;persistSessionTabs();}
     restoredViewId=m.id;if(incremental){if(stick){scroll();requestAnimationFrame(scroll);}}else restoreSessionTabView(m.id);reqList();loadTree();}
-  else if(m.type==='detached'){if(!sid){ready=false;ta.disabled=true;sendBtn.disabled=true;attachBtn.disabled=true;statset('idle');}}
+  else if(m.type==='detached'){if(!sid){ready=false;setComposerEnabled(false);statset('idle');}}
   else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;ready=false;activeModel='default';setBusy(false);setCurname('');renderCtx(null);statset('idle');
     if(m.id){sessionViewCache.delete(m.id);const i=sessionTabState.findIndex(t=>t.id===m.id);if(i>=0){sessionTabState.splice(i,1);persistSessionTabs();renderSessionTabs();}}
     mergeSubagents([],true);
@@ -5597,7 +5905,7 @@ function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
   ws.onopen=()=>{clearTimeout(reconnectT);$('#dot').className='dot '+(ready?'on':'');reqList();
     if(cb)cb();else{const saved=localStorage.getItem(SKEY);if(saved&&!pendingStart){const req={type:'attach',id:saved},tab=sessionTabById(saved);
       if(restoredViewId===saved&&tab)req.after_seq=Number(tab.lastSeq||0);else statset('reattaching…');ws.send(JSON.stringify(req));}}};
-  ws.onclose=()=>{$('#dot').className='dot';statset('disconnected');ta.disabled=true;sendBtn.disabled=true;attachBtn.disabled=true;
+  ws.onclose=()=>{$('#dot').className='dot';statset('disconnected');setComposerEnabled(false);
     clearTimeout(reconnectT);reconnectT=setTimeout(()=>openWs(),1800);};
   ws.onmessage=onMsg;}
 function wsSend(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}
@@ -5680,7 +5988,7 @@ function closeSessionTab(id){const idx=sessionTabState.findIndex(t=>t.id===id);i
   if(active){saveDraft();rememberActiveTabView();}sessionViewCache.delete(id);sessionTabState.splice(idx,1);persistSessionTabs();renderSessionTabs();if(!active)return;
   const next=sessionTabState[Math.min(idx,sessionTabState.length-1)];if(next){switchSession(next.id);return;}
   clearUI();sid=null;curCC=null;cwd='';activeModel='default';running=false;compacting=false;localStorage.removeItem(SKEY);
-  setCurname('');statset('idle');ta.disabled=true;sendBtn.disabled=true;attachBtn.disabled=true;wsSend({type:'detach'});renderSessionTabs();}
+  setCurname('');statset('idle');setComposerEnabled(false);wsSend({type:'detach'});renderSessionTabs();}
 function openLiveSession(s){if(!s||!s.id)return;ensureSessionTab(s,false);switchSession(s.id);}
 function sessionTabKeydown(ev){if(!['ArrowLeft','ArrowRight','Home','End'].includes(ev.key))return;
   const tabs=[...$('#sessionTabs').querySelectorAll('.stab-main')];if(!tabs.length)return;let i=tabs.indexOf(ev.target);if(i<0)return;
@@ -6331,6 +6639,88 @@ function loadDraft(id){const d=drafts[id]||{text:'',images:[],files:[]};ta.value
   ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';
   pendingImages=(d.images||[]).slice();pendingFiles=(d.files||[]).slice();renderAttach();}
 function dropDraft(id){if(id&&drafts[id]){delete drafts[id];persistDrafts();}}
+
+/* voice input records locally, transcribes through the same-origin endpoint, and
+   writes only into the originating session's editable draft. */
+let voiceCaps={enabled:false,available:false,maxBytes:16*1024*1024,maxSeconds:120,reason:'loading voice input…'};
+let voiceJob=null,voiceSeq=0;
+function voiceShortcutLabel(){return 'Alt+M';}
+function voiceUnavailableReason(){
+  if(!window.isSecureContext)return 'Voice input requires HTTPS';
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia)return 'Microphone access is unavailable';
+  if(typeof MediaRecorder==='undefined')return 'Audio recording is unsupported';
+  if(!voiceCaps.available)return voiceCaps.reason||'Voice transcription is unavailable';
+  return '';}
+function fmtVoiceTime(ms){const s=Math.max(0,Math.floor(ms/1000));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0');}
+function syncVoiceButton(){if(!voiceBtn)return;const reason=voiceUnavailableReason(),recording=voiceJob&&voiceJob.mode==='recording';
+  voiceBtn.disabled=!!reason||(!ready&&!recording)||!!(voiceJob&&voiceJob.mode!=='recording');
+  voiceBtn.classList.toggle('recording',!!recording);voiceBtn.textContent=recording?'■':'🎙';
+  voiceBtn.title=reason||((recording?'Stop and transcribe':'Voice input')+' · '+voiceShortcutLabel());
+  voiceBtn.setAttribute('aria-label',reason||(recording?'Stop voice recording':'Start voice input'));
+  voiceBtn.setAttribute('aria-keyshortcuts','Alt+M');}
+function renderVoiceState(){const bar=$('#voiceBar'),label=$('#voiceLabel');if(!bar||!label)return;
+  if(!voiceJob){bar.hidden=true;bar.className='';syncVoiceButton();return;}
+  bar.hidden=false;bar.className=voiceJob.mode==='transcribing'?'transcribing':'';
+  if(voiceJob.mode==='starting')label.textContent='microphone…';
+  else if(voiceJob.mode==='transcribing')label.textContent='transcribing…';
+  else label.textContent='recording · '+fmtVoiceTime(Date.now()-voiceJob.startedAt)+' / '+fmtVoiceTime(voiceCaps.maxSeconds*1000);
+  syncVoiceButton();}
+function stopVoiceTracks(job){if(job&&job.stream){job.stream.getTracks().forEach(t=>t.stop());job.stream=null;}}
+function clearVoiceTimers(job){if(!job)return;clearInterval(job.tick);clearTimeout(job.limit);job.tick=job.limit=0;}
+function cleanupVoiceJob(job){clearVoiceTimers(job);stopVoiceTracks(job);if(voiceJob===job){voiceJob=null;renderVoiceState();}}
+function voiceMime(){const choices=['audio/webm;codecs=opus','audio/mp4','audio/ogg;codecs=opus','audio/webm'];
+  for(const type of choices){try{if(!MediaRecorder.isTypeSupported||MediaRecorder.isTypeSupported(type))return type;}catch(e){}}
+  return '';}
+function voiceSpacing(left,right){return /[A-Za-z0-9_]$/.test(left||'')&&/^[A-Za-z0-9_]/.test(right||'')?' ':'';}
+function insertVoiceValue(value,start,end,text){start=Math.max(0,Math.min(Number(start)||0,value.length));end=Math.max(start,Math.min(Number(end)||start,value.length));
+  const before=value.slice(0,start),after=value.slice(end),clean=(text||'').trim();
+  const inserted=voiceSpacing(before,clean)+clean+voiceSpacing(clean,after);
+  return {value:before+inserted+after,start:start,end:start+inserted.length};}
+function insertVoiceDraft(job,text){if(!job||!job.targetSid||!(text||'').trim())return;
+  if(job.targetSid===sid){const out=insertVoiceValue(ta.value,job.insertStart,job.insertEnd,text);ta.value=out.value;
+    ta.setSelectionRange(out.end,out.end);ta.dispatchEvent(new Event('input',{bubbles:true}));ta.focus();return;}
+  const d=drafts[job.targetSid]||{text:'',images:[],files:[]};d.images=d.images||[];d.files=d.files||[];
+  const out=insertVoiceValue(d.text||'',job.insertStart,job.insertEnd,text);d.text=out.value;drafts[job.targetSid]=d;persistDrafts();}
+function voiceErrorMessage(err){const name=err&&err.name;if(name==='NotAllowedError')return 'Microphone permission was denied';
+  if(name==='NotFoundError')return 'No microphone was found';if(name==='NotReadableError')return 'The microphone is already in use';
+  return (err&&err.message)||String(err||'Voice input failed');}
+async function loadVoiceCapabilities(){try{const r=await fetch('api/transcribe',{cache:'no-store'}),j=await r.json();
+    voiceCaps=Object.assign(voiceCaps,j||{});if(!r.ok)voiceCaps.available=false;
+  }catch(e){voiceCaps.available=false;voiceCaps.reason='Voice transcription is unreachable';}syncVoiceButton();}
+async function uploadVoice(job,blob){if(job.cancelled)return;
+  if(!blob.size){addNotice('⚠ no audio was recorded');cleanupVoiceJob(job);return;}
+  if(blob.size>voiceCaps.maxBytes){addNotice('⚠ voice recording exceeds the upload limit');cleanupVoiceJob(job);return;}
+  job.mode='transcribing';job.controller=new AbortController();renderVoiceState();
+  try{const r=await fetch('api/transcribe',{method:'POST',headers:{'Content-Type':blob.type||'application/octet-stream',
+      'X-Audio-Duration-Ms':String(job.durationMs||0)},body:blob,signal:job.controller.signal});
+    let j={};try{j=await r.json();}catch(e){}
+    if(!r.ok||!j.ok)throw new Error(j.error||('transcription failed ('+r.status+')'));
+    if(!job.cancelled)insertVoiceDraft(job,j.text||'');
+  }catch(e){if(!job.cancelled&&e.name!=='AbortError')addNotice('⚠ '+voiceErrorMessage(e));}
+  finally{cleanupVoiceJob(job);}}
+function recorderStopped(job){stopVoiceTracks(job);if(job.cancelled){cleanupVoiceJob(job);return;}
+  const type=(job.recorder&&job.recorder.mimeType)||job.mime||'application/octet-stream';
+  uploadVoice(job,new Blob(job.chunks,{type:type}));}
+function stopVoiceInput(){const job=voiceJob;if(!job||job.mode!=='recording')return;
+  job.insertStart=job.targetSid===sid?ta.selectionStart:job.insertStart;job.insertEnd=job.targetSid===sid?ta.selectionEnd:job.insertEnd;
+  job.durationMs=Math.max(0,Date.now()-job.startedAt);clearVoiceTimers(job);job.mode='transcribing';renderVoiceState();
+  try{if(job.recorder&&job.recorder.state!=='inactive')job.recorder.stop();else recorderStopped(job);}catch(e){addNotice('⚠ '+voiceErrorMessage(e));cleanupVoiceJob(job);}}
+function cancelVoiceInput(){const job=voiceJob;if(!job)return;job.cancelled=true;clearVoiceTimers(job);
+  if(job.controller)job.controller.abort();try{if(job.recorder&&job.recorder.state!=='inactive')job.recorder.stop();}catch(e){}
+  cleanupVoiceJob(job);}
+async function startVoiceInput(){const reason=voiceUnavailableReason();if(reason||!ready||!sid){if(reason)addNotice('⚠ '+reason);return;}
+  const job=voiceJob={id:++voiceSeq,mode:'starting',targetSid:sid,insertStart:ta.selectionStart,insertEnd:ta.selectionEnd,
+    chunks:[],stream:null,recorder:null,startedAt:0,durationMs:0,cancelled:false};renderVoiceState();
+  try{const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
+    if(voiceJob!==job||job.cancelled){stream.getTracks().forEach(t=>t.stop());return;}job.stream=stream;job.mime=voiceMime();
+    job.recorder=job.mime?new MediaRecorder(stream,{mimeType:job.mime,audioBitsPerSecond:64000}):new MediaRecorder(stream);
+    job.recorder.ondataavailable=e=>{if(e.data&&e.data.size)job.chunks.push(e.data);};
+    job.recorder.onerror=e=>{if(!job.cancelled)addNotice('⚠ '+voiceErrorMessage(e.error||e));cancelVoiceInput();};
+    job.recorder.onstop=()=>recorderStopped(job);job.startedAt=Date.now();job.mode='recording';job.recorder.start(1000);
+    job.tick=setInterval(renderVoiceState,250);job.limit=setTimeout(stopVoiceInput,voiceCaps.maxSeconds*1000);renderVoiceState();
+  }catch(e){if(!job.cancelled)addNotice('⚠ '+voiceErrorMessage(e));cleanupVoiceJob(job);}}
+function toggleVoiceInput(){if(voiceJob&&voiceJob.mode==='recording')stopVoiceInput();else if(!voiceJob)startVoiceInput();}
+
 function sendMsg(){const t=ta.value.trim();
   if((!t&&!pendingImages.length&&!pendingFiles.length)||!ready||!sid||!ws||ws.readyState!==1)return;
   wsSend({type:'user',text:t,images:pendingImages.map(im=>({media_type:im.media_type,data:im.data})),
@@ -6404,6 +6794,11 @@ ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefa
 window.addEventListener('paste',handlePaste);
 attachBtn.onclick=chooseAttachments;
 attachmentPicker.onchange=handleAttachmentPick;
+voiceBtn.onclick=toggleVoiceInput;
+$('#voiceCancel').onclick=cancelVoiceInput;
+window.addEventListener('beforeunload',cancelVoiceInput);
+document.addEventListener('keydown',e=>{if(e.repeat||!e.altKey||e.ctrlKey||e.metaKey||e.shiftKey||e.key.toLowerCase()!=='m')return;
+  e.preventDefault();e.stopPropagation();toggleVoiceInput();},true);
 sendBtn.onclick=sendMsg;
 $('#stop').onclick=doInterrupt;
 document.addEventListener('keydown',e=>{
@@ -6569,6 +6964,7 @@ setInterval(loadModels,300000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)loadModels();});
 wireImport();
 wireSearch();
+loadVoiceCapabilities();
 $('#mrefresh').onclick=()=>{const b=$('#mrefresh');if(b.classList.contains('busy'))return;
   b.classList.add('busy');loadModels(true).finally(()=>b.classList.remove('busy'));};
 openWs();
@@ -6608,6 +7004,7 @@ def main():
         (r"/api/import", ImportHandler),
         (r"/api/search", SearchHandler),
         (r"/api/thread", ThreadHandler),
+        (r"/api/transcribe", TranscribeHandler),
         (r"/ws/chat", ChatSocket),
         (r"/static/(.*)", tornado.web.StaticFileHandler,
          {"path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")}),
@@ -6631,6 +7028,7 @@ def main():
               " transcripts and code diffs. Set CODEX_CONSOLE_AUTH=user:pass." % BIND)
 
     def _shutdown(signum, frame):
+        _TRANSCRIBER.shutdown()
         for s in list(CHAT_SESSIONS.values()):
             try:
                 s.terminate()

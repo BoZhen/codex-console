@@ -2,9 +2,9 @@
 
 ## Source of truth
 - Status: Active
-- Last refreshed: 2026-08-31
+- Last refreshed: 2026-09-01
 - Primary product surfaces: session sidebar, session tabs, chat stream, composer, changes drawer
-- Evidence reviewed: `README.md`, inline HTML/CSS/JS in `codex_console.py`, current multi-session behavior
+- Evidence reviewed: `README.md`, inline HTML/CSS/JS in `codex_console.py`, `faster_whisper_worker.py`, current multi-session behavior
 
 ## Brand
 - Personality: quiet, technical, work-focused
@@ -18,7 +18,7 @@
 
 ## Personas and jobs
 - Primary personas: developers and researchers running several project-scoped Codex threads
-- User jobs: monitor parallel work, switch contexts quickly, retain drafts, and deliberately end only the sessions they no longer need
+- User jobs: monitor parallel work, switch contexts quickly, retain drafts, dictate editable prompts on mobile or desktop, and deliberately end only the sessions they no longer need
 - Key contexts of use: desktop as primary; narrow tablet/mobile for occasional monitoring
 
 ## Information architecture
@@ -42,13 +42,13 @@
 
 ## Components
 - Existing components to reuse: LIVE session rows, busy dots, close/menu controls, session title, context/status header
-- New/changed components: horizontal session tab strip labeled only by session name; tab activation and close-view actions; compact older-content marker with a history-search action; collapsible sticky Plan dock; collapsible consecutive tool-call groups; composer attachment button with image thumbnails and compact text/code file previews
+- New/changed components: horizontal session tab strip labeled only by session name; tab activation and close-view actions; compact older-content marker with a history-search action; collapsible sticky Plan dock; collapsible consecutive tool-call groups; composer attachment button with image thumbnails and compact text/code file previews; fixed-size microphone control with recording, cancellation, and transcription states
 - Variants and states: active, background-ready, background-busy, unread, stale/ended; Plan expanded or collapsed to active work only; tool groups collapsed or expanded with running and failed counts
 - Token/component ownership: inline CSS and JS in `codex_console.py`; no new dependency or design-system layer
 
 ## Accessibility
 - Target standard: practical WCAG 2.1 AA behavior for navigation and controls
-- Keyboard/focus behavior: tabs use tab semantics, arrow-key navigation, visible focus, and a named close button
+- Keyboard/focus behavior: tabs use tab semantics, arrow-key navigation, visible focus, and a named close button; Alt+M toggles voice recording without moving focus out of the composer
 - Contrast/readability: reuse tested theme colors and add text/symbol state alongside color
 - Screen-reader semantics: `role="tablist"`, `role="tab"`, `aria-selected`, descriptive close labels
 - Reduced motion and sensory considerations: no required animation for state comprehension
@@ -56,13 +56,13 @@
 ## Responsive behavior
 - Supported breakpoints/devices: existing desktop layout and `max-width: 860px` mobile layout
 - Layout adaptations: tabs scroll horizontally and truncate session names; they have no project subtitle and never wrap or resize the chat/composer
-- Touch/hover differences: close and composer attachment controls remain large enough for touch; tooltips are supplemental; mobile users choose images or files through the system picker while desktop paste remains available
+- Touch/hover differences: close, attachment, and microphone controls remain large enough for touch; tooltips are supplemental; mobile users choose images or files through the system picker while desktop paste remains available
 
 ## Interaction states
 - Loading: newly resumed session tab shows its existing switching/resuming status
 - Empty: hide the strip when no tab is open
-- Error: failed attach removes stale live tabs and leaves the user in an explicit no-session state
-- Success: activating a live tab updates chat, project binding, draft, model, and context; long sessions retain a bounded recent DOM window with explicit access to indexed history; a collapsed Plan shows only current active work and updates in place; a fully completed Plan remains visible briefly and then clears itself; adjacent calls of the same tool collapse into one summary while preserving each original call and output on expansion; pasted images and system-picked image/text/code attachments share validation, preview, draft, and send behavior
+- Error: failed attach removes stale live tabs and leaves the user in an explicit no-session state; microphone, recording, upload, and transcription failures leave the existing draft intact
+- Success: activating a live tab updates chat, project binding, draft, model, and context; long sessions retain a bounded recent DOM window with explicit access to indexed history; a collapsed Plan shows only current active work and updates in place; a fully completed Plan remains visible briefly and then clears itself; adjacent calls of the same tool collapse into one summary while preserving each original call and output on expansion; pasted images and system-picked image/text/code attachments share validation, preview, draft, and send behavior; voice recordings transcribe into the originating session draft without automatic submission and may apply explicitly configured Chinese script normalization and pause-aware punctuation
 - Disabled: ended/stale tabs cannot send messages
 - Offline/slow network: tabs remain visible while the socket reconnects; no session is ended by disconnect
 
@@ -72,10 +72,10 @@
 - Microcopy rules: use "Close tab" for view-only removal and "End session" for process termination
 
 ## Implementation constraints
-- Framework/styling system: single Python file with inline vanilla HTML/CSS/JS
+- Framework/styling system: primary Python server with inline vanilla HTML/CSS/JS plus an optional isolated transcription worker
 - Design-token constraints: reuse existing CSS custom properties
 - Performance constraints: restore an opened tab from its in-memory DOM cache before networking; use sequenced incremental `attach`, not `resume` or full replay, to catch up background activity; bound each chat DOM by rendered-item and text-size budgets while never pruning unresolved interactive cards or tool groups containing running calls
-- Compatibility constraints: existing sidebar, drafts, approvals, model/context state, and service restart behavior must remain intact
+- Compatibility constraints: existing sidebar, drafts, approvals, model/context state, and service restart behavior must remain intact; microphone capture requires a secure browser context while transcription remains an optional local backend
 - Test/screenshot expectations: source-level regression tests, JavaScript syntax check, unit suite, and desktop/mobile visual smoke check when practical
 
 ## Open questions
