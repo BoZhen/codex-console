@@ -46,6 +46,7 @@ class TranscriberManagerTests(unittest.TestCase):
                 python_path=sys.executable,
                 worker_path=worker,
                 model="test-model",
+                allowed_languages=("zh", "en"),
                 chinese_conversion="tw2sp",
                 pause_punctuation=True,
                 idle_seconds=60,
@@ -62,6 +63,8 @@ class TranscriberManagerTests(unittest.TestCase):
                 self.assertEqual(first["text"], "hello")
                 self.assertIn("tw2sp", first["argv"])
                 self.assertIn("--pause-punctuation", first["argv"])
+                self.assertIn("--allowed-languages", first["argv"])
+                self.assertIn("zh,en", first["argv"])
                 self.assertFalse(first["final"])
                 self.assertEqual(first["stream_id"], "voice-1")
                 self.assertEqual(first["duration_hint"], 2.5)
@@ -190,6 +193,62 @@ class TranscriberManagerTests(unittest.TestCase):
         faster_whisper_worker._purge_live_states(states, now=400)
         self.assertNotIn("stale", states)
         self.assertLessEqual(len(states), faster_whisper_worker._LIVE_STATE_LIMIT)
+
+    def test_language_allowlist_retries_and_selects_best_candidate(self):
+        class FakeModel:
+            def __init__(self, responses):
+                self.responses = responses
+                self.calls = []
+
+            def transcribe(self, _path, language=None, **_kwargs):
+                self.calls.append(language)
+                text, resolved, score = self.responses[language]
+                segment = SimpleNamespace(
+                    text=text, words=[], start=0.0, end=1.0,
+                    avg_logprob=score)
+                info = SimpleNamespace(
+                    language=resolved, language_probability=0.9,
+                    duration=1.0)
+                return iter([segment]), info
+
+        spanish = FakeModel({
+            None: ("hola", "es", -0.2),
+            "zh": ("你好", "zh", -0.8),
+            "en": ("hello", "en", -0.1),
+        })
+        selected = faster_whisper_worker._decode_with_allowlist(
+            spanish, "audio", "", ("zh", "en"), False, False)
+        self.assertEqual(selected["language"], "en")
+        self.assertEqual(spanish.calls, [None, "zh", "en"])
+
+        japanese = FakeModel({
+            None: ("テスト", "ja", -0.2),
+            "zh": ("测试", "zh", -0.1),
+            "en": ("test", "en", -0.7),
+        })
+        selected = faster_whisper_worker._decode_with_allowlist(
+            japanese, "audio", "", ("zh", "en"), False, False)
+        self.assertEqual(selected["language"], "zh")
+        self.assertEqual(japanese.calls, [None, "zh", "en"])
+
+    def test_fixed_language_bypasses_allowlist_retries(self):
+        class FakeModel:
+            def __init__(self):
+                self.calls = []
+
+            def transcribe(self, _path, language=None, **_kwargs):
+                self.calls.append(language)
+                segment = SimpleNamespace(
+                    text="测试", words=[], start=0.0, end=1.0,
+                    avg_logprob=-0.1)
+                return iter([segment]), SimpleNamespace(
+                    language="zh", language_probability=1.0, duration=1.0)
+
+        model = FakeModel()
+        selected = faster_whisper_worker._decode_with_allowlist(
+            model, "audio", "zh", ("zh", "en"), False, False)
+        self.assertEqual(selected["language"], "zh")
+        self.assertEqual(model.calls, ["zh"])
 
 
 class _FakeTranscriber:

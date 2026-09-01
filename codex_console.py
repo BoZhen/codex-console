@@ -115,6 +115,10 @@ TRANSCRIBE_DEVICE = _env("TRANSCRIBE_DEVICE", "auto") or "auto"
 TRANSCRIBE_DEVICE_INDEX = int(_env("TRANSCRIBE_DEVICE_INDEX", "0") or "0")
 TRANSCRIBE_COMPUTE_TYPE = _env("TRANSCRIBE_COMPUTE_TYPE", "default") or "default"
 TRANSCRIBE_LANGUAGE = _env("TRANSCRIBE_LANGUAGE", "")
+TRANSCRIBE_ALLOWED_LANGUAGES = tuple(
+    language.strip().lower()
+    for language in _env("TRANSCRIBE_ALLOWED_LANGUAGES", "").split(",")
+    if language.strip())
 TRANSCRIBE_CHINESE_CONVERSION = (
     _env("TRANSCRIBE_CHINESE_CONVERSION", "none") or "none").lower()
 TRANSCRIBE_PAUSE_PUNCTUATION = (
@@ -2183,6 +2187,10 @@ def _transcribe_status():
     if TRANSCRIBE_CHINESE_CONVERSION not in ("none", "t2s", "tw2sp"):
         return {"enabled": True, "available": False,
                 "reason": "Chinese transcription conversion is invalid"}
+    if any(not re.fullmatch(r"[a-z]{2,3}", language)
+           for language in TRANSCRIBE_ALLOWED_LANGUAGES):
+        return {"enabled": True, "available": False,
+                "reason": "transcription language allowlist is invalid"}
     if (os.path.isabs(TRANSCRIBE_MODEL)
             and not os.path.isfile(os.path.join(TRANSCRIBE_MODEL, "model.bin"))):
         return {"enabled": True, "available": False,
@@ -2198,7 +2206,7 @@ class TranscriberManager:
 
     def __init__(self, python_path=None, worker_path=None, model=None,
                  device=None, device_index=None, compute_type=None,
-                 language=None, chinese_conversion=None,
+                 language=None, allowed_languages=None, chinese_conversion=None,
                  pause_punctuation=None,
                  idle_seconds=None, timeout_seconds=None,
                  max_seconds=None, library_path=None):
@@ -2210,6 +2218,9 @@ class TranscriberManager:
                              else int(device_index))
         self.compute_type = compute_type or TRANSCRIBE_COMPUTE_TYPE
         self.language = TRANSCRIBE_LANGUAGE if language is None else language
+        self.allowed_languages = (TRANSCRIBE_ALLOWED_LANGUAGES
+                                  if allowed_languages is None
+                                  else tuple(allowed_languages))
         self.chinese_conversion = (TRANSCRIBE_CHINESE_CONVERSION
                                    if chinese_conversion is None
                                    else chinese_conversion)
@@ -2243,6 +2254,8 @@ class TranscriberManager:
         ]
         if self.language:
             command += ["--language", self.language]
+        if self.allowed_languages:
+            command += ["--allowed-languages", ",".join(self.allowed_languages)]
         if self.chinese_conversion and self.chinese_conversion != "none":
             command += ["--chinese-conversion", self.chinese_conversion]
         if self.pause_punctuation:

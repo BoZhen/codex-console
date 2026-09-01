@@ -20,6 +20,8 @@ _LIVE_REVISABLE_CJK_CHARS = 10
 _LIVE_REVISABLE_LATIN_CHARS = 32
 _LIVE_STATE_TTL_SECONDS = 300.0
 _LIVE_STATE_LIMIT = 16
+_CJK_SCRIPT = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff]")
+_LATIN_SCRIPT = re.compile(r"[A-Za-z]")
 _QUESTION_PREFIX = re.compile(
     r"^(?:请问)?(?:是否|能否|可否|有没有|有沒有|是不是|能不能|可不可以|"
     r"为什么|為什麼|为何|為何|怎么|怎麼|怎样|怎樣|如何|哪里|哪裡|哪儿|"
@@ -205,6 +207,78 @@ def _purge_live_states(states, now):
             states.pop(key, None)
 
 
+def _segments_score(segments):
+    weighted = 0.0
+    total = 0.0
+    for segment in segments:
+        value = getattr(segment, "avg_logprob", None)
+        if value is None:
+            continue
+        start = getattr(segment, "start", 0) or 0
+        end = getattr(segment, "end", start) or start
+        weight = max(0.1, float(end) - float(start))
+        weighted += float(value) * weight
+        total += weight
+    return weighted / total if total else float("-inf")
+
+
+def _script_bonus(text, language):
+    text = str(text or "")
+    if language == "zh":
+        return 0.08 if _CJK_SCRIPT.search(text) else 0.0
+    if language == "en":
+        return 0.04 if _LATIN_SCRIPT.search(text) and not _CJK_SCRIPT.search(text) else 0.0
+    return 0.0
+
+
+def _decode_audio(model, path, language, pause_punctuation, final):
+    segments, info = model.transcribe(
+        path,
+        language=language or None,
+        task="transcribe",
+        beam_size=5,
+        vad_filter=True,
+        condition_on_previous_text=False,
+        word_timestamps=pause_punctuation or not final,
+    )
+    segments = list(segments)
+    resolved_language = getattr(info, "language", "") or language or ""
+    text = _join_pieces(
+        _segment_pieces(segments), resolved_language,
+        pause_punctuation, final=final)
+    return {
+        "text": text,
+        "language": resolved_language,
+        "info": info,
+        "score": _segments_score(segments),
+    }
+
+
+def _decode_with_allowlist(model, path, configured_language,
+                           allowed_languages, pause_punctuation, final):
+    initial = _decode_audio(
+        model, path, configured_language, pause_punctuation, final)
+    allowed = tuple(dict.fromkeys(allowed_languages or ()))
+    if configured_language or not allowed or initial["language"] in allowed:
+        return initial
+    preferred = ""
+    if "zh" in allowed and (
+            _CJK_SCRIPT.search(initial["text"])
+            or initial["language"] in ("ja", "ko", "yue")):
+        preferred = "zh"
+    elif "en" in allowed:
+        preferred = "en"
+    candidates = []
+    for language in allowed:
+        candidate = _decode_audio(
+            model, path, language, pause_punctuation, final)
+        candidate["selection_score"] = (
+            candidate["score"] + _script_bonus(candidate["text"], language)
+            + (0.001 if language == preferred else 0.0))
+        candidates.append(candidate)
+    return max(candidates, key=lambda candidate: candidate["selection_score"])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -212,12 +286,17 @@ def main():
     parser.add_argument("--device-index", type=int, default=0)
     parser.add_argument("--compute-type", default="default")
     parser.add_argument("--language", default="")
+    parser.add_argument("--allowed-languages", default="")
     parser.add_argument("--chinese-conversion", default="none",
                         choices=("none", "t2s", "tw2sp"))
     parser.add_argument("--pause-punctuation", action="store_true")
     parser.add_argument("--idle-seconds", type=int, default=600)
     parser.add_argument("--max-seconds", type=int, default=120)
     args = parser.parse_args()
+    allowed_languages = tuple(
+        language.strip().lower()
+        for language in args.allowed_languages.split(",")
+        if language.strip())
 
     model = None
     chinese_converter = None
@@ -278,26 +357,22 @@ def main():
                 duration_hint = None
             duration = measured_duration if measured_duration is not None else duration_hint
             state = live_states.get(stream_id) if stream_id else None
-            segments, info = model.transcribe(
-                request["path"],
-                language=args.language or (state or {}).get("language") or None,
-                task="transcribe",
-                beam_size=5,
-                vad_filter=True,
-                condition_on_previous_text=False,
-                word_timestamps=args.pause_punctuation or not final,
-            )
-            language = getattr(info, "language", "") or (state or {}).get("language", "")
-            pieces = _segment_pieces(list(segments))
-            text = _join_pieces(
-                pieces, language, args.pause_punctuation, final=final)
+            decoded = _decode_with_allowlist(
+                model, request["path"], args.language,
+                allowed_languages, args.pause_punctuation, final)
+            info = decoded["info"]
+            language = decoded["language"]
+            text = decoded["text"]
+            same_language = bool(state and state.get("language") == language)
+            language_runs = ((state or {}).get("language_runs", 0) + 1
+                             if same_language else 1)
             if args.chinese_conversion != "none":
                 if chinese_converter is None:
                     from opencc import OpenCC
 
                     chinese_converter = OpenCC(args.chinese_conversion + ".json")
                 text = chinese_converter.convert(text)
-            if state and state.get("stable_text"):
+            if same_language and state.get("stable_text"):
                 text = _preserve_confirmed_prefix(
                     state.get("text", ""), text, state["stable_text"])
             stable_text = ""
@@ -305,14 +380,16 @@ def main():
                 if stream_id:
                     live_states.pop(stream_id, None)
             else:
-                stable_text = _stable_live_prefix(
-                    (state or {}).get("text", ""), text,
-                    (state or {}).get("stable_text", ""), language)
+                if same_language and language_runs >= 3:
+                    stable_text = _stable_live_prefix(
+                        state.get("text", ""), text,
+                        state.get("stable_text", ""), language)
                 if stream_id:
                     live_states[stream_id] = {
                         "text": text,
                         "stable_text": stable_text,
                         "language": language,
+                        "language_runs": language_runs,
                         "seen": time.monotonic(),
                     }
                     _purge_live_states(live_states, time.monotonic())

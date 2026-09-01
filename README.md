@@ -102,6 +102,7 @@ python codex_console.py
 | `CODEX_CONSOLE_TRANSCRIBE_DEVICE_INDEX` | `0` | GPU index used by the worker |
 | `CODEX_CONSOLE_TRANSCRIBE_COMPUTE_TYPE` | `default` | CTranslate2 compute type, such as `float16` or `int8` |
 | `CODEX_CONSOLE_TRANSCRIBE_LANGUAGE` | auto | Optional fixed transcription language |
+| `CODEX_CONSOLE_TRANSCRIBE_ALLOWED_LANGUAGES` | unrestricted | Comma-separated auto-detection allowlist, such as `zh,en` |
 | `CODEX_CONSOLE_TRANSCRIBE_CHINESE_CONVERSION` | `none` | Chinese conversion: `none`, `t2s`, or `tw2sp` |
 | `CODEX_CONSOLE_TRANSCRIBE_PAUSE_PUNCTUATION` | `0` | Add pause punctuation (comma at 0.5s, period at 1.2s) and infer final punctuation |
 | `CODEX_CONSOLE_TRANSCRIBE_LD_LIBRARY_PATH` | unset | Additional CUDA library directories for the worker |

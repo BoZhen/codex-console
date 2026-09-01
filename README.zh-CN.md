@@ -92,6 +92,7 @@ python codex_console.py
 | `CODEX_CONSOLE_TRANSCRIBE_DEVICE_INDEX` | `0` | Worker 使用的 GPU 编号 |
 | `CODEX_CONSOLE_TRANSCRIBE_COMPUTE_TYPE` | `default` | CTranslate2 计算类型，例如 `float16` 或 `int8` |
 | `CODEX_CONSOLE_TRANSCRIBE_LANGUAGE` | 自动检测 | 可选的固定转写语言 |
+| `CODEX_CONSOLE_TRANSCRIBE_ALLOWED_LANGUAGES` | 不限制 | 自动检测语言白名单，以逗号分隔，例如 `zh,en` |
 | `CODEX_CONSOLE_TRANSCRIBE_CHINESE_CONVERSION` | `none` | 中文转换方式：`none`、`t2s` 或 `tw2sp` |
 | `CODEX_CONSOLE_TRANSCRIBE_PAUSE_PUNCTUATION` | `0` | 根据语音停顿补充标点（0.5 秒逗号、1.2 秒句号），并推断句末标点 |
 | `CODEX_CONSOLE_TRANSCRIBE_LD_LIBRARY_PATH` | 未设置 | Worker 使用的额外 CUDA 库目录 |
