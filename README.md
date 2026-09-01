@@ -4,6 +4,10 @@ A browser interface for the OpenAI Codex CLI. It runs `codex app-server`, keeps
 Codex sessions alive in the background, and presents conversation, tool calls,
 plans, file changes, and session state in one interface.
 
+<p align="center">
+  <img src="docs/codex-console-overview.png" alt="Codex Console interface with project sidebar, session tabs, Plan, and grouped tool activity" width="600">
+</p>
+
 ## Features
 
 - **Streaming chat** with rendered Markdown and KaTeX math.
