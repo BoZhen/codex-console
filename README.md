@@ -32,9 +32,8 @@ plans, file changes, and session state in one interface.
 - **Image, text, and code attachments** from desktop or mobile. Images can also
   be pasted from the clipboard. Text and code files are sent as bounded,
   filename-labelled text input.
-- **Optional local voice input** that prewarms faster-whisper when recording
-  starts, revises the recent transcript while protecting confirmed text and
-  punctuation, then runs a full correction before the text can be sent.
+- **Optional local voice input** with live transcription and final correction
+  before sending.
 - **Live model catalog and reasoning effort controls** from the installed Codex
   app-server.
 - **Context and rate-limit meters** from app-server usage events.
