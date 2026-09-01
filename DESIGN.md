@@ -42,8 +42,8 @@
 
 ## Components
 - Existing components to reuse: LIVE session rows, busy dots, close/menu controls, session title, context/status header
-- New/changed components: horizontal session tab strip labeled only by session name; tab activation and close-view actions; compact older-content marker with a history-search action; collapsible sticky Plan dock
-- Variants and states: active, background-ready, background-busy, unread, stale/ended; Plan expanded or collapsed to active work only
+- New/changed components: horizontal session tab strip labeled only by session name; tab activation and close-view actions; compact older-content marker with a history-search action; collapsible sticky Plan dock; collapsible consecutive tool-call groups; composer attachment button with image thumbnails and compact text/code file previews
+- Variants and states: active, background-ready, background-busy, unread, stale/ended; Plan expanded or collapsed to active work only; tool groups collapsed or expanded with running and failed counts
 - Token/component ownership: inline CSS and JS in `codex_console.py`; no new dependency or design-system layer
 
 ## Accessibility
@@ -56,13 +56,13 @@
 ## Responsive behavior
 - Supported breakpoints/devices: existing desktop layout and `max-width: 860px` mobile layout
 - Layout adaptations: tabs scroll horizontally and truncate session names; they have no project subtitle and never wrap or resize the chat/composer
-- Touch/hover differences: close control remains large enough for touch; tooltips are supplemental
+- Touch/hover differences: close and composer attachment controls remain large enough for touch; tooltips are supplemental; mobile users choose images or files through the system picker while desktop paste remains available
 
 ## Interaction states
 - Loading: newly resumed session tab shows its existing switching/resuming status
 - Empty: hide the strip when no tab is open
 - Error: failed attach removes stale live tabs and leaves the user in an explicit no-session state
-- Success: activating a live tab updates chat, project binding, draft, model, and context; long sessions retain a bounded recent DOM window with explicit access to indexed history; a collapsed Plan shows only current active work and updates in place; a fully completed Plan remains visible briefly and then clears itself
+- Success: activating a live tab updates chat, project binding, draft, model, and context; long sessions retain a bounded recent DOM window with explicit access to indexed history; a collapsed Plan shows only current active work and updates in place; a fully completed Plan remains visible briefly and then clears itself; adjacent calls of the same tool collapse into one summary while preserving each original call and output on expansion; pasted images and system-picked image/text/code attachments share validation, preview, draft, and send behavior
 - Disabled: ended/stale tabs cannot send messages
 - Offline/slow network: tabs remain visible while the socket reconnects; no session is ended by disconnect
 
@@ -74,7 +74,7 @@
 ## Implementation constraints
 - Framework/styling system: single Python file with inline vanilla HTML/CSS/JS
 - Design-token constraints: reuse existing CSS custom properties
-- Performance constraints: restore an opened tab from its in-memory DOM cache before networking; use sequenced incremental `attach`, not `resume` or full replay, to catch up background activity; bound each chat DOM by rendered-item and text-size budgets while never pruning unresolved interactive cards
+- Performance constraints: restore an opened tab from its in-memory DOM cache before networking; use sequenced incremental `attach`, not `resume` or full replay, to catch up background activity; bound each chat DOM by rendered-item and text-size budgets while never pruning unresolved interactive cards or tool groups containing running calls
 - Compatibility constraints: existing sidebar, drafts, approvals, model/context state, and service restart behavior must remain intact
 - Test/screenshot expectations: source-level regression tests, JavaScript syntax check, unit suite, and desktop/mobile visual smoke check when practical
 

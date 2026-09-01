@@ -99,6 +99,12 @@ HAVE_CODEX = bool(CODEX_BIN and os.path.exists(CODEX_BIN))
 CAP = 12000          # cap per long string field sent to the browser
 RESULT_CAP = 6000    # cap per tool_result body
 ITEM_HISTORY_LIMIT = max(32, int(_env("ITEM_HISTORY_LIMIT", "256") or 256))
+MAX_ATTACHMENTS = 8
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_IMAGE_B64_CHARS = ((MAX_IMAGE_BYTES + 2) // 3) * 4
+MAX_TEXT_FILE_BYTES = 512 * 1024
+MAX_TEXT_FILES_TOTAL_BYTES = 2 * 1024 * 1024
+WEBSOCKET_MAX_MESSAGE_SIZE = 64 * 1024 * 1024
 # asyncio StreamReader's default line limit is 64KB. The codex app-server frames
 # each JSON-RPC message as one newline-delimited line, and a single notification
 # (e.g. an item/completed carrying a big command output, file read, or diff) can
@@ -813,6 +819,45 @@ def _cap_input(inp):
     if isinstance(inp, str):
         return _cap(inp)
     return inp
+
+
+def _sanitize_text_files(files):
+    """Bound browser-uploaded text/code before it reaches app-server input."""
+    out, total = [], 0
+    for raw in files or []:
+        if len(out) >= MAX_ATTACHMENTS:
+            break
+        if not isinstance(raw, dict):
+            continue
+        text = raw.get("text")
+        if not isinstance(text, str):
+            continue
+        text = text.encode("utf-8", errors="replace").decode("utf-8")
+        size = len(text.encode("utf-8"))
+        if size > MAX_TEXT_FILE_BYTES or total + size > MAX_TEXT_FILES_TOTAL_BYTES:
+            continue
+        name = os.path.basename(str(raw.get("name") or "attachment.txt"))
+        name = "".join(ch for ch in name if ch >= " " and ch not in "\x7f\r\n")[:180]
+        if not name:
+            name = "attachment.txt"
+        out.append({"name": name, "media_type": str(raw.get("media_type") or "text/plain")[:100],
+                    "text": text, "size": size})
+        total += size
+    return out
+
+
+def _sanitize_images(images):
+    out = []
+    for raw in images or []:
+        if len(out) >= MAX_ATTACHMENTS:
+            break
+        if not isinstance(raw, dict):
+            continue
+        data = raw.get("data")
+        if not isinstance(data, str) or len(data) > MAX_IMAGE_B64_CHARS:
+            continue
+        out.append({"data": data, "media_type": str(raw.get("media_type") or "image/png")[:100]})
+    return out
 
 
 def _jsonish(x):
@@ -3335,47 +3380,61 @@ class ChatSession:
             "git": git_status_brief(self.cwd),
         }
 
-    def _handle_local_command(self, text, images):
+    def _handle_local_command(self, text, images, files):
         cmd = text.strip().split(None, 1)[0] if text.strip() else ""
         if cmd != "/status":
             return False
         evs = [{"kind": "user_text", "text": _cap(text)}]
         if images:
             evs[0]["images"] = len(images)
+        if files:
+            evs[0]["files"] = [{"name": f["name"], "size": f["size"]} for f in files]
         evs.append({"kind": "status", "status": self._status_snapshot()})
         self.last_activity = time.time()
         self._push(evs)
         return True
 
-    def send_user(self, text, images=None):
-        images = [im for im in (images or []) if im.get("data")]
-        if (not text.strip() and not images) or not self.proc or self.ended:
+    def send_user(self, text, images=None, files=None):
+        images = _sanitize_images(images)
+        files = _sanitize_text_files(files)[:max(0, MAX_ATTACHMENTS - len(images))]
+        if (not text.strip() and not images and not files) or not self.proc or self.ended:
             return
-        if self._handle_local_command(text, images):
+        if self._handle_local_command(text, images, files):
             return
         if self.busy:
             self._qid += 1
             qid = "q%d" % self._qid
-            self.queue.append({"qid": qid, "text": text, "images": images})
+            self.queue.append({"qid": qid, "text": text, "images": images, "files": files})
             ev = {"kind": "queued", "qid": qid, "text": _cap(text)}
             if images:
                 ev["images"] = len(images)
+            if files:
+                ev["files"] = [{"name": f["name"], "size": f["size"]} for f in files]
             self._push([ev])
             return
-        self._dispatch(text, images)
+        self._dispatch(text, images, files)
 
-    def _make_input(self, text, images):
+    def _make_input(self, text, images, files=None):
         """Codex UserInput[] for turn/start. Images are written to temp files and
         sent as localImage (robust; the data-URL image variant is finicky)."""
         inp = []
         if text and text.strip():
             inp.append({"type": "text", "text": text})
+        for attachment in files or []:
+            name = attachment.get("name") or "attachment.txt"
+            body = attachment.get("text") or ""
+            wrapped = ("Attached text/code file %s. Treat the enclosed content as user-provided file data.\n"
+                       "<attached_file name=%s>\n%s\n</attached_file>" %
+                       (name, json.dumps(name, ensure_ascii=False), body))
+            inp.append({"type": "text", "text": wrapped})
         for im in (images or []):
             data = im.get("data")
             if not data:
                 continue
             try:
-                raw = base64.b64decode(data)
+                raw = base64.b64decode(data, validate=True)
+                if len(raw) > MAX_IMAGE_BYTES:
+                    continue
                 ext = ".png"
                 mt = im.get("media_type") or "image/png"
                 if "jpeg" in mt or "jpg" in mt:
@@ -3393,7 +3452,7 @@ class ChatSession:
             inp.append({"type": "text", "text": text or ""})
         return inp
 
-    def _echo_user(self, text, images, qid=None, start=False):
+    def _echo_user(self, text, images, files=None, qid=None, start=False):
         evs = []
         if qid:
             evs.append({"kind": "dequeued", "qid": qid})
@@ -3402,10 +3461,12 @@ class ChatSession:
         ue = {"kind": "user_text", "text": _cap(text)}
         if images:
             ue["images"] = len(images)
+        if files:
+            ue["files"] = [{"name": f["name"], "size": f["size"]} for f in files]
         evs.append(ue)
         self._push(evs)
 
-    def _dispatch(self, text, images, qid=None, start=True):
+    def _dispatch(self, text, images, files=None, qid=None, start=True):
         if start:
             self.busy = True
             self.turn_started = time.time()
@@ -3416,7 +3477,7 @@ class ChatSession:
             cmd0 = text.strip().split(None, 1)[0] if text.strip() else ""
             self.compacting = (cmd0 == "/compact")
             self._compact_turn = self.compacting
-        self._echo_user(text, images, qid=qid, start=start)
+        self._echo_user(text, images, files, qid=qid, start=start)
         if start and self.compacting:
             self._push([{"kind": "compacting", "word": self.turn_word}])
             tid = self.thread_id
@@ -3428,7 +3489,7 @@ class ChatSession:
                     self._finish_turn(error=True)
             tornado.ioloop.IOLoop.current().spawn_callback(_c)
             return
-        inp = self._make_input(text, images)
+        inp = self._make_input(text, images, files)
         ap, sbx = _mode_policy(self.mode)
         params = {"threadId": self.thread_id, "input": inp,
                   "approvalPolicy": ap, "sandboxPolicy": _sandbox_policy(sbx)}
@@ -3457,8 +3518,8 @@ class ChatSession:
             return
         items, self.queue = self.queue, []
         for it in items:
-            self._echo_user(it["text"], it["images"], qid=it["qid"], start=False)
-            inp = self._make_input(it["text"], it["images"])
+            self._echo_user(it["text"], it["images"], it.get("files"), qid=it["qid"], start=False)
+            inp = self._make_input(it["text"], it["images"], it.get("files"))
             params = {"threadId": self.thread_id, "expectedTurnId": self.turn_id, "input": inp}
             async def _s(pr=params):
                 try:
@@ -3471,7 +3532,7 @@ class ChatSession:
         if self.busy or self.ended or not self.proc or not self.queue:
             return
         item = self.queue.pop(0)
-        self._dispatch(item["text"], item["images"], qid=item["qid"], start=True)
+        self._dispatch(item["text"], item["images"], item.get("files"), qid=item["qid"], start=True)
 
     def unqueue(self, qid):
         for i, it in enumerate(self.queue):
@@ -3873,7 +3934,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             if not sess.ended:
                 sess.set_effort(msg.get("effort"))
         elif mt == "user" and self.session:
-            self.session.send_user(msg.get("text", ""), msg.get("images"))
+            self.session.send_user(msg.get("text", ""), msg.get("images"), msg.get("files"))
         elif mt == "unqueue" and self.session:
             self.session.unqueue(msg.get("qid"))
         elif mt == "del_resumable":
@@ -4147,6 +4208,22 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .tool.done .tn{opacity:.85}
 .tool .progress,.ecard .progress{font-size:11.5px;color:var(--mut);font-family:var(--fmono);white-space:pre-wrap;margin:0 0 5px}
 .tool .resmeta,.ecard .resmeta{font-size:11px;color:var(--mut);margin-left:6px}
+.toolgroup{border:1px solid var(--line);border-radius:8px;margin:6px 0 12px;background:var(--bg2);overflow:hidden}
+.toolgroup>.tgh{width:100%;min-height:38px;padding:7px 10px;border:0;background:transparent;color:var(--fg);
+  display:flex;gap:8px;align-items:center;text-align:left;cursor:pointer;font:inherit}
+.toolgroup>.tgh:hover{background:var(--bg3)}
+.toolgroup .tgico{flex:none}.toolgroup .tgname{color:var(--tool);font-weight:600;font-family:var(--fmono);font-size:12.5px;flex:none}
+.toolgroup .tgcount,.toolgroup .tgstate{color:var(--mut);font-family:var(--fmono);font-size:11.5px;flex:none}
+.toolgroup .tgsummary{color:var(--mut);font-family:var(--fmono);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
+.toolgroup.running .tgstate{color:var(--tool)}.toolgroup.err .tgstate{color:var(--del)}
+.toolgroup .eye{color:var(--mut);flex:none;display:inline-flex;align-items:center;transition:color .15s}
+.toolgroup .eye svg{width:16px;height:16px;display:block}.toolgroup .eye .e-open{display:none}
+.toolgroup.open>.tgh .eye .e-shut{display:none}.toolgroup.open>.tgh .eye .e-open{display:block}
+.toolgroup>.tgh:hover .eye{color:var(--fg)}
+.toolgroup>.tgb{display:none;border-top:1px solid var(--line)}.toolgroup.open>.tgb{display:block}
+.toolgroup>.tgb>.tool{border:0;border-radius:0;margin:0;background:transparent}
+.toolgroup>.tgb>.tool+.tool{border-top:1px solid var(--line)}
+.toolgroup>.tgb>.tool .th{padding-left:12px;padding-right:12px}
 pre{background:var(--codebg);border:1px solid var(--line);border-radius:6px;padding:8px;overflow-x:auto;margin:5px 0;
   font-family:var(--fmono);font-size:12.5px;line-height:1.45}
 code{font-family:var(--fmono);font-size:12.5px;background:var(--codebg);border:1px solid var(--line);border-radius:3px;padding:0 4px}
@@ -4174,7 +4251,13 @@ pre code{background:none;border:none;padding:0}
 #attach .att .rm{position:absolute;top:1px;right:1px;width:17px;height:17px;border-radius:50%;border:none;
   background:rgba(0,0,0,.6);color:#fff;cursor:pointer;font-size:12px;line-height:17px;text-align:center;padding:0}
 #attach .att .rm:hover{background:var(--del)}
-.msg.user .imgs{margin-top:5px;font-size:11.5px;color:var(--mut)}
+.attfile{height:54px;max-width:230px;min-width:145px;display:flex;align-items:center;gap:8px;padding:6px 7px 6px 9px;
+  border:1px solid var(--line);border-radius:8px;background:var(--bg3);font-family:var(--fmono)}
+.attfile .fico{flex:none;font-size:17px}.attfile .fmeta{min-width:0;flex:1}.attfile .fname{display:block;font-size:11.5px;
+  color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.attfile .fsize{display:block;font-size:10px;color:var(--mut);margin-top:2px}
+.attfile .rm{width:24px;height:24px;flex:none;border:0;background:transparent;color:var(--mut);cursor:pointer;font-size:13px;padding:0}
+.attfile .rm:hover{color:var(--del);background:var(--nobg)}
+.msg.user .attachments{margin-top:5px;font-size:11.5px;color:var(--mut)}
 /* queued messages (typed while the agent is busy) */
 #queue{width:100%;display:none;flex-direction:column;gap:5px;padding:0 0 8px}
 #queue.on{display:flex}
@@ -4187,6 +4270,10 @@ pre code{background:none;border:none;padding:0}
 #ta{flex:1;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:10px;
   padding:9px 12px;font-size:14px;font-family:inherit;resize:none;max-height:160px;line-height:1.4}
 #ta:focus{outline:1px solid var(--acc)}
+#attachBtn{background:var(--bg3);color:var(--mut);border:1px solid var(--line);border-radius:10px;width:38px;height:38px;
+  flex:none;display:inline-flex;align-items:center;justify-content:center;font-size:16px;cursor:pointer;padding:0}
+#attachBtn:hover{color:var(--fg);border-color:var(--acc)}
+#attachBtn:disabled{opacity:.45;cursor:default;border-color:var(--line)}
 #send{background:var(--acc);color:var(--onacc);border:none;border-radius:10px;width:38px;height:38px;flex:none;display:inline-flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;cursor:pointer}
 #send:disabled{background:var(--line);color:var(--mut);cursor:default}
 
@@ -4712,7 +4799,9 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
       <div id="queue"></div>
       <div id="attach"></div>
       <div class="wrap2">
-      <textarea id="ta" rows="1" placeholder="Type a message…  (Enter to send · Shift+Enter newline · paste an image)" disabled></textarea>
+      <input type="file" id="attachmentPicker" accept="image/png,image/jpeg,image/gif,image/webp,text/*,application/json,application/xml,application/javascript,application/x-yaml,.py,.ipynb,.js,.jsx,.ts,.tsx,.json,.jsonl,.yaml,.yml,.toml,.md,.rst,.tex,.bib,.c,.h,.cpp,.hpp,.cc,.rs,.go,.java,.kt,.kts,.sh,.bash,.zsh,.fish,.sql,.html,.css,.scss,.less,.xml,.csv,.tsv,.ini,.cfg,.conf,.log,.diff,.patch,.mk" multiple hidden>
+      <button id="attachBtn" type="button" title="Attach images, text, or code files" aria-label="Attach files" disabled>📎</button>
+      <textarea id="ta" rows="1" placeholder="Type a message…" disabled></textarea>
       <button id="stop" title="interrupt / stop" style="display:none">⏹</button>
       <button id="send" disabled>➤</button>
     </div></div>
@@ -4761,7 +4850,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 
 <script>
 const $=s=>document.querySelector(s);
-const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send');
+const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send'), attachBtn=$('#attachBtn'), attachmentPicker=$('#attachmentPicker');
 let ws=null, running=false, ready=false, compacting=false, cwd='', tools={};
 let tokUp=0,tokOut=0,tokShow=false;   /* live streaming token counts shown in the pill */
 let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
@@ -4940,7 +5029,8 @@ function renderWindowMarker(){let marker=stream.querySelector(':scope > .window-
   marker.innerHTML='<span>'+windowHidden+' earlier item'+(windowHidden===1?'':'s')+' hidden to keep this tab responsive</span>'+
     '<button type="button" title="Search full session history" aria-label="Search full session history">🕘</button>';
   marker.querySelector('button').onclick=()=>{openSearch();$('#srchscope').value='session';$('#srchq').focus();};}
-function windowProtected(el){return el.matches('.streaming,.tool:not(.done),.approval:not(.done),.question:not(.done)');}
+function windowProtected(el){return el.matches('.streaming,.tool:not(.done),.approval:not(.done),.question:not(.done)')||
+  (el.classList.contains('toolgroup')&&!!el.querySelector('.tool:not(.done)'));}
 function sweepWindowRefs(){const edits=$('#edits'),kept=el=>el&&(stream.contains(el)||(edits&&edits.contains(el)));
   Object.keys(textItems).forEach(k=>{if(!kept(textItems[k]&&textItems[k].el))delete textItems[k];});
   Object.keys(thinkItems).forEach(k=>{if(!kept(thinkItems[k]&&thinkItems[k].el))delete thinkItems[k];});
@@ -4959,8 +5049,10 @@ function trimChatWindow(force){if(replaying&&!force)return;if(windowTrimT){clear
   else renderWindowMarker();}
 function scheduleChatWindowTrim(){if(replaying||windowTrimT)return;
   windowTrimT=setTimeout(()=>trimChatWindow(false),120);}
-function addUser(text,nImg){const s=atBottom();const d=document.createElement('div');d.className='msg user';
-  d.innerHTML='<div class="b">'+esc(text)+'</div>'+(nImg?'<div class="imgs">🖼 '+nImg+' image'+(nImg>1?'s':'')+' attached</div>':'');
+function addUser(text,nImg,files){const s=atBottom(),d=document.createElement('div'),meta=[];d.className='msg user';
+  if(nImg)meta.push('🖼 '+nImg+' image'+(nImg>1?'s':''));const fl=Array.isArray(files)?files:[];
+  if(fl.length){const names=fl.slice(0,3).map(f=>esc((f&&f.name)||f||'file')).join(', ');meta.push('📎 '+names+(fl.length>3?(' +'+(fl.length-3)) :''));}
+  d.innerHTML=(text?'<div class="b">'+esc(text)+'</div>':'')+(meta.length?'<div class="attachments">'+meta.join(' · ')+'</div>':'');
   stream.appendChild(d);scroll();}
 function addAsst(text){const s=atBottom();const d=document.createElement('div');d.className='msg asst';
   d.innerHTML='<div class="b bubble">'+md(text)+'</div>';typesetMath(d,!replaying);stream.appendChild(d);if(s)scroll();}
@@ -5150,6 +5242,24 @@ function addDone(word,durMs,atSec){const s=atBottom();const d=document.createEle
   d.querySelector('.dw').textContent=t;
   stream.appendChild(d);if(s)scroll();}
 function addErr(t){const d=document.createElement('div');d.className='errline';d.textContent=t;stream.appendChild(d);if(atBottom())scroll();}
+function toolGroupKey(ev){return (''+(ev&&ev.tool||'')).trim().toLowerCase();}
+function toolGroupEye(){return '<span class="eye"><svg class="e-shut" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 11c3 4 7 6 10 6s7-2 10-6"/><line x1="5.5" y1="15.5" x2="4.3" y2="18"/><line x1="12" y1="17.5" x2="12" y2="20"/><line x1="18.5" y1="15.5" x2="19.7" y2="18"/></svg><svg class="e-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></span>';}
+function refreshToolGroup(g){if(!g)return;const cards=[...g.querySelectorAll(':scope>.tgb>.tool')];if(!cards.length)return;
+  const pending=cards.filter(c=>!c.classList.contains('done')).length,failed=cards.filter(c=>c.classList.contains('err')).length;
+  const latest=cards[cards.length-1]._ev||{},states=[];if(pending)states.push(pending+' running');if(failed)states.push(failed+' failed');
+  g.classList.toggle('running',pending>0);g.classList.toggle('err',failed>0);
+  g.querySelector('.tgcount').textContent=cards.length+' calls';g.querySelector('.tgsummary').textContent=primaryArg(latest.input);
+  g.querySelector('.tgstate').textContent=states.join(' · ')||'done';}
+function makeToolGroup(first,second,key){const g=document.createElement('div'),body=document.createElement('div'),ev=first._ev||second._ev||{};
+  g.className='toolgroup';g.dataset.toolKey=key;body.className='tgb';
+  g.innerHTML='<button class="tgh" type="button" aria-expanded="false"><span class="tgico">'+(ICON[ev.tool]||'🔧')+'</span><span class="tgname">'+esc(ev.tool||'tool')+'</span><span class="tgcount"></span><span class="tgsummary"></span><span class="tgstate"></span>'+toolGroupEye()+'</button>';
+  g.appendChild(body);const wasOpen=first.classList.contains('open');first.replaceWith(g);body.append(first,second);
+  const h=g.querySelector('.tgh');h.onclick=()=>{const open=g.classList.toggle('open');h.setAttribute('aria-expanded',open?'true':'false');};
+  if(wasOpen){g.classList.add('open');h.setAttribute('aria-expanded','true');}refreshToolGroup(g);return g;}
+function placeToolCard(c,ev){const prev=stream.lastElementChild,key=toolGroupKey(ev);if(prev&&key){
+    if(prev.classList.contains('toolgroup')&&prev.dataset.toolKey===key){prev.querySelector(':scope>.tgb').appendChild(c);refreshToolGroup(prev);return;}
+    if(prev.classList.contains('tool')&&toolGroupKey(prev._ev)===key){makeToolGroup(prev,c,key);return;}}
+  stream.appendChild(c);}
 function addTool(ev){const s=atBottom();const c=document.createElement('div');c.className='tool';
   const cn=counts(ev);const cnt=cn?('<span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span>'):'';
   c.innerHTML='<div class="th"><span class="ico">'+(ICON[ev.tool]||'🔧')+'</span><span class="tn">'+esc(ev.tool)+'</span>'+
@@ -5158,7 +5268,7 @@ function addTool(ev){const s=atBottom();const c=document.createElement('div');c.
   c._ev=ev;   /* lazy: build the (maybe large) body only on first expand */
   c.querySelector('.th').onclick=()=>{const open=c.classList.toggle('open');
     if(open&&!c._bodyDone){c._bodyDone=1;c.querySelector('.res').insertAdjacentHTML('beforebegin',toolBody(c._ev));}};
-  stream.appendChild(c);if(ev.toolId)tools[ev.toolId]=c;if(s)scroll();}
+  placeToolCard(c,ev);if(ev.toolId)tools[ev.toolId]=c;if(s)scroll();}
 function resultBits(ev){const bits=[];if(ev.status)bits.push(ev.status);
   if(ev.exitCode!==undefined&&ev.exitCode!==null)bits.push('exit '+ev.exitCode);
   if(ev.durationMs!=null)bits.push(fmtSecs(ev.durationMs));return bits;}
@@ -5172,7 +5282,8 @@ function updateToolHeader(c,ev){if(!c||!ev)return;
   const ico=c.querySelector('.ico');if(ico&&merged.tool)ico.textContent=ICON[merged.tool]||'🔧';
   const tn=c.querySelector('.tn');if(tn&&merged.tool)tn.textContent=merged.tool;
   const tp=c.querySelector('.tp,.ef');if(tp)tp.textContent=primaryArg(merged.input)||merged.tool||'';
-  const cnt=c.querySelector('.cnt'),cn=counts(merged);if(cnt)cnt.innerHTML=cn?('<span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span>'):'';}
+  const cnt=c.querySelector('.cnt'),cn=counts(merged);if(cnt)cnt.innerHTML=cn?('<span class="a">+'+cn.a+'</span> <span class="d">−'+cn.d+'</span>'):'';
+  refreshToolGroup(c.closest('.toolgroup'));}
 function updateTool(ev){let c=tools[ev.toolId];if(!c){
     if(EDIT_TOOLS.has(ev.tool)){addEditCard(ev);addMarker(ev);}else addTool(ev);return;}
   updateToolHeader(c,ev);
@@ -5184,7 +5295,8 @@ function addResult(ev){const c=tools[ev.toolId];if(!c)return;c.classList.add('do
   const b=((ev.content!=null?ev.content:c._output)||'').trim();
   if(b||ev.isError||c._output)setToolOutput(c,ev.isError?'error':'output',b,ev.isError,ev);
   else if(resultBits(ev).length){const r=c.querySelector('.res');
-    if(r)r.innerHTML='<div class="reslabel">done'+resultMeta(ev)+'</div>';}}
+    if(r)r.innerHTML='<div class="reslabel">done'+resultMeta(ev)+'</div>';}
+  refreshToolGroup(c.closest('.toolgroup'));}
 function appendToolDelta(ev){let c=tools[ev.toolId];if(!c){addTool({kind:'tool_use',tool:'Bash',input:{command:ev.toolId||'process output'},toolId:ev.toolId});c=tools[ev.toolId];}
   if(!c)return;c._output=(c._output||'')+(ev.delta||'');
   if(c._output.length>12000)c._output=c._output.slice(c._output.length-12000);
@@ -5225,6 +5337,7 @@ function setBusy(b,wordSeed,elapsedMs){running=b;$('#dot').className='dot '+(b?'
   if(!b&&ready)statset('ready');      /* busy: startThinking owns the word + timer */
   ta.disabled=!ready;
   sendBtn.disabled=!ready;            /* send stays available while busy → queues */
+  attachBtn.disabled=!ready;
   $('#stop').style.display=b?'':'none';   /* interrupt button only while busy */
   sendBtn.style.display='';               /* send always visible */
   if(b)startThinking(wordSeed,elapsedMs);else stopThinking();}
@@ -5388,7 +5501,7 @@ function route(ev){const seq=Number(ev&&ev._seq||0),tab=sessionTabById(sid);
   if(!running&&['assistant_text','assistant_delta','assistant_update','thinking','thinking_delta',
       'thinking_update','plan','plan_delta','plan_text','tool_use','tool_delta','tool_progress',
       'tool_update'].includes(ev.kind))setBusy(true);
-  if(ev.kind==='user_text')addUser(ev.text,ev.images);
+  if(ev.kind==='user_text')addUser(ev.text,ev.images,ev.files);
   else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;curCC=ev.session_id||curCC;
     if(!replaying)activeModel=(ev.model&&ev.model!=='default'?ev.model:(ev.display_model||activeModel));
     const modelName=ev.display_model||ev.model||'';if(modelName)setResolvedModel(modelName);
@@ -5429,7 +5542,7 @@ function route(ev){const seq=Number(ev&&ev._seq||0),tab=sessionTabById(sid);
 }
 
 /* persistent server-side session: attach / reattach / switch */
-function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;$('#dot').className='dot';statset('ended');
+function markEnded(msg){ready=false;ta.disabled=true;sendBtn.disabled=true;attachBtn.disabled=true;$('#dot').className='dot';statset('ended');
   localStorage.removeItem(SKEY);if(msg)addNotice(msg);}
 function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);loadDraft(sid);
@@ -5448,10 +5561,10 @@ function onMsg(e){const m=JSON.parse(e.data);
     mergeSubagents(m.subagents||[],incremental);
     compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);loadDraft(sid);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
-    else{ta.disabled=false;sendBtn.disabled=false;if(!incremental)addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
+    else{ta.disabled=false;sendBtn.disabled=false;attachBtn.disabled=false;if(!incremental)addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
     const attachedTab=sessionTabById(m.id);if(attachedTab){attachedTab.lastSeq=Number(m.event_seq||attachedTab.lastSeq||0);attachedTab.serverSeq=attachedTab.lastSeq;persistSessionTabs();}
     restoredViewId=m.id;if(incremental){if(stick){scroll();requestAnimationFrame(scroll);}}else restoreSessionTabView(m.id);reqList();loadTree();}
-  else if(m.type==='detached'){if(!sid){ready=false;ta.disabled=true;sendBtn.disabled=true;statset('idle');}}
+  else if(m.type==='detached'){if(!sid){ready=false;ta.disabled=true;sendBtn.disabled=true;attachBtn.disabled=true;statset('idle');}}
   else if(m.type==='no_session'){localStorage.removeItem(SKEY);sid=null;ready=false;activeModel='default';setBusy(false);setCurname('');renderCtx(null);statset('idle');
     if(m.id){sessionViewCache.delete(m.id);const i=sessionTabState.findIndex(t=>t.id===m.id);if(i>=0){sessionTabState.splice(i,1);persistSessionTabs();renderSessionTabs();}}
     mergeSubagents([],true);
@@ -5484,7 +5597,7 @@ function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
   ws.onopen=()=>{clearTimeout(reconnectT);$('#dot').className='dot '+(ready?'on':'');reqList();
     if(cb)cb();else{const saved=localStorage.getItem(SKEY);if(saved&&!pendingStart){const req={type:'attach',id:saved},tab=sessionTabById(saved);
       if(restoredViewId===saved&&tab)req.after_seq=Number(tab.lastSeq||0);else statset('reattaching…');ws.send(JSON.stringify(req));}}};
-  ws.onclose=()=>{$('#dot').className='dot';statset('disconnected');ta.disabled=true;sendBtn.disabled=true;
+  ws.onclose=()=>{$('#dot').className='dot';statset('disconnected');ta.disabled=true;sendBtn.disabled=true;attachBtn.disabled=true;
     clearTimeout(reconnectT);reconnectT=setTimeout(()=>openWs(),1800);};
   ws.onmessage=onMsg;}
 function wsSend(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}
@@ -5567,7 +5680,7 @@ function closeSessionTab(id){const idx=sessionTabState.findIndex(t=>t.id===id);i
   if(active){saveDraft();rememberActiveTabView();}sessionViewCache.delete(id);sessionTabState.splice(idx,1);persistSessionTabs();renderSessionTabs();if(!active)return;
   const next=sessionTabState[Math.min(idx,sessionTabState.length-1)];if(next){switchSession(next.id);return;}
   clearUI();sid=null;curCC=null;cwd='';activeModel='default';running=false;compacting=false;localStorage.removeItem(SKEY);
-  setCurname('');statset('idle');ta.disabled=true;sendBtn.disabled=true;wsSend({type:'detach'});renderSessionTabs();}
+  setCurname('');statset('idle');ta.disabled=true;sendBtn.disabled=true;attachBtn.disabled=true;wsSend({type:'detach'});renderSessionTabs();}
 function openLiveSession(s){if(!s||!s.id)return;ensureSessionTab(s,false);switchSession(s.id);}
 function sessionTabKeydown(ev){if(!['ArrowLeft','ArrowRight','Home','End'].includes(ev.key))return;
   const tabs=[...$('#sessionTabs').querySelectorAll('.stab-main')];if(!tabs.length)return;let i=tabs.indexOf(ev.target);if(i<0)return;
@@ -6155,41 +6268,74 @@ function endSessionById(id,name){if(!id)return;
   wsSend({type:'end',id:id});
   if(id===sid){setCurname('');markEnded('session ended');}
   reqList();loadTree();}
-/* image attachments: paste (Ctrl/Cmd+V) an image into the composer */
-let pendingImages=[];
-const MAX_IMG=8, MAX_IMG_BYTES=5*1024*1024, OK_IMG=['image/png','image/jpeg','image/gif','image/webp'];
-function renderAttach(){const a=$('#attach');a.classList.toggle('on',pendingImages.length>0);
-  a.innerHTML=pendingImages.map((im,i)=>'<div class="att"><img src="'+im.url+'"><button class="rm" data-i="'+i+'" title="remove">✕</button></div>').join('');
-  a.querySelectorAll('.rm').forEach(b=>b.onclick=()=>{pendingImages.splice(+b.dataset.i,1);renderAttach();});}
+/* attachments: image paste plus a shared image/text/code picker on desktop and mobile */
+let pendingImages=[],pendingFiles=[],pendingImageReads=0,pendingFileReads=0,pendingFileReadBytes=0;
+const MAX_ATTACH=8,MAX_IMG_BYTES=5*1024*1024,MAX_TEXT_BYTES=512*1024,MAX_TEXT_TOTAL=2*1024*1024;
+const OK_IMG=['image/png','image/jpeg','image/gif','image/webp'];
+const OK_TEXT_MIME=new Set(['application/json','application/ld+json','application/xml','application/javascript',
+  'application/x-javascript','application/x-yaml','application/yaml','application/toml','application/sql']);
+const TEXT_EXT=/\.(txt|md|markdown|rst|py|pyi|ipynb|js|mjs|cjs|jsx|ts|tsx|json|jsonl|yaml|yml|toml|tex|bib|c|h|cc|cpp|cxx|hpp|rs|go|java|kt|kts|swift|scala|rb|php|pl|lua|r|sh|bash|zsh|fish|ps1|sql|html|htm|css|scss|sass|less|xml|csv|tsv|ini|cfg|conf|log|diff|patch|mk|cmake|gradle|properties|env)$/i;
+const TEXT_NAMES=new Set(['dockerfile','makefile','cmakelists.txt','.gitignore','.dockerignore','.editorconfig']);
+function fmtFileBytes(n){if(n<1024)return n+' B';if(n<1048576)return Math.round(n/1024)+' KB';return (n/1048576).toFixed(1)+' MB';}
+function attachmentCount(){return pendingImages.length+pendingFiles.length+pendingImageReads+pendingFileReads;}
+function textAttachmentBytes(){return pendingFiles.reduce((n,f)=>n+(f.size||0),0);}
+function isTextFile(file){const mt=(file.type||'').toLowerCase(),name=(file.name||'').toLowerCase();
+  return mt.startsWith('text/')||OK_TEXT_MIME.has(mt)||TEXT_EXT.test(name)||TEXT_NAMES.has(name);}
+function keepAttachmentFor(targetSid,kind,item){if(targetSid&&targetSid!==sid){
+    const d=drafts[targetSid]||{text:'',images:[],files:[]};d.images=d.images||[];d.files=d.files||[];
+    if(d.images.length+d.files.length<MAX_ATTACH)d[kind].push(item);drafts[targetSid]=d;return;}
+  (kind==='images'?pendingImages:pendingFiles).push(item);renderAttach();}
+function renderAttach(){const a=$('#attach'),has=pendingImages.length||pendingFiles.length;a.classList.toggle('on',!!has);
+  const images=pendingImages.map((im,i)=>'<div class="att"><img src="'+im.url+'" alt=""><button class="rm" data-kind="images" data-i="'+i+'" title="Remove image" aria-label="Remove image">✕</button></div>').join('');
+  const files=pendingFiles.map((f,i)=>'<div class="attfile"><span class="fico">📄</span><span class="fmeta"><span class="fname">'+esc(f.name)+'</span><span class="fsize">'+fmtFileBytes(f.size||0)+'</span></span><button class="rm" data-kind="files" data-i="'+i+'" title="Remove file" aria-label="Remove '+escAttr(f.name)+'">✕</button></div>').join('');
+  a.innerHTML=images+files;a.querySelectorAll('.rm').forEach(b=>b.onclick=()=>{
+    (b.dataset.kind==='images'?pendingImages:pendingFiles).splice(+b.dataset.i,1);renderAttach();});}
 function addImageFile(file){
-  if(pendingImages.length>=MAX_IMG){addNotice('⚠ up to '+MAX_IMG+' images at once');return;}
+  if(attachmentCount()>=MAX_ATTACH){addNotice('⚠ up to '+MAX_ATTACH+' attachments at once');return;}
   if(OK_IMG.indexOf(file.type)<0){addNotice('⚠ unsupported image type: '+(file.type||'?'));return;}
   if(file.size>MAX_IMG_BYTES){addNotice('⚠ image too large ('+Math.round(file.size/1048576)+'MB, max 5MB)');return;}
-  const r=new FileReader();
-  r.onload=()=>{const url=''+r.result;pendingImages.push({media_type:file.type,data:url.split(',')[1]||'',url:url});renderAttach();};
+  const r=new FileReader(),targetSid=sid;pendingImageReads++;
+  r.onload=()=>{pendingImageReads--;const url=''+r.result;keepAttachmentFor(targetSid,'images',{media_type:file.type,data:url.split(',')[1]||'',url:url});};
+  r.onerror=()=>{pendingImageReads--;addNotice('⚠ could not read image: '+(file.name||'unknown file'));};
   r.readAsDataURL(file);}
+function addTextFile(file){
+  if(attachmentCount()>=MAX_ATTACH){addNotice('⚠ up to '+MAX_ATTACH+' attachments at once');return;}
+  if(!isTextFile(file)){addNotice('⚠ unsupported attachment: '+(file.name||'unknown file'));return;}
+  if(file.size>MAX_TEXT_BYTES){addNotice('⚠ text/code file too large ('+fmtFileBytes(file.size)+', max 512 KB)');return;}
+  if(textAttachmentBytes()+pendingFileReadBytes+file.size>MAX_TEXT_TOTAL){addNotice('⚠ text/code attachments exceed the 2 MB total limit');return;}
+  const r=new FileReader(),targetSid=sid;pendingFileReads++;pendingFileReadBytes+=file.size;
+  r.onload=()=>{pendingFileReads--;pendingFileReadBytes-=file.size;const text=''+r.result;
+    if(text.indexOf('\0')>=0){addNotice('⚠ binary file is not supported: '+(file.name||'unknown file'));return;}
+    keepAttachmentFor(targetSid,'files',{name:file.name||'attachment.txt',media_type:file.type||'text/plain',text:text,size:new Blob([text]).size});};
+  r.onerror=()=>{pendingFileReads--;pendingFileReadBytes-=file.size;addNotice('⚠ could not read file: '+(file.name||'unknown file'));};
+  r.readAsText(file,'utf-8');}
+function chooseAttachments(){attachmentPicker.value='';attachmentPicker.click();}
+function handleAttachmentPick(){for(const file of (attachmentPicker.files||[])){
+    if(OK_IMG.indexOf(file.type)>=0)addImageFile(file);else addTextFile(file);}
+  attachmentPicker.value='';}
 function handlePaste(e){const cd=e.clipboardData;if(!cd)return;
   if((cd.getData('text/plain')||'').length>0)return;
   const items=cd.items||[];let got=false;
   for(const it of items){if(it.kind==='file'&&it.type.indexOf('image/')===0){const f=it.getAsFile();if(f){addImageFile(f);got=true;}}}
   if(got)e.preventDefault();}
-/* per-session composer drafts — each session keeps its own unsent text (+ images),
+/* per-session composer drafts — each session keeps its own unsent text (+ attachments),
    so switching sessions swaps the draft with the chat. Text persists across reloads
-   via localStorage; attached images are kept in memory only. */
+   via localStorage; attachment bodies are kept in memory only. */
 const DKEY='al_drafts';
 let drafts={}, _dpT=0;
-try{const sv=JSON.parse(localStorage.getItem(DKEY)||'{}');for(const k in sv)drafts[k]={text:sv[k]||'',images:[]};}catch(e){}
+try{const sv=JSON.parse(localStorage.getItem(DKEY)||'{}');for(const k in sv)drafts[k]={text:sv[k]||'',images:[],files:[]};}catch(e){}
 function persistDrafts(){const t={};for(const k in drafts){const v=drafts[k];if(v&&v.text&&v.text.trim())t[k]=v.text;}try{localStorage.setItem(DKEY,JSON.stringify(t));}catch(e){}}
 function schedulePersist(){clearTimeout(_dpT);_dpT=setTimeout(persistDrafts,500);}
-function saveDraft(){if(sid)drafts[sid]={text:ta.value,images:pendingImages.slice()};persistDrafts();}
-function loadDraft(id){const d=drafts[id]||{text:'',images:[]};ta.value=d.text||'';
+function saveDraft(){if(sid)drafts[sid]={text:ta.value,images:pendingImages.slice(),files:pendingFiles.slice()};persistDrafts();}
+function loadDraft(id){const d=drafts[id]||{text:'',images:[],files:[]};ta.value=d.text||'';
   ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';
-  pendingImages=(d.images||[]).slice();renderAttach();}
+  pendingImages=(d.images||[]).slice();pendingFiles=(d.files||[]).slice();renderAttach();}
 function dropDraft(id){if(id&&drafts[id]){delete drafts[id];persistDrafts();}}
 function sendMsg(){const t=ta.value.trim();
-  if((!t&&!pendingImages.length)||!ready||!sid||!ws||ws.readyState!==1)return;
-  wsSend({type:'user',text:t,images:pendingImages.map(im=>({media_type:im.media_type,data:im.data}))});
-  ta.value='';ta.style.height='auto';pendingImages=[];renderAttach();dropDraft(sid);}
+  if((!t&&!pendingImages.length&&!pendingFiles.length)||!ready||!sid||!ws||ws.readyState!==1)return;
+  wsSend({type:'user',text:t,images:pendingImages.map(im=>({media_type:im.media_type,data:im.data})),
+    files:pendingFiles.map(f=>({name:f.name,media_type:f.media_type,text:f.text,size:f.size}))});
+  ta.value='';ta.style.height='auto';pendingImages=[];pendingFiles=[];renderAttach();dropDraft(sid);}
   /* busy state (and the thinking word/timer) is driven by the server's
      turn_start, so it stays correct across reattach — no optimistic flip here */
 
@@ -6200,18 +6346,19 @@ function renderQueue(){const q=$('#queue');if(!q)return;const ids=Object.keys(qu
   q.classList.toggle('on',ids.length>0);
   q.innerHTML=ids.map(id=>'<div class="qmsg" data-q="'+id+'" title="click to edit · ✕ to discard">'+
     '<span class="qicon">⏳</span><span class="qtext">'+esc(queued[id].text||'')+
-    (queued[id].images?(' 🖼×'+queued[id].images):'')+'</span><span class="qx" title="discard">✕</span></div>').join('');
+    (queued[id].images?(' 🖼×'+queued[id].images):'')+(queued[id].files?(' 📎×'+queued[id].files):'')+
+    '</span><span class="qx" title="discard">✕</span></div>').join('');
   q.querySelectorAll('.qmsg').forEach(el=>{const id=el.dataset.q;
     el.querySelector('.qx').onclick=ev=>{ev.stopPropagation();discardQueued(id);};
     el.onclick=()=>editQueued(id);});}
-function addQueued(ev){queued[ev.qid]={text:ev.text||'',images:ev.images||0};renderQueue();}
+function addQueued(ev){queued[ev.qid]={text:ev.text||'',images:ev.images||0,files:(ev.files||[]).length||0};renderQueue();}
 function removeQueued(qid){if(queued[qid]){delete queued[qid];renderQueue();}}
 function discardQueued(id){if(ws&&ws.readyState===1)wsSend({type:'unqueue',qid:id});removeQueued(id);}
 function editQueued(id){const it=queued[id];if(!it)return;
   const draft=ta.value;
   ta.value=draft.trim()?(it.text+'\n'+draft):it.text;   /* keep any in-progress draft */
   ta.dispatchEvent(new Event('input'));ta.focus();
-  if(it.images)addNotice('⚠ image(s) on the withdrawn message were dropped — re-paste if needed');
+  if(it.images||it.files)addNotice('⚠ attachments on the withdrawn message were dropped — attach them again if needed');
   discardQueued(id);}
 
 /* sidebar open/close (mobile drawer; desktop collapse) */
@@ -6250,11 +6397,13 @@ async function refreshGit(){if(!cwd){$('#gitc').innerHTML='<div class="empty">no
 
 /* bindings */
 ta.addEventListener('input',()=>{ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';
-  if(sid){drafts[sid]={text:ta.value,images:pendingImages.slice()};schedulePersist();}});
+  if(sid){drafts[sid]={text:ta.value,images:pendingImages.slice(),files:pendingFiles.slice()};schedulePersist();}});
 ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendMsg();}
   else if(e.key==='ArrowUp'&&!ta.value&&Object.keys(queued).length){
     e.preventDefault();const ids=Object.keys(queued);editQueued(ids[ids.length-1]);}});
 window.addEventListener('paste',handlePaste);
+attachBtn.onclick=chooseAttachments;
+attachmentPicker.onchange=handleAttachmentPick;
 sendBtn.onclick=sendMsg;
 $('#stop').onclick=doInterrupt;
 document.addEventListener('keydown',e=>{
@@ -6462,7 +6611,7 @@ def main():
         (r"/ws/chat", ChatSocket),
         (r"/static/(.*)", tornado.web.StaticFileHandler,
          {"path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")}),
-    ])
+    ], websocket_max_message_size=WEBSOCKET_MAX_MESSAGE_SIZE)
     loopback = BIND in ("127.0.0.1", "localhost", "::1")
     app.listen(PORT, address=BIND, max_buffer_size=IMPORT_MAX, max_body_size=IMPORT_MAX)
     tornado.ioloop.IOLoop.current().run_in_executor(None, reindex)

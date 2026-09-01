@@ -369,6 +369,82 @@ class AppServerV2EventTests(unittest.TestCase):
         self.assertIn(".approval:not(.done)", html)
         self.assertIn("Search full session history", html)
 
+    def test_consecutive_tools_group_without_losing_individual_cards(self):
+        html = codex_console.CONSOLE_HTML
+
+        self.assertIn("function placeToolCard(c,ev)", html)
+        self.assertIn("function makeToolGroup(first,second,key)", html)
+        self.assertIn("prev.classList.contains('toolgroup')", html)
+        self.assertIn("prev.classList.contains('tool')", html)
+        self.assertIn("cards.length+' calls'", html)
+        self.assertIn("g.querySelector('.tgstate').textContent", html)
+        self.assertIn(".toolgroup>.tgb>.tool", html)
+        self.assertIn("el.classList.contains('toolgroup')", html)
+
+    def test_attachment_picker_accepts_images_text_and_code(self):
+        html = codex_console.CONSOLE_HTML
+
+        self.assertIn('id="attachmentPicker"', html)
+        self.assertIn('text/*', html)
+        self.assertIn('.py', html)
+        self.assertIn('id="attachBtn"', html)
+        self.assertIn("function chooseAttachments()", html)
+        self.assertIn("function handleAttachmentPick()", html)
+        self.assertIn("attachmentPicker.onchange=handleAttachmentPick", html)
+        self.assertIn("function addTextFile(file)", html)
+        self.assertIn("pendingFiles.map(f=>", html)
+        self.assertIn("MAX_TEXT_BYTES=512*1024", html)
+
+    def test_text_file_attachment_becomes_named_appserver_text_input(self):
+        session, _ = _session()
+        files = codex_console._sanitize_text_files([{
+            "name": "../solver.py",
+            "media_type": "text/x-python",
+            "text": "print('ok')\n",
+        }])
+
+        inputs = session._make_input("Review this file", [], files)
+
+        self.assertEqual(inputs[0], {"type": "text", "text": "Review this file"})
+        self.assertEqual(files[0]["name"], "solver.py")
+        self.assertEqual(inputs[1]["type"], "text")
+        self.assertIn('name="solver.py"', inputs[1]["text"])
+        self.assertIn("print('ok')", inputs[1]["text"])
+
+    def test_text_file_attachment_limits_are_enforced_server_side(self):
+        oversized = "x" * (codex_console.MAX_TEXT_FILE_BYTES + 1)
+        files = codex_console._sanitize_text_files([
+            {"name": "too-large.txt", "text": oversized},
+            {"name": "small.txt", "text": "ok"},
+        ])
+
+        self.assertEqual([f["name"] for f in files], ["small.txt"])
+
+    def test_image_attachment_limits_are_enforced_server_side(self):
+        images = codex_console._sanitize_images([
+            {"media_type": "image/png", "data": "a" * (codex_console.MAX_IMAGE_B64_CHARS + 1)},
+            {"media_type": "image/png", "data": "YWJj"},
+        ])
+
+        self.assertEqual(images, [{"media_type": "image/png", "data": "YWJj"}])
+        self.assertGreaterEqual(codex_console.WEBSOCKET_MAX_MESSAGE_SIZE, 64 * 1024 * 1024)
+
+    def test_queued_attachment_logs_metadata_without_file_body(self):
+        session, _ = _session()
+        session.proc = object()
+        session.busy = True
+
+        session.send_user("Review", files=[{
+            "name": "private.py",
+            "media_type": "text/x-python",
+            "text": "example-body",
+        }])
+
+        self.assertEqual(session.queue[0]["files"][0]["text"], "example-body")
+        self.assertEqual(session.log[0]["kind"], "queued")
+        self.assertEqual(session.log[0]["files"][0]["name"], "private.py")
+        self.assertNotIn("example-body", repr(session.log))
+
     def test_file_change_patch_updates_existing_change_card(self):
         session, _ = _session()
 
