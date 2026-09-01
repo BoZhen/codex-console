@@ -128,6 +128,7 @@ TRANSCRIBE_TIMEOUT_SECONDS = max(
     30, int(_env("TRANSCRIBE_TIMEOUT_SEC", "180") or "180"))
 TRANSCRIBE_IDLE_SECONDS = max(
     30, int(_env("TRANSCRIBE_IDLE_SEC", "600") or "600"))
+TRANSCRIBE_PREVIEW_INTERVAL_MS = 1600
 TRANSCRIBE_WORKER = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "faster_whisper_worker.py")
 # asyncio StreamReader's default line limit is 64KB. The codex app-server frames
@@ -2281,39 +2282,50 @@ class TranscriberManager:
         with self._lock:
             self._stop_locked()
 
-    def transcribe(self, path):
+    def _request_locked(self, payload):
+        proc = self._start_locked()
+        request_id = secrets.token_hex(8)
+        payload = {**payload, "id": request_id}
+        try:
+            proc.stdin.write(json.dumps(payload) + "\n")
+            proc.stdin.flush()
+        except Exception as exc:
+            self._stop_locked()
+            raise RuntimeError("transcription worker did not start") from exc
+        readable, _, _ = select.select(
+            [proc.stdout], [], [], self.timeout_seconds)
+        if not readable:
+            self._stop_locked()
+            raise TimeoutError("transcription timed out")
+        line = proc.stdout.readline()
+        if not line:
+            self._stop_locked()
+            raise RuntimeError("transcription worker exited")
+        try:
+            result = json.loads(line)
+        except Exception as exc:
+            self._stop_locked()
+            raise RuntimeError("invalid transcription worker response") from exc
+        if result.get("id") != request_id:
+            self._stop_locked()
+            raise RuntimeError("mismatched transcription worker response")
+        if not result.get("ok"):
+            error = RuntimeError(result.get("error") or "transcription failed")
+            error.code = result.get("code") or ""
+            raise error
+        return result
+
+    def warmup(self):
         with self._lock:
-            proc = self._start_locked()
-            request_id = secrets.token_hex(8)
-            try:
-                proc.stdin.write(json.dumps({
-                    "type": "transcribe", "id": request_id, "path": path}) + "\n")
-                proc.stdin.flush()
-            except Exception as exc:
-                self._stop_locked()
-                raise RuntimeError("transcription worker did not start") from exc
-            readable, _, _ = select.select(
-                [proc.stdout], [], [], self.timeout_seconds)
-            if not readable:
-                self._stop_locked()
-                raise TimeoutError("transcription timed out")
-            line = proc.stdout.readline()
-            if not line:
-                self._stop_locked()
-                raise RuntimeError("transcription worker exited")
-            try:
-                result = json.loads(line)
-            except Exception as exc:
-                self._stop_locked()
-                raise RuntimeError("invalid transcription worker response") from exc
-            if result.get("id") != request_id:
-                self._stop_locked()
-                raise RuntimeError("mismatched transcription worker response")
-            if not result.get("ok"):
-                error = RuntimeError(result.get("error") or "transcription failed")
-                error.code = result.get("code") or ""
-                raise error
-            return result
+            return self._request_locked({"type": "warmup"})
+
+    def transcribe(self, path, final=True, stream_id="", duration_hint=None):
+        with self._lock:
+            return self._request_locked({
+                "type": "transcribe", "path": path,
+                "final": bool(final), "stream_id": str(stream_id or "")[:120],
+                "duration_hint": duration_hint,
+            })
 
 
 _TRANSCRIBER = TranscriberManager()
@@ -2324,6 +2336,36 @@ _AUDIO_TYPES = {
     "audio/ogg": ".ogg", "audio/wav": ".wav", "audio/x-wav": ".wav",
     "application/octet-stream": ".audio",
 }
+
+
+class TranscribeWarmupHandler(AuthMixin, tornado.web.RequestHandler):
+    async def post(self):
+        if not self._ok_auth():
+            return
+        status = _transcribe_status()
+        if not status["available"]:
+            raise tornado.web.HTTPError(503, reason=status["reason"])
+        self.set_header("Content-Type", "application/json")
+        self.set_header("Cache-Control", "no-store")
+        if not _TRANSCRIBER_GATE.acquire(blocking=False):
+            self.set_status(202)
+            self.write(json.dumps({"ok": True, "warming": True}))
+            return
+        try:
+            loop = tornado.ioloop.IOLoop.current()
+            result = await loop.run_in_executor(None, _TRANSCRIBER.warmup)
+        except TimeoutError as exc:
+            raise tornado.web.HTTPError(504, reason=str(exc))
+        except Exception as exc:
+            raise tornado.web.HTTPError(
+                500, reason=(str(exc) or "transcription warmup failed")[:1000])
+        finally:
+            _TRANSCRIBER_GATE.release()
+        self.write(json.dumps({
+            "ok": True,
+            "warmed": True,
+            "elapsed": result.get("elapsed"),
+        }))
 
 
 @tornado.web.stream_request_body
@@ -2386,6 +2428,8 @@ class TranscribeHandler(AuthMixin, tornado.web.RequestHandler):
             "ok": True, **status,
             "maxBytes": TRANSCRIBE_MAX_BYTES,
             "maxSeconds": TRANSCRIBE_MAX_SECONDS,
+            "livePreview": True,
+            "previewIntervalMs": TRANSCRIBE_PREVIEW_INTERVAL_MS,
         })
 
     async def post(self):
@@ -2399,12 +2443,19 @@ class TranscribeHandler(AuthMixin, tornado.web.RequestHandler):
             duration_ms = 0
         if duration_ms > (TRANSCRIBE_MAX_SECONDS + 2) * 1000:
             raise tornado.web.HTTPError(413, reason="recording is too long")
+        partial = self.get_query_argument("partial", "0").lower() in (
+            "1", "true", "yes", "on")
+        stream_id = re.sub(
+            r"[^A-Za-z0-9_-]", "",
+            self.request.headers.get("X-Transcription-Stream", ""))[:120]
         if not _TRANSCRIBER_GATE.acquire(blocking=False):
             raise tornado.web.HTTPError(429, reason="another transcription is running")
         try:
             loop = tornado.ioloop.IOLoop.current()
             result = await loop.run_in_executor(
-                None, _TRANSCRIBER.transcribe, self._upload_path)
+                None, lambda: _TRANSCRIBER.transcribe(
+                    self._upload_path, final=not partial,
+                    stream_id=stream_id, duration_hint=duration_ms / 1000.0))
         except TimeoutError as exc:
             raise tornado.web.HTTPError(504, reason=str(exc))
         except Exception as exc:
@@ -2418,6 +2469,8 @@ class TranscribeHandler(AuthMixin, tornado.web.RequestHandler):
         self._json({
             "ok": True,
             "text": result.get("text") or "",
+            "stableText": result.get("stable_text") or "",
+            "partial": partial,
             "language": result.get("language") or "",
             "duration": result.get("duration"),
             "elapsed": result.get("elapsed"),
@@ -4568,6 +4621,7 @@ pre code{background:none;border:none;padding:0}
 #ta{flex:1;min-width:0;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:10px;
   padding:9px 12px;font-size:14px;font-family:inherit;resize:none;max-height:160px;line-height:1.4}
 #ta:focus{outline:1px solid var(--acc)}
+#ta[readonly]{border-color:var(--acc)}
 #attachBtn,#voiceBtn{background:var(--bg3);color:var(--mut);border:1px solid var(--line);border-radius:10px;width:38px;height:38px;
   flex:none;display:inline-flex;align-items:center;justify-content:center;font-size:16px;cursor:pointer;padding:0}
 #attachBtn:hover,#voiceBtn:hover{color:var(--fg);border-color:var(--acc)}
@@ -5643,7 +5697,7 @@ function bindProject(p){if(!p)return;const sel=$('#project');let ok=false;
   for(const o of sel.options){if(o.value===p){ok=true;break;}}
   if(!ok){const o=document.createElement('option');o.value=p;o.textContent='● '+p.split('/').slice(-2).join('/');sel.insertBefore(o,sel.firstChild);}
   sel.value=p;}
-function setComposerEnabled(on){ta.disabled=!on;sendBtn.disabled=!on;attachBtn.disabled=!on;syncVoiceButton();}
+function setComposerEnabled(on){ta.disabled=!on;syncVoiceComposerState();syncVoiceButton();}
 function setBusy(b,wordSeed,elapsedMs){running=b;$('#dot').className='dot '+(b?'busy':(ready?'on':''));
   setSessionTabBusy(sid,b);
   $('#thinking').classList.toggle('busy',b);
@@ -6641,12 +6695,13 @@ function schedulePersist(){clearTimeout(_dpT);_dpT=setTimeout(persistDrafts,500)
 function saveDraft(){if(sid)drafts[sid]={text:ta.value,images:pendingImages.slice(),files:pendingFiles.slice()};persistDrafts();}
 function loadDraft(id){const d=drafts[id]||{text:'',images:[],files:[]};ta.value=d.text||'';
   ta.style.height='auto';ta.style.height=Math.min(ta.scrollHeight,160)+'px';
-  pendingImages=(d.images||[]).slice();pendingFiles=(d.files||[]).slice();renderAttach();}
+  pendingImages=(d.images||[]).slice();pendingFiles=(d.files||[]).slice();renderAttach();syncVoiceComposerState();}
 function dropDraft(id){if(id&&drafts[id]){delete drafts[id];persistDrafts();}}
 
 /* voice input records locally, transcribes through the same-origin endpoint, and
    writes only into the originating session's editable draft. */
-let voiceCaps={enabled:false,available:false,maxBytes:16*1024*1024,maxSeconds:120,reason:'loading voice input…'};
+let voiceCaps={enabled:false,available:false,livePreview:false,previewIntervalMs:1600,
+  maxBytes:16*1024*1024,maxSeconds:120,reason:'loading voice input…'};
 let voiceJob=null,voiceSeq=0;
 const VOICE_MIC_ICON='<img class="voice-mic-icon" src="/static/icons/fluent-studio-microphone.png" alt="">';
 const VOICE_STOP_ICON='<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="1"></rect></svg>';
@@ -6658,6 +6713,8 @@ function voiceUnavailableReason(){
   if(!voiceCaps.available)return voiceCaps.reason||'Voice transcription is unavailable';
   return '';}
 function fmtVoiceTime(ms){const s=Math.max(0,Math.floor(ms/1000));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0');}
+function syncVoiceComposerState(){const locked=!!(voiceJob&&voiceJob.targetSid===sid),enabled=!ta.disabled;
+  ta.readOnly=locked;sendBtn.disabled=!enabled||locked;attachBtn.disabled=!enabled||locked;}
 function syncVoiceButton(){if(!voiceBtn)return;const reason=voiceUnavailableReason(),recording=voiceJob&&voiceJob.mode==='recording';
   voiceBtn.disabled=!!reason||(!ready&&!recording)||!!(voiceJob&&voiceJob.mode!=='recording');
   voiceBtn.classList.toggle('recording',!!recording);voiceBtn.innerHTML=recording?VOICE_STOP_ICON:VOICE_MIC_ICON;
@@ -6665,15 +6722,20 @@ function syncVoiceButton(){if(!voiceBtn)return;const reason=voiceUnavailableReas
   voiceBtn.setAttribute('aria-label',reason||(recording?'Stop voice recording':'Start voice input'));
   voiceBtn.setAttribute('aria-keyshortcuts','Alt+M');}
 function renderVoiceState(){const bar=$('#voiceBar'),label=$('#voiceLabel');if(!bar||!label)return;
-  if(!voiceJob){bar.hidden=true;bar.className='';syncVoiceButton();return;}
+  if(!voiceJob){bar.hidden=true;bar.className='';syncVoiceComposerState();syncVoiceButton();return;}
   bar.hidden=false;bar.className=voiceJob.mode==='transcribing'?'transcribing':'';
   if(voiceJob.mode==='starting')label.textContent='microphone…';
-  else if(voiceJob.mode==='transcribing')label.textContent='transcribing…';
+  else if(voiceJob.mode==='transcribing')label.textContent='finalizing transcript…';
+  else if(voiceJob.liveUnavailable)label.textContent='recording · final transcript only · '+fmtVoiceTime(Date.now()-voiceJob.startedAt);
+  else if(voiceJob.hypothesis)label.textContent='listening · revising recent phrase · '+fmtVoiceTime(Date.now()-voiceJob.startedAt);
   else label.textContent='recording · '+fmtVoiceTime(Date.now()-voiceJob.startedAt)+' / '+fmtVoiceTime(voiceCaps.maxSeconds*1000);
-  syncVoiceButton();}
+  syncVoiceComposerState();syncVoiceButton();}
 function stopVoiceTracks(job){if(job&&job.stream){job.stream.getTracks().forEach(t=>t.stop());job.stream=null;}}
-function clearVoiceTimers(job){if(!job)return;clearInterval(job.tick);clearTimeout(job.limit);job.tick=job.limit=0;}
-function cleanupVoiceJob(job){clearVoiceTimers(job);stopVoiceTracks(job);if(voiceJob===job){voiceJob=null;renderVoiceState();}}
+function clearVoiceTimers(job){if(!job)return;clearInterval(job.tick);clearTimeout(job.limit);clearTimeout(job.previewTimer);
+  job.tick=job.limit=job.previewTimer=0;}
+function cleanupVoiceJob(job){clearVoiceTimers(job);stopVoiceTracks(job);
+  if(job.previewController)job.previewController.abort();
+  if(voiceJob===job){voiceJob=null;renderVoiceState();}}
 function voiceMime(){const choices=['audio/webm;codecs=opus','audio/mp4','audio/ogg;codecs=opus','audio/webm'];
   for(const type of choices){try{if(!MediaRecorder.isTypeSupported||MediaRecorder.isTypeSupported(type))return type;}catch(e){}}
   return '';}
@@ -6682,45 +6744,97 @@ function insertVoiceValue(value,start,end,text){start=Math.max(0,Math.min(Number
   const before=value.slice(0,start),after=value.slice(end),clean=(text||'').trim();
   const inserted=voiceSpacing(before,clean)+clean+voiceSpacing(clean,after);
   return {value:before+inserted+after,start:start,end:start+inserted.length};}
-function insertVoiceDraft(job,text){if(!job||!job.targetSid||!(text||'').trim())return;
-  if(job.targetSid===sid){const out=insertVoiceValue(ta.value,job.insertStart,job.insertEnd,text);ta.value=out.value;
-    ta.setSelectionRange(out.end,out.end);ta.dispatchEvent(new Event('input',{bubbles:true}));ta.focus();return;}
-  const d=drafts[job.targetSid]||{text:'',images:[],files:[]};d.images=d.images||[];d.files=d.files||[];
-  const out=insertVoiceValue(d.text||'',job.insertStart,job.insertEnd,text);d.text=out.value;drafts[job.targetSid]=d;persistDrafts();}
+function voiceCommonPrefix(a,b){a=a||'';b=b||'';let i=0,n=Math.min(a.length,b.length);while(i<n&&a[i]===b[i])i++;
+  if(i&&i<a.length&&/^[\uDC00-\uDFFF]$/.test(a[i]))i--;return i;}
+function voiceTargetValue(job){if(job.targetSid===sid)return ta.value;const d=drafts[job.targetSid];return d&&d.text||'';}
+function applyVoiceHypothesis(job,text,stableText,final){if(!job||!job.targetSid||!(text||'').trim())return false;
+  const value=voiceTargetValue(job),start=job.previewApplied?job.previewStart:job.insertStart,
+    end=job.previewApplied?job.previewEnd:job.insertEnd;
+  if(job.previewApplied&&value.slice(start,end)!==job.previewText){job.previewConflict=true;return false;}
+  const out=insertVoiceValue(value,start,end,text),preview=out.value.slice(out.start,out.end);
+  if(job.targetSid===sid){const common=job.previewApplied?voiceCommonPrefix(job.previewText,preview):0;
+    ta.setRangeText(preview.slice(common),start+common,end,'end');if(ta.value!==out.value)ta.value=out.value;
+    ta.setSelectionRange(out.end,out.end);ta.dispatchEvent(new Event('input',{bubbles:true}));}
+  else{const d=drafts[job.targetSid]||{text:'',images:[],files:[]};d.images=d.images||[];d.files=d.files||[];
+    d.text=out.value;drafts[job.targetSid]=d;persistDrafts();}
+  job.previewApplied=true;job.previewStart=out.start;job.previewEnd=out.end;
+  job.previewText=preview;job.hypothesis=(text||'').trim();job.stableText=final?job.hypothesis:(stableText||'');
+  return true;}
+function restoreVoicePreview(job){if(!job||!job.previewApplied)return;const value=voiceTargetValue(job);
+  if(value.slice(job.previewStart,job.previewEnd)!==job.previewText)return;
+  const restored=value.slice(0,job.previewStart)+job.originalText+value.slice(job.previewEnd);
+  if(job.targetSid===sid){ta.setRangeText(job.originalText,job.previewStart,job.previewEnd,'end');
+    if(ta.value!==restored)ta.value=restored;ta.dispatchEvent(new Event('input',{bubbles:true}));}
+  else{const d=drafts[job.targetSid]||{text:'',images:[],files:[]};d.images=d.images||[];d.files=d.files||[];
+    d.text=restored;drafts[job.targetSid]=d;persistDrafts();}job.previewApplied=false;}
 function voiceErrorMessage(err){const name=err&&err.name;if(name==='NotAllowedError')return 'Microphone permission was denied';
   if(name==='NotFoundError')return 'No microphone was found';if(name==='NotReadableError')return 'The microphone is already in use';
   return (err&&err.message)||String(err||'Voice input failed');}
 async function loadVoiceCapabilities(){try{const r=await fetch('api/transcribe',{cache:'no-store'}),j=await r.json();
     voiceCaps=Object.assign(voiceCaps,j||{});if(!r.ok)voiceCaps.available=false;
   }catch(e){voiceCaps.available=false;voiceCaps.reason='Voice transcription is unreachable';}syncVoiceButton();}
+async function warmVoiceModel(){try{await fetch('api/transcribe/warmup',{method:'POST',cache:'no-store'});}catch(e){}}
+function voiceStreamId(){if(globalThis.crypto&&crypto.randomUUID)return crypto.randomUUID();
+  return 'voice-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2);}
+function queueVoicePreview(job){if(!job||job.cancelled||job.mode!=='recording'||job.liveUnavailable||!voiceCaps.livePreview)return;
+  if(Date.now()-job.startedAt<1500||job.chunks.length<2)return;job.previewQueued=true;
+  if(job.previewPromise||job.previewTimer)return;const interval=Math.max(1000,Number(voiceCaps.previewIntervalMs)||1600);
+  const wait=Math.max(0,interval-(Date.now()-(job.lastPreviewAt||0)));
+  job.previewTimer=setTimeout(()=>{job.previewTimer=0;requestVoicePreview(job);},wait);}
+async function requestVoicePreview(job){if(!job||job.cancelled||job.mode!=='recording'||job.previewPromise)return;
+  job.previewQueued=false;job.lastPreviewAt=Date.now();const type=(job.recorder&&job.recorder.mimeType)||job.mime||'application/octet-stream';
+  const blob=new Blob(job.chunks.slice(),{type:type});if(!blob.size||blob.size>voiceCaps.maxBytes)return;
+  const controller=new AbortController();job.previewController=controller;const chunkCount=job.chunks.length;
+  const work=(async()=>{try{const r=await fetch('api/transcribe?partial=1',{method:'POST',
+      headers:{'Content-Type':blob.type||'application/octet-stream','X-Audio-Duration-Ms':String(Math.max(0,Date.now()-job.startedAt)),
+        'X-Transcription-Stream':job.streamId},body:blob,signal:controller.signal});
+    let j={};try{j=await r.json();}catch(e){}
+    if(r.status===422||r.status===429)return;
+    if(!r.ok||!j.ok)throw new Error(j.error||('live transcription failed ('+r.status+')'));
+    job.previewFailures=0;if(!job.cancelled&&voiceJob===job)applyVoiceHypothesis(job,j.text||'',j.stableText||'',false);
+  }catch(e){if(e.name!=='AbortError'){job.previewFailures=(job.previewFailures||0)+1;
+      if(job.previewFailures>=3)job.liveUnavailable=true;}}
+  finally{if(job.previewController===controller)job.previewController=null;job.previewPromise=null;
+    if(job.mode==='recording'&&(job.previewQueued||job.chunks.length>chunkCount))queueVoicePreview(job);renderVoiceState();}})();
+  job.previewPromise=work;await work;}
+async function settleVoicePreview(job){clearTimeout(job.previewTimer);job.previewTimer=0;job.previewQueued=false;
+  if(job.previewPromise){try{await job.previewPromise;}catch(e){}}}
 async function uploadVoice(job,blob){if(job.cancelled)return;
   if(!blob.size){addNotice('⚠ no audio was recorded');cleanupVoiceJob(job);return;}
   if(blob.size>voiceCaps.maxBytes){addNotice('⚠ voice recording exceeds the upload limit');cleanupVoiceJob(job);return;}
-  job.mode='transcribing';job.controller=new AbortController();renderVoiceState();
-  try{const r=await fetch('api/transcribe',{method:'POST',headers:{'Content-Type':blob.type||'application/octet-stream',
-      'X-Audio-Duration-Ms':String(job.durationMs||0)},body:blob,signal:job.controller.signal});
-    let j={};try{j=await r.json();}catch(e){}
+  job.mode='transcribing';renderVoiceState();await settleVoicePreview(job);if(job.cancelled)return;
+  job.controller=new AbortController();
+  try{let r=null,j={};for(let attempt=0;attempt<6;attempt++){
+      r=await fetch('api/transcribe',{method:'POST',headers:{'Content-Type':blob.type||'application/octet-stream',
+        'X-Audio-Duration-Ms':String(job.durationMs||0),'X-Transcription-Stream':job.streamId},body:blob,signal:job.controller.signal});
+      try{j=await r.json();}catch(e){j={};}
+      if(r.status!==429||attempt===5)break;
+      await new Promise(resolve=>setTimeout(resolve,300*(attempt+1)));if(job.cancelled)return;}
     if(!r.ok||!j.ok)throw new Error(j.error||('transcription failed ('+r.status+')'));
-    if(!job.cancelled)insertVoiceDraft(job,j.text||'');
+    if(!job.cancelled)applyVoiceHypothesis(job,j.text||'','',true);
   }catch(e){if(!job.cancelled&&e.name!=='AbortError')addNotice('⚠ '+voiceErrorMessage(e));}
-  finally{cleanupVoiceJob(job);}}
+  finally{cleanupVoiceJob(job);if(!job.cancelled&&job.targetSid===sid){
+      requestAnimationFrame(()=>{if(!voiceJob&&job.targetSid===sid)ta.focus();});}}}
 function recorderStopped(job){stopVoiceTracks(job);if(job.cancelled){cleanupVoiceJob(job);return;}
   const type=(job.recorder&&job.recorder.mimeType)||job.mime||'application/octet-stream';
   uploadVoice(job,new Blob(job.chunks,{type:type}));}
 function stopVoiceInput(){const job=voiceJob;if(!job||job.mode!=='recording')return;
-  job.insertStart=job.targetSid===sid?ta.selectionStart:job.insertStart;job.insertEnd=job.targetSid===sid?ta.selectionEnd:job.insertEnd;
   job.durationMs=Math.max(0,Date.now()-job.startedAt);clearVoiceTimers(job);job.mode='transcribing';renderVoiceState();
   try{if(job.recorder&&job.recorder.state!=='inactive')job.recorder.stop();else recorderStopped(job);}catch(e){addNotice('⚠ '+voiceErrorMessage(e));cleanupVoiceJob(job);}}
 function cancelVoiceInput(){const job=voiceJob;if(!job)return;job.cancelled=true;clearVoiceTimers(job);
-  if(job.controller)job.controller.abort();try{if(job.recorder&&job.recorder.state!=='inactive')job.recorder.stop();}catch(e){}
+  if(job.controller)job.controller.abort();if(job.previewController)job.previewController.abort();restoreVoicePreview(job);
+  try{if(job.recorder&&job.recorder.state!=='inactive')job.recorder.stop();}catch(e){}
   cleanupVoiceJob(job);}
 async function startVoiceInput(){const reason=voiceUnavailableReason();if(reason||!ready||!sid){if(reason)addNotice('⚠ '+reason);return;}
   const job=voiceJob={id:++voiceSeq,mode:'starting',targetSid:sid,insertStart:ta.selectionStart,insertEnd:ta.selectionEnd,
-    chunks:[],stream:null,recorder:null,startedAt:0,durationMs:0,cancelled:false};renderVoiceState();
+    originalText:ta.value.slice(ta.selectionStart,ta.selectionEnd),previewApplied:false,previewStart:0,previewEnd:0,previewText:'',
+    hypothesis:'',stableText:'',streamId:voiceStreamId(),chunks:[],stream:null,recorder:null,startedAt:0,durationMs:0,
+    previewTimer:0,previewPromise:null,previewController:null,previewQueued:false,lastPreviewAt:0,previewFailures:0,
+    liveUnavailable:false,cancelled:false};renderVoiceState();job.warmPromise=warmVoiceModel();
   try{const stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
     if(voiceJob!==job||job.cancelled){stream.getTracks().forEach(t=>t.stop());return;}job.stream=stream;job.mime=voiceMime();
     job.recorder=job.mime?new MediaRecorder(stream,{mimeType:job.mime,audioBitsPerSecond:64000}):new MediaRecorder(stream);
-    job.recorder.ondataavailable=e=>{if(e.data&&e.data.size)job.chunks.push(e.data);};
+    job.recorder.ondataavailable=e=>{if(e.data&&e.data.size){job.chunks.push(e.data);queueVoicePreview(job);}};
     job.recorder.onerror=e=>{if(!job.cancelled)addNotice('⚠ '+voiceErrorMessage(e.error||e));cancelVoiceInput();};
     job.recorder.onstop=()=>recorderStopped(job);job.startedAt=Date.now();job.mode='recording';job.recorder.start(1000);
     job.tick=setInterval(renderVoiceState,250);job.limit=setTimeout(stopVoiceInput,voiceCaps.maxSeconds*1000);renderVoiceState();
@@ -6728,7 +6842,7 @@ async function startVoiceInput(){const reason=voiceUnavailableReason();if(reason
 function toggleVoiceInput(){if(voiceJob&&voiceJob.mode==='recording')stopVoiceInput();else if(!voiceJob)startVoiceInput();}
 
 function sendMsg(){const t=ta.value.trim();
-  if((!t&&!pendingImages.length&&!pendingFiles.length)||!ready||!sid||!ws||ws.readyState!==1)return;
+  if((voiceJob&&voiceJob.targetSid===sid)||(!t&&!pendingImages.length&&!pendingFiles.length)||!ready||!sid||!ws||ws.readyState!==1)return;
   wsSend({type:'user',text:t,images:pendingImages.map(im=>({media_type:im.media_type,data:im.data})),
     files:pendingFiles.map(f=>({name:f.name,media_type:f.media_type,text:f.text,size:f.size}))});
   ta.value='';ta.style.height='auto';pendingImages=[];pendingFiles=[];renderAttach();dropDraft(sid);}
@@ -7010,6 +7124,7 @@ def main():
         (r"/api/import", ImportHandler),
         (r"/api/search", SearchHandler),
         (r"/api/thread", ThreadHandler),
+        (r"/api/transcribe/warmup", TranscribeWarmupHandler),
         (r"/api/transcribe", TranscribeHandler),
         (r"/ws/chat", ChatSocket),
         (r"/static/(.*)", tornado.web.StaticFileHandler,

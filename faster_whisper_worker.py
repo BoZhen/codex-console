@@ -2,6 +2,7 @@
 """Long-lived local faster-whisper worker using JSON lines over stdio."""
 
 import argparse
+import difflib
 import json
 import re
 import select
@@ -15,6 +16,10 @@ _NONTERMINAL_PUNCTUATION = ",;:，；：、"
 _TRAILING_CLOSERS = "'\"”’）)]}】」』"
 _COMMA_PAUSE_SECONDS = 0.5
 _PERIOD_PAUSE_SECONDS = 1.2
+_LIVE_REVISABLE_CJK_CHARS = 10
+_LIVE_REVISABLE_LATIN_CHARS = 32
+_LIVE_STATE_TTL_SECONDS = 300.0
+_LIVE_STATE_LIMIT = 16
 _QUESTION_PREFIX = re.compile(
     r"^(?:请问)?(?:是否|能否|可否|有没有|有沒有|是不是|能不能|可不可以|"
     r"为什么|為什麼|为何|為何|怎么|怎麼|怎样|怎樣|如何|哪里|哪裡|哪儿|"
@@ -80,10 +85,30 @@ def _duration_seconds(path):
         return None
 
 
-def _join_segments(segments, language, pause_punctuation=False):
-    segments = list(segments)
+def _segment_pieces(segments):
+    pieces = []
+    for segment in segments:
+        words = list(getattr(segment, "words", None) or [])
+        if words:
+            for word in words:
+                pieces.append({
+                    "text": str(getattr(word, "word", "") or ""),
+                    "start": getattr(word, "start", None),
+                    "end": getattr(word, "end", None),
+                })
+        else:
+            pieces.append({
+                "text": str(getattr(segment, "text", "") or ""),
+                "start": getattr(segment, "start", None),
+                "end": getattr(segment, "end", None),
+            })
+    return pieces
+
+
+def _join_pieces(pieces, language, pause_punctuation=False, final=True):
+    pieces = list(pieces)
     if not pause_punctuation:
-        return "".join(segment.text for segment in segments).strip()
+        return "".join(piece["text"] for piece in pieces).strip()
 
     out = []
     previous_end = None
@@ -106,16 +131,78 @@ def _join_segments(segments, language, pause_punctuation=False):
         if end is not None:
             previous_end = float(end)
 
-    for segment in segments:
-        words = list(getattr(segment, "words", None) or [])
-        if words:
-            for word in words:
-                append_piece(word.word, word.start, word.end)
-        else:
-            append_piece(segment.text, getattr(segment, "start", None),
-                         getattr(segment, "end", None))
+    for piece in pieces:
+        append_piece(piece["text"], piece.get("start"), piece.get("end"))
     text = "".join(out).strip()
-    return _ensure_terminal_punctuation(text, is_chinese)
+    return _ensure_terminal_punctuation(text, is_chinese) if final else text
+
+
+def _join_segments(segments, language, pause_punctuation=False, final=True):
+    return _join_pieces(_segment_pieces(list(segments)), language,
+                        pause_punctuation, final)
+
+
+def _common_prefix(previous, current):
+    limit = min(len(previous), len(current))
+    index = 0
+    while index < limit and previous[index] == current[index]:
+        index += 1
+    return current[:index]
+
+
+def _stable_live_prefix(previous, current, confirmed, language):
+    confirmed = confirmed or ""
+    common = _common_prefix(previous or "", current or "")
+    reserve = (_LIVE_REVISABLE_CJK_CHARS
+               if str(language or "").lower().startswith("zh")
+               else _LIVE_REVISABLE_LATIN_CHARS)
+    candidate = min(len(common), max(0, len(current) - reserve))
+    while (candidate > len(confirmed) and candidate < len(current)
+           and current[candidate - 1].isalnum() and current[candidate].isalnum()
+           and current[candidate - 1].isascii() and current[candidate].isascii()):
+        candidate -= 1
+    end = max(len(confirmed), candidate)
+    return current[:end]
+
+
+def _map_text_boundary(previous, current, boundary):
+    boundary = max(0, min(int(boundary), len(previous)))
+    for tag, old_start, old_end, new_start, new_end in difflib.SequenceMatcher(
+            None, previous, current, autojunk=False).get_opcodes():
+        if boundary < old_start:
+            return new_start
+        if old_start <= boundary <= old_end:
+            if tag == "equal":
+                return new_start + min(boundary - old_start,
+                                       new_end - new_start)
+            if tag == "insert":
+                return new_start
+            return new_end
+    return len(current)
+
+
+def _preserve_confirmed_prefix(previous, current, confirmed):
+    previous = previous or ""
+    current = current or ""
+    confirmed = confirmed or ""
+    if not confirmed or current.startswith(confirmed):
+        return current
+    tail_start = _map_text_boundary(previous, current, len(confirmed))
+    tail = current[tail_start:]
+    if confirmed[-1:].isspace() and tail[:1].isspace():
+        tail = tail[1:]
+    return confirmed + tail
+
+
+def _purge_live_states(states, now):
+    stale = [key for key, value in states.items()
+             if now - value.get("seen", 0) > _LIVE_STATE_TTL_SECONDS]
+    for key in stale:
+        states.pop(key, None)
+    if len(states) > _LIVE_STATE_LIMIT:
+        oldest = sorted(states, key=lambda key: states[key].get("seen", 0))
+        for key in oldest[:len(states) - _LIVE_STATE_LIMIT]:
+            states.pop(key, None)
 
 
 def main():
@@ -134,6 +221,7 @@ def main():
 
     model = None
     chinese_converter = None
+    live_states = {}
     while True:
         readable, _, _ = select.select([sys.stdin], [], [], max(30, args.idle_seconds))
         if not readable:
@@ -146,21 +234,15 @@ def main():
         except Exception:
             _reply({"ok": False, "error": "invalid worker request"})
             continue
-        if request.get("type") == "shutdown":
+        request_type = request.get("type")
+        if request_type == "shutdown":
             return
 
         request_id = str(request.get("id") or "")
+        stream_id = str(request.get("stream_id") or "")[:120]
+        final = request.get("final", True) is not False
         started = time.monotonic()
         try:
-            measured_duration = _duration_seconds(request["path"])
-            if measured_duration is not None and measured_duration > args.max_seconds + 2:
-                _reply({
-                    "id": request_id,
-                    "ok": False,
-                    "code": "too_long",
-                    "error": "recording is too long",
-                })
-                continue
             if model is None:
                 from faster_whisper import WhisperModel
 
@@ -170,30 +252,79 @@ def main():
                     device_index=args.device_index,
                     compute_type=args.compute_type,
                 )
+            if request_type == "warmup":
+                _reply({
+                    "id": request_id,
+                    "ok": True,
+                    "warmed": True,
+                    "elapsed": round(time.monotonic() - started, 3),
+                })
+                continue
+            if request_type != "transcribe":
+                raise ValueError("unsupported worker request")
+            measured_duration = _duration_seconds(request["path"])
+            if measured_duration is not None and measured_duration > args.max_seconds + 2:
+                _reply({
+                    "id": request_id,
+                    "ok": False,
+                    "code": "too_long",
+                    "error": "recording is too long",
+                })
+                continue
+            duration_hint = request.get("duration_hint")
+            try:
+                duration_hint = float(duration_hint) if duration_hint is not None else None
+            except (TypeError, ValueError):
+                duration_hint = None
+            duration = measured_duration if measured_duration is not None else duration_hint
+            state = live_states.get(stream_id) if stream_id else None
             segments, info = model.transcribe(
                 request["path"],
-                language=args.language or None,
+                language=args.language or (state or {}).get("language") or None,
                 task="transcribe",
                 beam_size=5,
                 vad_filter=True,
                 condition_on_previous_text=False,
-                word_timestamps=args.pause_punctuation,
+                word_timestamps=args.pause_punctuation or not final,
             )
-            text = _join_segments(segments, getattr(info, "language", ""),
-                                  args.pause_punctuation)
+            language = getattr(info, "language", "") or (state or {}).get("language", "")
+            pieces = _segment_pieces(list(segments))
+            text = _join_pieces(
+                pieces, language, args.pause_punctuation, final=final)
             if args.chinese_conversion != "none":
                 if chinese_converter is None:
                     from opencc import OpenCC
 
                     chinese_converter = OpenCC(args.chinese_conversion + ".json")
                 text = chinese_converter.convert(text)
+            if state and state.get("stable_text"):
+                text = _preserve_confirmed_prefix(
+                    state.get("text", ""), text, state["stable_text"])
+            stable_text = ""
+            if final:
+                if stream_id:
+                    live_states.pop(stream_id, None)
+            else:
+                stable_text = _stable_live_prefix(
+                    (state or {}).get("text", ""), text,
+                    (state or {}).get("stable_text", ""), language)
+                if stream_id:
+                    live_states[stream_id] = {
+                        "text": text,
+                        "stable_text": stable_text,
+                        "language": language,
+                        "seen": time.monotonic(),
+                    }
+                    _purge_live_states(live_states, time.monotonic())
             _reply({
                 "id": request_id,
                 "ok": True,
                 "text": text,
-                "language": getattr(info, "language", "") or "",
+                "stable_text": stable_text,
+                "partial": not final,
+                "language": language,
                 "language_probability": getattr(info, "language_probability", None),
-                "duration": measured_duration or getattr(info, "duration", None),
+                "duration": duration or getattr(info, "duration", None),
                 "elapsed": round(time.monotonic() - started, 3),
             })
         except Exception as exc:

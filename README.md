@@ -32,8 +32,9 @@ plans, file changes, and session state in one interface.
 - **Image, text, and code attachments** from desktop or mobile. Images can also
   be pasted from the clipboard. Text and code files are sent as bounded,
   filename-labelled text input.
-- **Optional local voice input** that records in the browser, transcribes with
-  faster-whisper, and inserts editable text into the originating session draft.
+- **Optional local voice input** that prewarms faster-whisper when recording
+  starts, revises the recent transcript while protecting confirmed text and
+  punctuation, then runs a full correction before the text can be sent.
 - **Live model catalog and reasoning effort controls** from the installed Codex
   app-server.
 - **Context and rate-limit meters** from app-server usage events.
@@ -58,7 +59,8 @@ python -m pip install tornado
 Local voice transcription is optional. Install `faster-whisper` in the Python
 runtime configured for the transcription worker; install `opencc` there as well
 when Chinese script normalization is enabled. Browser microphone access requires
-HTTPS or localhost.
+HTTPS or localhost. During live Chinese dictation, the latest 10 characters
+remain revisable; earlier confirmed text and punctuation are preserved.
 
 ## Run
 
@@ -118,9 +120,9 @@ python codex_console.py
 Before sending, attachment bodies remain in browser memory. Sent text and code
 attachments become part of the Codex turn and may be stored in its rollout
 JSONL. Images are written to temporary files before being passed to app-server
-as local image input. Voice recordings use permission-restricted temporary
-files and are deleted after transcription; transcribed text enters Codex only
-after the user sends the edited draft.
+as local image input. Every live voice preview and final correction uses a
+permission-restricted temporary file that is deleted after transcription;
+transcribed text enters Codex only after the user sends the edited draft.
 
 ## Security
 

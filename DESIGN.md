@@ -42,13 +42,13 @@
 
 ## Components
 - Existing components to reuse: LIVE session rows, busy dots, close/menu controls, session title, context/status header
-- New/changed components: horizontal session tab strip labeled only by session name; tab activation and close-view actions; compact older-content marker with a history-search action; collapsible sticky Plan dock; collapsible consecutive tool-call groups; composer attachment button with image thumbnails and compact text/code file previews; fixed-size microphone control with recording, cancellation, and transcription states
+- New/changed components: horizontal session tab strip labeled only by session name; tab activation and close-view actions; compact older-content marker with a history-search action; collapsible sticky Plan dock; collapsible consecutive tool-call groups; composer attachment button with image thumbnails and compact text/code file previews; fixed-size microphone control with recording, live-revision, finalization, and cancellation states
 - Variants and states: active, background-ready, background-busy, unread, stale/ended; Plan expanded or collapsed to active work only; tool groups collapsed or expanded with running and failed counts
 - Token/component ownership: inline CSS and JS in `codex_console.py`; no new dependency or design-system layer
 
 ## Accessibility
 - Target standard: practical WCAG 2.1 AA behavior for navigation and controls
-- Keyboard/focus behavior: tabs use tab semantics, arrow-key navigation, visible focus, and a named close button; Alt+M toggles voice recording without moving focus out of the composer
+- Keyboard/focus behavior: tabs use tab semantics, arrow-key navigation, visible focus, and a named close button; Alt+M toggles voice recording; stopping from the microphone button returns focus to the originating composer so Enter can send the reviewed transcript
 - Contrast/readability: reuse tested theme colors and add text/symbol state alongside color
 - Screen-reader semantics: `role="tablist"`, `role="tab"`, `aria-selected`, descriptive close labels
 - Reduced motion and sensory considerations: no required animation for state comprehension
@@ -59,10 +59,10 @@
 - Touch/hover differences: close, attachment, and microphone controls remain large enough for touch; tooltips are supplemental; mobile users choose images or files through the system picker while desktop paste remains available
 
 ## Interaction states
-- Loading: newly resumed session tab shows its existing switching/resuming status
+- Loading: newly resumed session tab shows its existing switching/resuming status; pressing the microphone begins model warmup concurrently with permission and initial audio capture
 - Empty: hide the strip when no tab is open
-- Error: failed attach removes stale live tabs and leaves the user in an explicit no-session state; microphone, recording, upload, and transcription failures leave the existing draft intact
-- Success: activating a live tab updates chat, project binding, draft, model, and context; long sessions retain a bounded recent DOM window with explicit access to indexed history; a collapsed Plan shows only current active work and updates in place; a fully completed Plan remains visible briefly and then clears itself; adjacent calls of the same tool collapse into one summary while preserving each original call and output on expansion; pasted images and system-picked image/text/code attachments share validation, preview, draft, and send behavior; voice recordings transcribe into the originating session draft without automatic submission and may apply explicitly configured Chinese script normalization and pause-aware punctuation
+- Error: failed attach removes stale live tabs and leaves the user in an explicit no-session state; microphone and final transcription failures retain the last usable draft; repeated live-preview failures fall back to final-only transcription without stopping the recording
+- Success: activating a live tab updates chat, project binding, draft, model, and context; long sessions retain a bounded recent DOM window with explicit access to indexed history; a collapsed Plan shows only current active work and updates in place; a fully completed Plan remains visible briefly and then clears itself; adjacent calls of the same tool collapse into one summary while preserving each original call and output on expansion; pasted images and system-picked image/text/code attachments share validation, preview, draft, and send behavior; voice recording writes revisable hypotheses into the originating session draft, preserves a confirmed prefix between updates, runs a full final correction before unlocking send, restores the original selection on cancel, and never submits automatically
 - Disabled: ended/stale tabs cannot send messages
 - Offline/slow network: tabs remain visible while the socket reconnects; no session is ended by disconnect
 
@@ -74,7 +74,7 @@
 ## Implementation constraints
 - Framework/styling system: primary Python server with inline vanilla HTML/CSS/JS plus an optional isolated transcription worker
 - Design-token constraints: reuse existing CSS custom properties
-- Performance constraints: restore an opened tab from its in-memory DOM cache before networking; use sequenced incremental `attach`, not `resume` or full replay, to catch up background activity; bound each chat DOM by rendered-item and text-size budgets while never pruning unresolved interactive cards or tool groups containing running calls
+- Performance constraints: restore an opened tab from its in-memory DOM cache before networking; use sequenced incremental `attach`, not `resume` or full replay, to catch up background activity; bound each chat DOM by rendered-item and text-size budgets while never pruning unresolved interactive cards or tool groups containing running calls; keep at most one live transcription request in flight and coalesce newer recorder chunks behind it
 - Compatibility constraints: existing sidebar, drafts, approvals, model/context state, and service restart behavior must remain intact; microphone capture requires a secure browser context while transcription remains an optional local backend
 - Test/screenshot expectations: source-level regression tests, JavaScript syntax check, unit suite, and desktop/mobile visual smoke check when practical
 
