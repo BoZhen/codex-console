@@ -2,7 +2,7 @@
 
 ## Source of truth
 - Status: Active
-- Last refreshed: 2026-09-01
+- Last refreshed: 2026-09-05
 - Primary product surfaces: session sidebar, session tabs, chat stream, composer, changes drawer
 - Evidence reviewed: `README.md`, inline HTML/CSS/JS in `codex_console.py`, `faster_whisper_worker.py`, current multi-session behavior
 
@@ -42,7 +42,7 @@
 
 ## Components
 - Existing components to reuse: LIVE session rows, busy dots, close/menu controls, session title, context/status header
-- New/changed components: horizontal session tab strip labeled only by session name; tab activation and close-view actions; compact older-content marker with a history-search action; collapsible sticky Plan dock; collapsible consecutive tool-call groups; composer attachment button with image thumbnails and compact text/code file previews; fixed-size microphone control with recording, live-revision, finalization, and cancellation states
+- New/changed components: horizontal session tab strip labeled only by session name; tab activation and close-view actions; compact older-content marker with a history-search action; collapsible sticky Plan dock; collapsible consecutive tool-call groups; semantic Agent tool cards that summarize collaboration actions without exposing empty protocol fields; composer attachment button with image thumbnails and compact text/code file previews; fixed-size microphone control with recording, live-revision, finalization, and cancellation states
 - Variants and states: active, background-ready, background-busy, unread, stale/ended; Plan expanded or collapsed to active work only; tool groups collapsed or expanded with running and failed counts
 - Token/component ownership: inline CSS and JS in `codex_console.py`; no new dependency or design-system layer
 
@@ -59,10 +59,14 @@
 - Touch/hover differences: close, attachment, and microphone controls remain large enough for touch; tooltips are supplemental; mobile users choose images or files through the system picker while desktop paste remains available
 
 ## Interaction states
+- Session controls: model and service-tier selectors sit beside the effort control; options follow the installed CLI catalog and apply to the next turn. Standard speed is always available, with Fast only when advertised.
+- Questions: asynchronous questions do not block ongoing work; submission is marked complete only after server acknowledgement. Answers follow the existing queue behavior while a turn is busy.
+- Reading: upward scrolling leaves tail-follow mode immediately; returning to the bottom resumes it. Each tab preserves that state; revealing a tab scrolls only the tab strip.
+- Updates: a page-version mismatch exposes a reload action; preserve text drafts and defer reload while recording or holding draft attachments.
 - Loading: newly resumed session tab shows its existing switching/resuming status; pressing the microphone begins model warmup concurrently with permission and initial audio capture
 - Empty: hide the strip when no tab is open
 - Error: failed attach removes stale live tabs and leaves the user in an explicit no-session state; microphone and final transcription failures retain the last usable draft; repeated live-preview failures fall back to final-only transcription without stopping the recording
-- Success: activating a live tab updates chat, project binding, draft, model, and context; long sessions retain a bounded recent DOM window with explicit access to indexed history; a collapsed Plan shows only current active work and updates in place; a fully completed Plan remains visible briefly and then clears itself; adjacent calls of the same tool collapse into one summary while preserving each original call and output on expansion; pasted images and system-picked image/text/code attachments share validation, preview, draft, and send behavior; voice recording writes revisable hypotheses into the originating session draft, preserves a confirmed prefix between updates, runs a full final correction before unlocking send, restores the original selection on cancel, and never submits automatically
+- Success: activating a live tab updates chat, project binding, draft, model, and context; long sessions retain a bounded recent DOM window with explicit access to indexed history; a collapsed Plan shows only current active work and updates in place; a fully completed Plan remains visible briefly and then clears itself; adjacent calls of the same tool collapse into one summary while preserving each original call and output on expansion; subagent wait/start/input/close actions use concise labels and reserve detailed child output for the Subagents panel; pasted images and system-picked image/text/code attachments share validation, preview, draft, and send behavior; voice recording writes revisable hypotheses into the originating session draft, preserves a confirmed prefix between updates, runs a full final correction before unlocking send, restores the original selection on cancel, and never submits automatically
 - Disabled: ended/stale tabs cannot send messages
 - Offline/slow network: tabs remain visible while the socket reconnects; no session is ended by disconnect
 

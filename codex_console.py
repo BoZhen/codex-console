@@ -17,6 +17,7 @@ Env (legacy CLAUDE_CONSOLE_* names still accepted as a fallback):
 import asyncio
 import base64
 import glob
+import hashlib
 import json
 import os
 import queue
@@ -376,6 +377,8 @@ def _probe_codex_models(timeout=12):
                     "isDefault": bool(model.get("isDefault")),
                     "reasoningEfforts": efforts,
                     "defaultReasoningEffort": model.get("defaultReasoningEffort") or "",
+                    "serviceTiers": model.get("serviceTiers") or [],
+                    "defaultServiceTier": model.get("defaultServiceTier"),
                 })
             cursor = page.get("nextCursor")
             if not cursor:
@@ -668,6 +671,30 @@ def _subagent_public(rec):
                 "message", "model", "reasoningEffort", "tool", "cwd", "title"):
         if rec.get(key):
             out[key] = rec.get(key)
+    return out
+
+
+def _collab_agent_input(item):
+    item = item if isinstance(item, dict) else {}
+    action = _txt(item.get("tool")).strip()
+    action_key = re.sub(r"[^a-z0-9]+", "", action.lower())
+    labels = {
+        "spawnagent": "Starting subagent",
+        "sendinput": "Sending input to subagent",
+        "wait": "Waiting for subagents",
+        "closeagent": "Closing subagent",
+        "resumeagent": "Resuming subagent",
+    }
+    out = {
+        "action": action or "agent",
+        "display": labels.get(action_key, "Subagent activity"),
+    }
+    for key in ("prompt", "model", "reasoningEffort"):
+        if item.get(key):
+            out[key] = item.get(key)
+    receiver_ids = list(item.get("receiverThreadIds") or [])
+    if receiver_ids:
+        out["receiverThreadIds"] = receiver_ids
     return out
 
 
@@ -2775,6 +2802,7 @@ class ChatSession:
         self.cwd = cwd
         self.model = model or ""        # "" / "default" → codex config default
         self.display_model = _display_model(self.model)
+        self.service_tier = None
         self.mode = _sanitize_mode(mode)  # approval preset (see _mode_policy)
         effort_model = self.model if self.model and self.model != "default" else self.display_model
         self.effort = _sanitize_effort(effort, effort_model)   # reasoning effort (per-turn)
@@ -2881,6 +2909,7 @@ class ChatSession:
         if res is None:
             res = await self._request("thread/start", base)
         th = (res or {}).get("thread") or {}
+        self.service_tier = (res or {}).get("serviceTier") or "default"
         self.thread_id = th.get("id") or self.thread_id
         self.cc_id = self.thread_id
         meta_model = self.transcript_meta.get("model") if (not self.model or self.model == "default") else ""
@@ -3401,6 +3430,16 @@ class ChatSession:
             return                          # echoed locally by _echo_user
         if it == "agentMessage":
             if not started:
+                questions = item.get("questions") or []
+                if questions:
+                    self._aid += 1
+                    aid = "a%d" % self._aid
+                    raw = [{"id": str(n), "question": q.get("title") or "",
+                            "options": [{"label": o} for o in (q.get("options") or [])]}
+                           for n, q in enumerate(questions) if isinstance(q, dict)]
+                    self._req[aid] = {"kind": "async_input", "raw": raw}
+                    self._push([{"kind": "question", "aid": aid, "questions": raw,
+                                 "async": True}])
                 txt = item.get("text") or ""
                 if txt.strip():
                     if book.get("streamed"):
@@ -3509,15 +3548,15 @@ class ChatSession:
             self._update_subagents_from_collab(item)
             if started:
                 self._push([{"kind": "tool_use", "tool": "Agent",
-                             "input": {"tool": item.get("tool"), "prompt": item.get("prompt"),
-                                       "model": item.get("model"),
-                                       "reasoningEffort": item.get("reasoningEffort"),
-                                       "receiverThreadIds": item.get("receiverThreadIds") or []},
+                             "input": _collab_agent_input(item),
                              "toolId": iid}])
                 self._maybe_steer()
             else:
+                err = _txt(item.get("error")).strip()
+                if not err and item.get("status") == "failed":
+                    err = "Subagent operation failed"
                 self._push([{"kind": "tool_result", "toolId": iid,
-                                 "content": _cap(_txt(item.get("agentsStates")), RESULT_CAP),
+                                 "content": _cap(err, RESULT_CAP),
                                  "isError": item.get("status") == "failed",
                                  "status": item.get("status")}])
             return
@@ -3680,21 +3719,35 @@ class ChatSession:
                      "allow": bool(allow), "always": bool(allow and always)}])
 
     def resolve_answer(self, aid, answers):
-        meta = self._req.pop(aid, None)
-        self._pending.pop(aid, None)
+        meta = self._req.get(aid)
         if not meta:
             return
-        rpc = meta["rpc"]
+        if meta.get("kind") not in ("input", "async_input"):
+            return
         raw = meta.get("raw") or []
         picks = answers if isinstance(answers, list) else []
-        out = []
+        if any(v is not None and not isinstance(v, str) for v in picks):
+            return
+        if meta["kind"] == "async_input":
+            if not self.proc or self.ended or len(picks) != len(raw) or not all(picks):
+                return
+            text = "\n".join("%s: %s" % (q.get("question"), picks[n])
+                             for n, q in enumerate(raw))
+            self.send_user(text)
+            self._req.pop(aid, None)
+            self._push([{"kind": "question_resolved", "aid": aid, "answers": picks}])
+            return
+        self._req.pop(aid, None)
+        self._pending.pop(aid, None)
+        rpc = meta["rpc"]
+        out = {}
         for i, q in enumerate(raw):
             val = picks[i] if i < len(picks) else None
             if val:
-                out.append({"id": q.get("id"), "answers": [val]})
+                out[q["id"]] = {"answers": [val]}
         if not out:
             # dismissed → answer with empty selections (codex continues the turn)
-            self._send({"jsonrpc": "2.0", "id": rpc, "result": {"answers": []}})
+            self._send({"jsonrpc": "2.0", "id": rpc, "result": {"answers": {}}})
             self._push([{"kind": "question_resolved", "aid": aid, "answers": None}])
             return
         self._send({"jsonrpc": "2.0", "id": rpc, "result": {"answers": out}})
@@ -3859,6 +3912,8 @@ class ChatSession:
                   "approvalPolicy": ap, "sandboxPolicy": _sandbox_policy(sbx)}
         if self.effort:
             params["effort"] = self.effort
+        if self.service_tier is not None:
+            params["serviceTier"] = self.service_tier
         if self.model and self.model != "default":
             params["model"] = self.model
         async def _q():
@@ -3931,9 +3986,24 @@ class ChatSession:
     def _notice(self, text):
         self._emit({"type": "events", "events": [{"kind": "notice", "text": text}]})
 
+    def _emit_choices(self):
+        self._emit({"type": "events", "events": [{"kind": "settings",
+                    "model": self.model or "default", "display_model": self.display_model,
+                    "effort": self.effort, "serviceTier": self.service_tier}]})
+
+    def set_service_tier(self, tier):
+        spec = _model_catalog_entry(self.model if self.model != "default" else self.display_model) or {}
+        allowed = {"default"} | {t.get("id") for t in (spec.get("serviceTiers") or []) if isinstance(t, dict)}
+        if tier not in allowed:
+            self._notice("Speed unavailable for this model")
+            return
+        self.service_tier = tier
+        self._emit_choices()
+
     # ───────── live model / approval changes (per-turn in codex) ─────────
     def set_model(self, model):
         self.model = model or "default"
+        self.service_tier = "default"
         self.display_model = _display_model(self.model)
         previous_effort = self.effort
         effort_model = self.model if self.model != "default" else self.display_model
@@ -3943,6 +4013,7 @@ class ChatSession:
         suffix = (" · effort → %s (model default)" % self.effort
                   if self.effort != previous_effort else "")
         self._notice("⚙ model → %s%s (applies next turn)" % (self.model, suffix))
+        self._emit_choices()
 
     def set_effort(self, effort):
         effort_model = self.model if self.model != "default" else self.display_model
@@ -3953,6 +4024,7 @@ class ChatSession:
         if _valid_cc(self.cc_id):
             save_pref(self.cc_id, effort=effort)
         self._notice("⚙ effort → %s (applies next turn)" % effort)
+        self._emit_choices()
 
     def set_mode(self, mode):
         self.mode = _sanitize_mode(mode)
@@ -4134,6 +4206,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             return
         self.session = None
         ChatSocket.clients.add(self)
+        self._say({"type": "hello", "stamp": PAGE_STAMP})
         self._say({"type": "favorites", "favorites": list_favorites()})
         self._say({"type": "projects", "projects": project_tree()})
 
@@ -4186,7 +4259,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             self._say({"type": "started", "id": sid, "cwd": cwd,
                        "name": os.path.basename(cwd) or cwd,
                        "model": sess.model or "default", "display_model": sess.display_model,
-                       "mode": sess.mode, "effort": sess.effort,
+                       "mode": sess.mode, "effort": sess.effort, "serviceTier": sess.service_tier,
                        "activity": sess.last_activity,
                        "event_seq": sess.event_seq,
                        "subagents": sess.subagents_snapshot()})
@@ -4210,7 +4283,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "name": os.path.basename(sess.cwd) or sess.cwd, "cc": sess.cc_id,
                        "title": sess.title(), "ctx": sess.ctx, "usage": sess.usage,
                        "model": sess.model or "default", "display_model": sess.display_model,
-                       "mode": sess.mode,
+                       "mode": sess.mode, "serviceTier": sess.service_tier,
                        "busy": sess.busy, "ended": sess.ended, "events": events,
                        "events_delta": events_delta, "event_seq": sess.event_seq,
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
@@ -4259,7 +4332,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "name": os.path.basename(sess.cwd) or sess.cwd, "cc": sess.cc_id,
                        "title": sess.title(), "ctx": sess.ctx, "usage": sess.usage,
                        "model": sess.model or "default", "display_model": sess.display_model,
-                       "mode": sess.mode,
+                       "mode": sess.mode, "serviceTier": sess.service_tier,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
                        "events_delta": False, "event_seq": sess.event_seq,
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
@@ -4278,6 +4351,8 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             self.session.interrupt()
         elif mt == "set_model" and self.session:
             self.session.set_model(msg.get("model") or "")
+        elif mt == "set_service_tier" and self.session:
+            self.session.set_service_tier(msg.get("serviceTier"))
         elif mt == "set_mode" and self.session:
             self.session.set_mode(msg.get("mode") or "")
         elif mt == "configure":
@@ -4391,7 +4466,8 @@ class ConsoleHandler(AuthMixin, tornado.web.RequestHandler):
         if not self._ok_auth():
             return
         self.set_header("Cache-Control", "no-store")
-        self.write(CONSOLE_HTML.replace("__CODEX_CONSOLE_WEBFM_URL__", json.dumps(WEBFM_URL)))
+        self.write(CONSOLE_HTML.replace("__CODEX_CONSOLE_WEBFM_URL__", json.dumps(WEBFM_URL))
+                   .replace("__CODEX_CONSOLE_STAMP__", PAGE_STAMP))
 
 
 CONSOLE_HTML = r"""<!DOCTYPE html>
@@ -4482,6 +4558,12 @@ header input#cwd{flex:1;min-width:120px;display:none}
   border-radius:9px;box-shadow:0 2px 10px rgba(0,0,0,.28);user-select:none;cursor:pointer;
   font-size:13px;line-height:1.1;color:var(--fg);white-space:nowrap}
 #effort:hover{border-color:var(--acc);color:var(--acc)}
+.session-choices{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:6px;max-width:100%;min-width:0}
+.choicebtn{max-width:240px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:3px 9px;
+  border:1px solid var(--line);border-radius:8px;background:var(--bg3);color:var(--fg);font:12px var(--fmono);cursor:pointer}
+.choicebtn:disabled{opacity:.5;cursor:default}.choicebtn:hover{border-color:var(--acc)}
+#pageUpdate{width:100%;margin-bottom:6px;max-width:none;text-align:center;color:var(--acc)}
+#pageUpdate[hidden]{display:none}
 #thinking{flex:none;max-width:100%;padding:3px 12px;
   background:var(--bg3);border:1px solid var(--line);border-radius:9px;
   box-shadow:0 2px 10px rgba(0,0,0,.28);user-select:none}
@@ -5169,9 +5251,12 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     <div id="sessionTabs" role="tablist" aria-label="Open sessions" hidden></div>
     <div id="chat"><div class="plandock" id="planDock" hidden></div><div class="wrap" id="stream"></div></div>
     <div id="composer">
+      <button id="pageUpdate" class="choicebtn" type="button" hidden>Update available · Reload</button>
       <div class="pillrow">
         <div id="thinking"><div class="twrap"><span class="dot" id="dot"></span><span class="glyph">✶</span><span class="word">idle</span><span class="meta"></span></div></div>
-        <span id="effort" title="thinking effort — click to change">🧠 max</span>
+        <div class="session-choices"><button id="modelpill" class="choicebtn" type="button" title="Model for next turn">Model</button>
+        <button id="speedpill" class="choicebtn" type="button" title="Speed for next turn">Speed</button>
+        <span id="effort" title="thinking effort — click to change">🧠 max</span></div>
       </div>
       <div id="queue"></div>
       <div id="attach"></div>
@@ -5231,6 +5316,8 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 const $=s=>document.querySelector(s);
 const stream=$('#stream'), ta=$('#ta'), sendBtn=$('#send'), attachBtn=$('#attachBtn'), voiceBtn=$('#voiceBtn'), attachmentPicker=$('#attachmentPicker');
 let ws=null, running=false, ready=false, compacting=false, cwd='', tools={};
+const PAGE_STAMP='__CODEX_CONSOLE_STAMP__';
+let activeTier=null;
 let tokUp=0,tokOut=0,tokShow=false;   /* live streaming token counts shown in the pill */
 let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
 const FALLBACK_EFFORTS=['minimal','low','medium','high','xhigh'];
@@ -5358,8 +5445,14 @@ function diffHtml(t){return t.split('\n').map(l=>{let c='dl-ctx';
 let replaying=false;   /* true while bulk-replaying a session log on attach — suppresses
                           per-event atBottom/scroll so we don't force 1000s of reflows;
                           a single scroll-to-bottom runs once at the end instead. */
-function atBottom(){if(replaying)return false;const c=$('#chat');return c.scrollHeight-c.scrollTop-c.clientHeight<140;}
-function scroll(){if(replaying)return;const c=$('#chat');c.scrollTop=c.scrollHeight;}
+let follow=true,autoTop=0;
+function atBottom(){return !replaying&&follow;}
+function setChatTop(y,f){const c=$('#chat');c.scrollTop=y;autoTop=c.scrollTop;follow=f;}
+function scroll(){if(replaying)return;setChatTop($('#chat').scrollHeight,true);}
+(()=>{const c=$('#chat');let prev=c.scrollTop;
+  c.addEventListener('wheel',e=>{if(e.deltaY<0&&c.scrollTop>0)follow=false;},{passive:true});
+  c.addEventListener('scroll',()=>{const top=c.scrollTop,gap=c.scrollHeight-top-c.clientHeight;
+    if(top<autoTop-1&&gap>2)follow=false;else if(top>prev&&gap<140)follow=true;prev=top;},{passive:true});})();
 
 const ICON={Edit:'✏️',MultiEdit:'✏️',Write:'📝',Bash:'▶',Read:'📖',List:'📂',Search:'🔍',
   Glob:'🔍',Grep:'🔍',Task:'🤖',Agent:'🤖',ViewImage:'🖼',ImageGeneration:'🖼',
@@ -5386,6 +5479,12 @@ function toolBody(ev){const i=ev.input||{},t=ev.tool;
   if(t==='apply_patch'&&typeof i.diff==='string')return diffHtml(i.diff);   /* codex: render the unified diff directly */
   if(t==='Edit'&&i.old_string!==undefined)return diffHtml(i.old_string.split('\n').map(x=>'-'+x).join('\n')+'\n'+i.new_string.split('\n').map(x=>'+'+x).join('\n'));
   if(t==='Write'&&i.content!==undefined)return '<div class="reslabel">new file content</div>'+diffHtml(i.content.split('\n').map(x=>'+'+x).join('\n'));
+  if(t==='Agent'){
+    const meta=[];if(i.model)meta.push(i.model);if(i.reasoningEffort)meta.push(i.reasoningEffort+' effort');
+    if(Array.isArray(i.receiverThreadIds)&&i.receiverThreadIds.length)meta.push(i.receiverThreadIds.length+' target'+(i.receiverThreadIds.length===1?'':'s'));
+    let h='<div class="reslabel">'+esc(i.display||'Subagent activity')+'</div>';
+    if(meta.length)h+='<div class="progress">'+esc(meta.join(' · '))+'</div>';
+    if(i.prompt)h+='<pre><code>'+esc(clipOut(i.prompt))+'</code></pre>';return h;}
   if(t==='web_search'){
     const act=i.action||'search';
     if(act==='search')return '<div class="reslabel">search</div><pre><code>'+
@@ -5424,7 +5523,7 @@ function trimChatWindow(force){if(replaying&&!force)return;if(windowTrimT){clear
     if(_mathObs)el.querySelectorAll('.math').forEach(node=>_mathObs.unobserve(node));
     chars-=n;removedChars+=n;removed++;el.remove();}
   if(removed){windowHidden+=removed;windowHiddenChars+=removedChars;renderWindowMarker();sweepWindowRefs();
-    const lost=Math.max(0,beforeHeight-chat.scrollHeight);if(stick)scroll();else chat.scrollTop=Math.max(0,beforeTop-lost);}
+    const lost=Math.max(0,beforeHeight-chat.scrollHeight);if(stick)scroll();else setChatTop(Math.max(0,beforeTop-lost),false);}
   else renderWindowMarker();}
 function scheduleChatWindowTrim(){if(replaying||windowTrimT)return;
   windowTrimT=setTimeout(()=>trimChatWindow(false),120);}
@@ -5695,7 +5794,8 @@ function addTurnDiff(ev){if(!ev.diff)return;const id=ev.turnId||'turn-current';l
   c.querySelector('.ed').innerHTML=diffHtml(ev.diff);
   if(!replaying){const ed=$('#edits');ed.scrollTop=ed.scrollHeight;}}
 function applySettings(ev){if(ev.display_model||ev.model){activeModel=(ev.model&&ev.model!=='default')?ev.model:(ev.display_model||activeModel);setResolvedModel(ev.display_model||ev.model);}
-  if(ev.effort)setEffortPill(ev.effort);if(ev.cwd){cwd=ev.cwd;bindProject(cwd);}}
+  if(Object.prototype.hasOwnProperty.call(ev,'serviceTier'))activeTier=ev.serviceTier;
+  if(ev.effort)setEffortPill(ev.effort);renderSessionChoices();if(ev.cwd){cwd=ev.cwd;bindProject(cwd);}}
 function applyThreadStatus(ev){const st=(''+(ev.status||'')).toLowerCase();
   if(st==='active')setBusy(true);else if(st==='idle'||st==='notloaded')setBusy(false);}
 function addModelReroute(ev){if(ev.to){activeModel=ev.to;setResolvedModel(ev.to);}
@@ -5710,7 +5810,7 @@ function bindProject(p){if(!p)return;const sel=$('#project');let ok=false;
   for(const o of sel.options){if(o.value===p){ok=true;break;}}
   if(!ok){const o=document.createElement('option');o.value=p;o.textContent='● '+p.split('/').slice(-2).join('/');sel.insertBefore(o,sel.firstChild);}
   sel.value=p;}
-function setComposerEnabled(on){ta.disabled=!on;syncVoiceComposerState();syncVoiceButton();}
+function setComposerEnabled(on){ta.disabled=!on;syncVoiceComposerState();syncVoiceButton();renderSessionChoices();}
 function setBusy(b,wordSeed,elapsedMs){running=b;$('#dot').className='dot '+(b?'busy':(ready?'on':''));
   setSessionTabBusy(sid,b);
   $('#thinking').classList.toggle('busy',b);
@@ -5843,7 +5943,7 @@ function qval(bl){const other=bl.querySelector('.qother').value.trim();
   if(other)return other;
   return [...bl.querySelectorAll('.qopt.sel')].map(x=>x.dataset.label).join(', ');}
 function addQuestion(ev){const c=document.createElement('div');c.className='question';c.dataset.aid=ev.aid;
-  const qs=ev.questions||[];let h='<div class="qh">❓ <b>Question'+(qs.length>1?'s':'')+'</b></div>';
+  const qs=ev.questions||[];let h='<div class="qh">❓ <b>Question'+(qs.length>1?'s':'')+'</b>'+(ev.async?' · answer when ready':'')+'</div>';
   qs.forEach((q,qi)=>{h+='<div class="qblk" data-qi="'+qi+'"'+(q.multiSelect?' data-multi="1"':'')+'>'+
     '<div class="qtext">'+(q.header?'<span class="chip">'+esc(q.header)+'</span>':'')+esc(q.question||('Question '+(qi+1)))+'</div>'+
     '<div class="qopts">';
@@ -5860,7 +5960,8 @@ function addQuestion(ev){const c=document.createElement('div');c.className='ques
       refresh();};});
     bl.querySelector('.qother').oninput=refresh;});
   sub.onclick=()=>{const picks=qs.map((q,qi)=>qval(c.querySelector('.qblk[data-qi="'+qi+'"]')));
-    wsSend({type:'answer',aid:ev.aid,answers:picks});resolveQuestionCard(ev.aid,picks);};
+    if(!ws||ws.readyState!==1)return;
+    wsSend({type:'answer',aid:ev.aid,answers:picks});};
   stream.appendChild(c);scroll();}
 function resolveQuestionCard(aid,ans){const c=stream.querySelector('.question[data-aid="'+aid+'"]');
   if(!c||c.classList.contains('done'))return;c.classList.add('done');
@@ -5924,6 +6025,8 @@ function route(ev){const seq=Number(ev&&ev._seq||0),tab=sessionTabById(sid);
 function markEnded(msg){ready=false;setComposerEnabled(false);$('#dot').className='dot';statset('ended');
   localStorage.removeItem(SKEY);if(msg)addNotice(msg);}
 function onMsg(e){const m=JSON.parse(e.data);
+  if(m.type==='hello'){if(m.stamp&&m.stamp!==PAGE_STAMP)$('#pageUpdate').hidden=false;return;}
+  if(m.type==='started'||m.type==='attached')activeTier=m.serviceTier||null;
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);loadDraft(sid);
     activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');setEffortPill(m.effort);renderCtx(null);statset('ready');
     const startedTab=ensureSessionTab(m,true);planCollapsed=!!(startedTab&&startedTab.planCollapsed);
@@ -5995,7 +6098,7 @@ function stashSessionView(id){if(!id)return false;const t=sessionTabById(id);if(
     edits:takeChildren($('#edits')),git:takeChildren($('#gitc')),tools:tools,editCount:editCount,textItems:textItems,
     thinkItems:thinkItems,planItems:planItems,turnDiffCards:turnDiffCards,subagents:subagents,
     subagentCurrent:subagentCurrent,queued:queued,ctx:currentCtx,cwd:cwd,cc:curCC,model:activeModel,
-    effort:curEffort,ready:ready,running:running,compacting:compacting,word:lastWordSeed,
+    effort:curEffort,serviceTier:activeTier,ready:ready,running:running,compacting:compacting,word:lastWordSeed,
     windowHidden:windowHidden,windowHiddenChars:windowHiddenChars,planCollapsed:planCollapsed,
     elapsed:running?Math.max(0,Date.now()-thinkStart):0,tokUp:tokUp,tokOut:tokOut,tokShow:tokShow,
     title:$('#curname').textContent||t.title||'session'});
@@ -6008,7 +6111,7 @@ function restoreSessionView(id){const v=sessionViewCache.get(id);if(!v)return fa
   subagentCurrent=v.subagentCurrent||'';queued=v.queued||{};cwd=v.cwd||'';curCC=v.cc||null;
   windowHidden=Number(v.windowHidden||0);windowHiddenChars=Number(v.windowHiddenChars||0);
   planCollapsed=!!v.planCollapsed;
-  activeModel=v.model||'default';tokUp=v.tokUp||0;tokOut=v.tokOut||0;tokShow=!!v.tokShow;
+  activeModel=v.model||'default';activeTier=v.serviceTier||null;tokUp=v.tokUp||0;tokOut=v.tokOut||0;tokShow=!!v.tokShow;
   ready=!!v.ready;compacting=!!v.compacting;bindProject(cwd);setCurname(v.title);renderCtx(v.ctx);setEffortPill(v.effort);
   updateEditBadge();renderQueue();renderSubagentBadge();renderSubagents();running=false;setBusy(!!v.running,v.word,v.elapsed);
   loadDraft(id);restoreSessionTabView(id);restoredViewId=id;return true;}
@@ -6028,7 +6131,8 @@ function renderSessionTabs(){const host=$('#sessionTabs');if(!host)return;
     const close=document.createElement('button');close.type='button';close.className='stab-close';close.textContent='×';
     close.title='Close tab';close.setAttribute('aria-label','Close '+(t.title||'session')+' tab');
     close.onclick=ev=>{ev.stopPropagation();closeSessionTab(t.id);};wrap.append(main,close);host.appendChild(wrap);});
-  const current=host.querySelector('.stab.active');if(current)current.scrollIntoView({block:'nearest',inline:'nearest'});}
+  const current=host.querySelector('.stab.active');if(current){const h=host.getBoundingClientRect(),r=current.getBoundingClientRect();
+    if(r.left<h.left)host.scrollLeft-=h.left-r.left;else if(r.right>h.right)host.scrollLeft+=r.right-h.right;}}
 function ensureSessionTab(s,active){if(!s||!s.id)return null;let t=sessionTabById(s.id);
   if(!t){t={id:s.id,cc:s.cc||null,title:s.title||s.name||'session',cwd:s.cwd||'',
     busy:!!s.busy,ended:!!s.ended,activity:Number(s.activity||0),serverSeq:Number(s.event_seq||0),lastSeq:0,
@@ -6046,10 +6150,10 @@ function syncSessionTabs(list){const by=new Map((list||[]).map(s=>[s.id,s]));
     t.busy=!!s.busy;t.ended=!!s.ended;t.activity=next;t.serverSeq=serverSeq;if(t.id===sid){t.unread=false;t.seenActivity=next;}});
   tabsValidated=true;persistSessionTabs();renderSessionTabs();}
 function rememberActiveTabView(){const t=sessionTabById(sid),chat=$('#chat');if(!t||!chat)return;
-  t.scrollTop=chat.scrollTop;t.atBottom=chat.scrollHeight-chat.scrollTop-chat.clientHeight<140;t.visited=true;persistSessionTabs();}
+  t.scrollTop=chat.scrollTop;t.atBottom=follow;t.visited=true;persistSessionTabs();}
 function restoreSessionTabView(id){const t=sessionTabById(id),chat=$('#chat');
-  if(t&&t.visited&&!t.atBottom){const y=Math.max(0,Number(t.scrollTop||0));chat.scrollTop=Math.min(y,Math.max(0,chat.scrollHeight-chat.clientHeight));
-    requestAnimationFrame(()=>{chat.scrollTop=Math.min(y,Math.max(0,chat.scrollHeight-chat.clientHeight));});}
+  if(t&&t.visited&&!t.atBottom){const y=Math.max(0,Number(t.scrollTop||0));setChatTop(y,false);
+    requestAnimationFrame(()=>{setChatTop(y,false);});}
   else{scroll();requestAnimationFrame(scroll);}}
 function setSessionTabBusy(id,busy){const t=sessionTabById(id);if(!t||t.busy===!!busy)return;t.busy=!!busy;persistSessionTabs();renderSessionTabs();}
 function renameSessionTabs(cc,title){if(!cc||!title)return;let changed=false;sessionTabState.forEach(t=>{if(t.cc===cc){t.title=title;
@@ -6128,7 +6232,7 @@ function retryModelLoad(){if(MODELS.length)return;clearTimeout(modelRetryT);
 function loadModels(force){return fetch('api/models'+(force?'?fresh=1':''),{cache:'no-store'}).then(r=>r.json()).then(j=>{
   if(j.models&&j.models.length){clearTimeout(modelRetryT);DEFAULT_MODEL_ID=j.defaultModel||'';MODELS=j.models;rebuildModelPicker();
     if(!sid||!ready){curEffort=effortForModel(curEffort,$('#model').value);
-      localStorage.setItem('al_effort',curEffort);setEffortPill(curEffort);}}
+      localStorage.setItem('al_effort',curEffort);setEffortPill(curEffort);}renderSessionChoices();}
   else retryModelLoad();}).catch(retryModelLoad);}
 /* Per-model effort capabilities come from model/list. The fallback is used only
    before that catalog arrives (or for a retired/custom model absent from it). */
@@ -6144,7 +6248,26 @@ function effortForModel(e,modelValue){const opts=effortOptionsFor(modelValue);if
 function currentEffortModel(){return sid&&ready?activeModel:($('#model').value||'default');}
 /* reasoning effort is per-turn. A change applies to the next turn and is also
    remembered as the starting preference for future sessions. */
-function setEffortPill(e){if(e)curEffort=e;const el=$('#effort');if(el)el.textContent='🧠 '+curEffort;}
+function setEffortPill(e){if(e)curEffort=e;const el=$('#effort');if(el)el.textContent='🧠 '+curEffort;renderSessionChoices();}
+function renderSessionChoices(){const m=modelMeta(activeModel),b=$('#modelpill'),s=$('#speedpill');if(!b||!s)return;
+  b.textContent=m&&m.name||activeModel||'Model';b.title='Model for next turn: '+(activeModel||'default');b.disabled=!sid||!ready;
+  const tiers=speedOptions(m),tier=tiers.find(t=>t.id===(activeTier||(m&&m.defaultServiceTier)||'default'));
+  s.textContent=tier?tier.name:'Speed: inherited';s.disabled=!sid||!ready||tiers.length<2;
+  s.title=tier?tier.description:'Uses the Codex configured speed';}
+function speedOptions(m){return [{id:'default',name:'Standard',description:'Standard speed'},
+  ...((m&&m.serviceTiers)||[]).filter(t=>t.id!=='default')];}
+$('#modelpill').onclick=ev=>{ev.stopPropagation();toggleCardMenu(ev.currentTarget,MODELS.map(m=>({
+  label:(m.id===activeModel?'● ':'')+m.name,fn:()=>wsSend({type:'set_model',model:m.id})})));};
+$('#speedpill').onclick=ev=>{ev.stopPropagation();const m=modelMeta(activeModel);if(!m)return;
+  toggleCardMenu(ev.currentTarget,speedOptions(m).map(t=>({label:((activeTier||m.defaultServiceTier||'default')===t.id?'● ':'')+t.name,
+    fn:()=>wsSend({type:'set_service_tier',serviceTier:t.id})})));};
+$('#pageUpdate').onclick=()=>{if(voiceJob){$('#pageUpdate').textContent='Finish recording before reloading';return;}
+  saveDraft();
+  if(pendingImages.length||pendingFiles.length||Object.values(drafts).some(d=>(d.images||[]).length||(d.files||[]).length)){
+    $('#pageUpdate').textContent='Send or remove draft attachments before reloading';return;}
+  try{const saved=JSON.parse(localStorage.getItem(DKEY)||'{}');
+    if(Object.entries(drafts).some(([k,d])=>d.text&&d.text.trim()&&saved[k]!==d.text))throw new Error('draft not saved');
+    location.reload();}catch(e){$('#pageUpdate').textContent='Draft could not be saved; reload cancelled';}};
 function setEffort(e){if(!effortOptionsFor(currentEffortModel()).includes(e)||e===curEffort)return;
   curEffort=e;localStorage.setItem('al_effort',e);setEffortPill(e);
   if(sid&&ready&&ws&&ws.readyState===1)wsSend({type:'set_effort',effort:e});}   /* applies next turn */
@@ -6164,7 +6287,7 @@ function modelLabel(real,maxTok){
 /* the sidebar #model picker now holds the NEW-session default, so it no longer
    reflects the live session's resolved model (that moved to ⚙ Configure). Kept
    as a no-op shim so existing callers (ready / context) stay valid. */
-function setResolvedModel(real,maxTok){if(real)_rmodel=real;if(maxTok)_rmax=maxTok;}
+function setResolvedModel(real,maxTok){if(real)_rmodel=real;if(maxTok)_rmax=maxTok;renderSessionChoices();}
 
 /* sidebar: live sessions (in-RAM) + resume-from-disk (past transcripts) */
 /* shared per-card action menu (⋯): a fixed popover anchored to the clicked
@@ -7106,6 +7229,7 @@ openWs();
 </body>
 </html>"""
 
+PAGE_STAMP = hashlib.sha256(CONSOLE_HTML.encode("utf-8")).hexdigest()[:16]
 
 def _recap_tick():
     """Periodic sweep: any session idle past the threshold gets a one-line recap,

@@ -38,7 +38,9 @@ class ModelCatalogTests(unittest.TestCase):
                              "description": "new", "hidden": False, "isDefault": True,
                              "supportedReasoningEfforts": [
                                  {"reasoningEffort": "high", "description": "deep"}],
-                             "defaultReasoningEffort": "high"},
+                             "defaultReasoningEffort": "high",
+                             "serviceTiers": [{"id": "priority", "name": "Fast", "description": "More usage"}],
+                             "defaultServiceTier": None},
                             {"id": "hidden", "model": "gpt-hidden", "displayName": "Hidden",
                              "hidden": True, "isDefault": False,
                              "supportedReasoningEfforts": [], "defaultReasoningEffort": "low"},
@@ -69,6 +71,9 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(models[0]["name"], "GPT New")
         self.assertTrue(models[0]["isDefault"])
         self.assertEqual(models[0]["reasoningEfforts"], ["high"])
+        self.assertEqual(models[0]["serviceTiers"][0]["id"], "priority")
+        self.assertIsNone(models[0]["defaultServiceTier"])
+        self.assertEqual(models[1]["serviceTiers"], [])
 
     def test_fetch_models_keeps_last_good_catalog_on_refresh_failure(self):
         catalog = [{"id": "gpt-new", "name": "GPT New", "isDefault": True}]

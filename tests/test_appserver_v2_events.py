@@ -1,6 +1,7 @@
 import inspect
 import os
 import unittest
+from unittest import mock
 
 import codex_console
 
@@ -20,6 +21,54 @@ def _emitted_events(messages):
 
 
 class AppServerV2EventTests(unittest.TestCase):
+    def test_question_answers_use_id_keyed_protocol_object(self):
+        session, _ = _session()
+        sent = []
+        session._send = sent.append
+        session._on_request(17, "item/tool/requestUserInput", {
+            "questions": [{"id": "scope", "question": "Which scope?", "options": []}]})
+        aid = session.log[-1]["aid"]
+        session.resolve_answer(aid, ["local"])
+        self.assertEqual(sent[-1]["result"], {"answers": {"scope": {"answers": ["local"]}}})
+        session._on_request(18, "item/tool/requestUserInput", {
+            "questions": [{"id": "scope", "question": "Which scope?"}]})
+        session.resolve_answer(session.log[-1]["aid"], [])
+        self.assertEqual(sent[-1]["result"], {"answers": {}})
+
+    def test_async_question_without_text_is_visible_and_answered_once(self):
+        session, _ = _session()
+        session.proc = object()
+        item = {"type": "agentMessage", "id": "async-1", "text": "",
+                "questions": [{"title": "Preferred scope?", "options": ["local", "all"]}]}
+        session._on_item(item, started=True)
+        session._on_item(item, started=False)
+        session._on_item(item, started=False)
+        events = [e for e in session.log if e["kind"] == "question"]
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0]["async"])
+        self.assertEqual(events[0]["questions"][0]["options"][0]["label"], "local")
+        with mock.patch.object(session, "send_user") as send:
+            session.resolve_answer(events[0]["aid"], ["local"])
+            session.resolve_answer(events[0]["aid"], ["all"])
+        send.assert_called_once_with("Preferred scope?: local")
+
+    def test_speed_selection_validates_catalog_and_reaches_next_turn(self):
+        session, _ = _session()
+        spec = {"id": "test-model", "serviceTiers": [{"id": "default"}, {"id": "fast"}]}
+        with mock.patch.object(codex_console, "_model_catalog_entry", return_value=spec):
+            session.set_service_tier("invalid")
+            self.assertIsNone(session.service_tier)
+            session.set_service_tier("fast")
+        calls = []
+        with mock.patch.object(codex_console.tornado.ioloop.IOLoop, "current") as loop:
+            loop.return_value.spawn_callback.side_effect = calls.append
+            session._dispatch("hello", [])
+        request = mock.AsyncMock(return_value={"turn": {"id": "t1"}})
+        with mock.patch.object(session, "_request", request):
+            import asyncio
+            asyncio.run(calls[0]())
+        self.assertEqual(request.call_args.args[1]["serviceTier"], "fast")
+
     def test_streamed_agent_message_is_updated_not_duplicated_on_completion(self):
         session, _ = _session()
 
@@ -215,6 +264,38 @@ class AppServerV2EventTests(unittest.TestCase):
         self.assertEqual(snap[0]["message"], "reading files")
         self.assertIn("subagents", [e["kind"] for e in _emitted_events(emitted)])
         self.assertEqual(session.log[-1]["tool"], "Agent")
+        self.assertEqual(session.log[-1]["input"]["display"], "Starting subagent")
+        self.assertEqual(session.log[-1]["input"]["action"], "spawn_agent")
+
+    def test_collab_agent_wait_uses_semantic_input_without_empty_protocol_fields(self):
+        session, _ = _session()
+        item = {
+            "type": "collabAgentToolCall",
+            "id": "agent-wait-1",
+            "tool": "wait",
+            "status": "running",
+            "receiverThreadIds": [],
+            "prompt": None,
+            "model": None,
+            "reasoningEffort": None,
+        }
+
+        session._on_note("item/started", {"item": item})
+        use = session.log[-1]
+
+        self.assertEqual(use["tool"], "Agent")
+        self.assertEqual(use["input"], {
+            "action": "wait",
+            "display": "Waiting for subagents",
+        })
+
+        session._on_note("item/completed", {
+            "item": {**item, "status": "completed", "agentsStates": {}},
+        })
+        result = session.log[-1]
+        self.assertEqual(result["kind"], "tool_result")
+        self.assertEqual(result["content"], "")
+        self.assertFalse(result["isError"])
 
     def test_subagent_activity_dedupes_and_marks_completed(self):
         session, _ = _session()
@@ -300,6 +381,8 @@ class AppServerV2EventTests(unittest.TestCase):
         self.assertIn("addSubagentMarker", html)
         self.assertIn("el.onclick=ev=>{ev.stopPropagation();subagentCurrent", html)
         self.assertIn("const path=e.composedPath?e.composedPath():[]", html)
+        self.assertIn("if(t==='Agent'){", html)
+        self.assertIn("i.display||'Subagent activity'", html)
 
     def test_frontend_plan_is_pinned_and_updates_in_place(self):
         html = codex_console.CONSOLE_HTML

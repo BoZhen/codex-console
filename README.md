@@ -27,15 +27,17 @@ plans, file changes, and session state in one interface.
   after all tasks complete.
 - **Subagents panel** with child-agent status and messages separated from the
   main transcript.
-- **Approvals and questions** rendered as interactive browser controls.
+- **Approvals and questions**, including non-blocking questions, rendered as
+  interactive browser controls.
 - **Queued messages and steering** while a turn is running.
 - **Image, text, and code attachments** from desktop or mobile. Images can also
   be pasted from the clipboard. Text and code files are sent as bounded,
   filename-labelled text input.
 - **Optional local voice input** with live transcription and final correction
   before sending.
-- **Live model catalog and reasoning effort controls** from the installed Codex
-  app-server.
+- **Model, reasoning effort, and speed controls** from the installed Codex
+  app-server, applied to the next turn.
+- **Page update notification** with draft-preserving reload.
 - **Context and rate-limit meters** from app-server usage events.
 - **Local `/status` and `/compact` commands**.
 - **Optional idle recap cards** generated after a configurable quiet period.
