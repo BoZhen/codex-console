@@ -27,8 +27,9 @@ plans, file changes, and session state in one interface.
   after all tasks complete.
 - **Subagents panel** with child-agent status and messages separated from the
   main transcript.
-- **Approvals and questions**, including non-blocking questions, rendered as
-  interactive browser controls.
+- **Expandable Agent cards** with current activity and recent child messages.
+- **Background terminals** with a command list and individual stop controls.
+- **Approvals and questions** rendered as interactive browser controls.
 - **Queued messages and steering** while a turn is running.
 - **Image, text, and code attachments** from desktop or mobile. Images can also
   be pasted from the clipboard. Text and code files are sent as bounded,
@@ -50,6 +51,7 @@ plans, file changes, and session state in one interface.
 - Python 3
 - [Tornado](https://www.tornadoweb.org/)
 - An installed and authenticated OpenAI Codex CLI
+- `zstd` on PATH for reading compressed `.jsonl.zst` history (plain JSONL needs no extra dependency)
 
 Install the Python dependency:
 

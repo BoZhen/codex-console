@@ -18,6 +18,10 @@ import asyncio
 import base64
 import glob
 import hashlib
+import io
+from contextlib import contextmanager
+from collections import deque
+from datetime import datetime
 import json
 import os
 import queue
@@ -41,6 +45,8 @@ import tornado.iostream
 import tornado.process
 import tornado.web
 import tornado.websocket
+
+from context_usage import read_context_usage
 
 # This build drives the real `codex` CLI through its `codex app-server` JSON-RPC
 # protocol (the same backend editor integrations use). No Python SDK needed —
@@ -1176,10 +1182,52 @@ def _peek_claude(path):
     return cwd, branch, title
 
 
+def _rollout_paths():
+    plain = glob.glob(os.path.join(CODEX_ROOT, "**", "*.jsonl"), recursive=True)
+    compressed = glob.glob(os.path.join(CODEX_ROOT, "**", "*.jsonl.zst"), recursive=True)
+    seen = set(plain)
+    return plain + [p for p in compressed if p[:-4] not in seen]
+
+
+@contextmanager
+def _open_rollout(path, binary=False):
+    """Stream either rollout representation without materializing private history."""
+    plain = str(path).removesuffix(".zst")
+    actual = plain if os.path.isfile(plain) else plain + ".zst"
+    if not actual.endswith(".zst"):
+        with open(actual, "rb") as source:
+            if binary:
+                yield source
+            else:
+                with io.TextIOWrapper(source, encoding="utf-8", errors="replace") as text:
+                    yield text
+        return
+    executable = shutil.which("zstd")
+    if not executable:
+        raise RuntimeError("Reading compressed Codex history requires the zstd command")
+    proc = subprocess.Popen([executable, "-dc", "--", actual], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL)
+    try:
+        if binary:
+            yield proc.stdout
+            if not proc.stdout.peek(1) and proc.wait() != 0:
+                raise OSError("Invalid compressed rollout")
+        else:
+            with io.TextIOWrapper(proc.stdout, encoding="utf-8", errors="replace") as text:
+                yield text
+                if not proc.stdout.peek(1) and proc.wait() != 0:
+                    raise OSError("Invalid compressed rollout")
+    finally:
+        proc.stdout.close()
+        if proc.poll() is None:
+            proc.terminate()
+        proc.wait()
+
+
 def _peek_codex(path):
     cwd, branch, title, is_subagent = "", "", "", False
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        with _open_rollout(path) as f:
             for i, line in enumerate(f):
                 if i > 150:
                     break
@@ -1219,7 +1267,7 @@ def _peek_codex(path):
 
 def list_sessions(limit=50):
     items = []
-    codex_files = glob.glob(os.path.join(CODEX_ROOT, "**", "*.jsonl"), recursive=True)
+    codex_files = _rollout_paths()
     paths = [(p, "codex") for p in codex_files]
     try:
         paths.sort(key=lambda pc: os.path.getmtime(pc[0]), reverse=True)
@@ -1285,11 +1333,7 @@ def find_transcript(cc):
     `rollout-<ts>-<threadId>.jsonl` under ~/.codex/sessions/YYYY/MM/DD/."""
     if not _valid_cc(cc):
         return None
-    hits = glob.glob(os.path.join(CODEX_ROOT, "**", "rollout-*-" + cc + ".jsonl"),
-                     recursive=True)
-    if not hits:   # fall back to a looser match (id embedded anywhere in the name)
-        hits = glob.glob(os.path.join(CODEX_ROOT, "**", "*" + cc + "*.jsonl"),
-                         recursive=True)
+    hits = [p for p in _rollout_paths() if _codex_cc_from_path(p) == cc]
     return hits[0] if hits else None
 
 
@@ -1302,8 +1346,10 @@ def trash_transcript(cc):
     path = find_transcript(cc)
     if not path:
         return {"ok": False, "error": "transcript not found"}
+    plain = path.removesuffix(".zst")
+    paths = [p for p in (plain, plain + ".zst") if os.path.isfile(p)]
     try:
-        subprocess.run(["gio", "trash", path], check=True,
+        subprocess.run(["gio", "trash", *paths], check=True,
                        capture_output=True, timeout=10)
         return {"ok": True}
     except FileNotFoundError:
@@ -1314,7 +1360,8 @@ def trash_transcript(cc):
     except Exception as ex:
         return {"ok": False, "error": str(ex)}
     try:
-        os.rename(path, "%s.trashed-%d" % (path, int(time.time())))
+        for path in paths:
+            os.rename(path, "%s.trashed-%d" % (path, int(time.time())))
         return {"ok": True}
     except Exception as ex:
         return {"ok": False, "error": str(ex)}
@@ -1728,7 +1775,7 @@ def reindex():
                  in db.execute("SELECT fid, path, off FROM files")}
         added = 0
         alive = set()
-        paths = glob.glob(os.path.join(CODEX_ROOT, "**", "*.jsonl"), recursive=True)
+        paths = _rollout_paths()
         for path in paths:
             cwd, _branch, title, is_subagent = _peek_codex(path)
             if is_subagent:
@@ -1739,40 +1786,39 @@ def reindex():
             except OSError:
                 continue
             fid, off = known.get(path, (None, 0))
+            compressed = path.endswith(".zst")
+            if compressed and fid is not None and sz != off:
+                db.execute("DELETE FROM msgs WHERE fid=?", (fid,))
+                off = 0
             if fid is not None and sz < off:
                 db.execute("DELETE FROM msgs WHERE fid=?", (fid,))
                 off = 0
             if fid is not None and sz == off:
                 continue
+            cc = _codex_cc_from_path(path)
+            rows, consumed = [], 0
             try:
-                with open(path, "rb") as f:
-                    f.seek(off)
-                    data = f.read()
+                with _open_rollout(path, binary=True) as f:
+                    if not compressed:
+                        f.seek(off)
+                    for raw in f:
+                        if not raw.endswith(b"\n"):
+                            break
+                        line_start = off + consumed
+                        consumed += len(raw)
+                        try:
+                            rec = json.loads(raw)
+                        except (ValueError, UnicodeError):
+                            continue
+                        m_cc, m_cwd, _m_ts = _rollout_meta_from_record(rec)
+                        cc, cwd = m_cc or cc, m_cwd or cwd
+                        ts = rec.get("timestamp") or ""
+                        for seq, (role, txt) in enumerate(_searchable_codex_record(rec, line_start)):
+                            rows.append(("%d:%d" % (line_start, seq), ts, role, txt))
             except OSError:
                 continue
-            cut = data.rfind(b"\n")
-            if cut < 0:
+            if not consumed:
                 continue
-            chunk, consumed = data[:cut + 1], cut + 1
-            cc = _codex_cc_from_path(path)
-            rows = []
-            pos = 0
-            for raw in chunk.splitlines(True):
-                line_start = off + pos
-                pos += len(raw)
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line.decode("utf-8", "replace"))
-                except Exception:
-                    continue
-                m_cc, m_cwd, _m_ts = _rollout_meta_from_record(rec)
-                cc = m_cc or cc
-                cwd = m_cwd or cwd
-                ts = rec.get("timestamp") or ""
-                for seq, (role, txt) in enumerate(_searchable_codex_record(rec, line_start)):
-                    rows.append(("%d:%d" % (line_start, seq), ts, role, txt))
             if fid is None:
                 cur = db.execute(
                     "INSERT INTO files(path, off, cc, cwd, title) VALUES(?,?,?,?,?)",
@@ -1789,7 +1835,7 @@ def reindex():
                     "INSERT OR IGNORE INTO msgs(fid, uid, ts, role, txt) VALUES(?,?,?,?,?)",
                     [(fid, uid, ts, role, txt) for uid, ts, role, txt in rows])
                 added += db.total_changes - before
-            db.execute("UPDATE files SET off=? WHERE fid=?", (off + consumed, fid))
+            db.execute("UPDATE files SET off=? WHERE fid=?", (sz if compressed else off + consumed, fid))
         for path, (fid, _off) in known.items():
             if path not in alive:
                 db.execute("DELETE FROM msgs WHERE fid=?", (fid,))
@@ -1946,16 +1992,29 @@ def load_transcript_events(cc, cap=1000):
     path = find_transcript(cc)
     if not path:
         return []
-    evs = []
+    evs = deque(maxlen=cap)
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        with _open_rollout(path) as f:
             for i, line in enumerate(f):
                 line = line.strip()
                 if line:
                     evs.extend(parse_line(line, i, "codex"))
     except Exception:
         pass
-    return evs[-cap:] if len(evs) > cap else evs
+    return list(evs)
+
+
+def _record_time(record):
+    try:
+        return datetime.fromisoformat(record.get("timestamp", "").replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError, AttributeError):
+        return 0.0
+
+
+def _request_context(tokens, window):
+    return {"source": "request", "totalTokens": tokens, "maxTokens": window,
+            "reportedMaxTokens": window, "configuredMaxTokens": _configured_context_window(),
+            "percentage": round(tokens * 100.0 / window, 1)}
 
 
 def load_transcript_meta(cc):
@@ -1964,8 +2023,9 @@ def load_transcript_meta(cc):
     if not path:
         return {}
     meta = {}
+    usage_at = 0.0
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        with _open_rollout(path) as f:
             for line in f:
                 try:
                     rec = json.loads(line)
@@ -1976,25 +2036,32 @@ def load_transcript_meta(cc):
                     model = _txt(p.get("model")).strip()
                     effort = _txt(p.get("effort")).strip()
                     if model:
+                        if meta.get("model") and model != meta["model"]:
+                            meta["contextAfter"] = _record_time(rec)
+                            meta.pop("ctx", None)
                         meta["model"] = model
                     if effort:
                         meta["effort"] = effort
+                elif rec.get("type") == "compacted":
+                    meta["contextAfter"] = _record_time(rec)
+                    meta.pop("ctx", None)
                 elif rec.get("type") == "event_msg" and p.get("type") == "token_count":
                     info = p.get("info") or {}
                     last = _pick(info, "last_token_usage", "lastTokenUsage") or {}
                     mx = _pick(info, "model_context_window", "modelContextWindow")
                     cur = _pick(last, "input_tokens", "inputTokens", "total_tokens", "totalTokens")
                     if cur is not None and mx:
-                        meta["ctx"] = {"totalTokens": cur, "maxTokens": mx,
-                                       "reportedMaxTokens": mx,
-                                       "configuredMaxTokens": _configured_context_window(),
-                                       "percentage": round(cur * 100.0 / mx, 1)}
+                        meta["ctx"] = _request_context(cur, mx)
+                        usage_at = _record_time(rec)
                 elif rec.get("type") == "event_msg" and p.get("type") == "task_started":
                     mx = _pick(p, "model_context_window", "modelContextWindow")
                     if mx:
                         meta["reportedMaxTokens"] = mx
     except Exception:
         return meta
+    sample = read_context_usage(cc, max(meta.get("contextAfter", 0), usage_at - 2))
+    if sample:
+        meta["ctx"] = {**sample, "configuredMaxTokens": _configured_context_window()}
     if meta.get("ctx") and meta.get("model"):
         meta["ctx"]["model"] = meta["model"]
     return meta
@@ -2088,6 +2155,77 @@ def dir_complete(q, limit=500):
     else:
         fuzzy(); fs_complete()              # bare name → fuzzy projects + home entries
     return out[:limit], len(out) > limit
+
+
+def _directory_path(raw=""):
+    if raw is not None and not isinstance(raw, str):
+        raise ValueError("Invalid directory path")
+    raw = (raw or "~").strip()
+    if raw == "~" or raw.startswith("~/"):
+        raw = os.path.join(HOME, raw[2:]) if raw != "~" else HOME
+    elif not os.path.isabs(raw):
+        raw = os.path.join(HOME, raw)
+    path = safe_cwd(raw)
+    if not path:
+        raise ValueError("Choose an existing directory inside your home folder")
+    return path
+
+
+def browse_directories(raw="", hidden=False, limit=500):
+    """List one directory, without discovering repositories or changing projects."""
+    path = _directory_path(raw)
+    home = os.path.realpath(HOME)
+    folders = []
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.name.startswith(".") and not hidden:
+                    continue
+                try:
+                    target = safe_cwd(entry.path) if entry.is_dir() else None
+                except OSError:
+                    continue
+                if target:
+                    folders.append({"name": entry.name, "path": target})
+    except OSError as exc:
+        raise ValueError("Cannot read this directory") from exc
+    folders.sort(key=lambda row: (row["name"].casefold(), row["name"]))
+    return {"path": path, "parent": path if path == home else os.path.dirname(path),
+            "home": home, "folders": folders[:limit], "truncated": len(folders) > limit}
+
+
+def create_directory(parent, name):
+    if not isinstance(parent, str) or not parent.strip():
+        raise ValueError("Choose a parent directory")
+    if not isinstance(name, str):
+        raise ValueError("Enter a folder name")
+    name = name.strip()
+    if (not name or name in (".", "..") or "/" in name or "\\" in name
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in name)):
+        raise ValueError("Enter a single folder name, without path separators")
+    try:
+        if len(name.encode("utf-8")) > 255:
+            raise ValueError("Folder name is too long")
+    except UnicodeError as exc:
+        raise ValueError("Invalid folder name") from exc
+    path = _directory_path(parent)
+    home = os.path.realpath(HOME)
+    if os.mkdir not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"):
+        raise ValueError("Secure folder creation is unavailable on this platform")
+    # Anchor traversal at HOME and refuse symlinks changed since validation.
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(home, flags)
+    try:
+        for part in os.path.relpath(path, home).split(os.sep):
+            if part == ".":
+                continue
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        os.mkdir(name, mode=0o755, dir_fd=fd)
+    finally:
+        os.close(fd)
+    return {"path": os.path.join(path, name)}
 
 
 # ───────────────────────── git diff (ground truth) ─────────────────────────
@@ -2596,6 +2734,67 @@ class DirCompleteHandler(AuthMixin, tornado.web.RequestHandler):
         self.write(json.dumps({"dirs": dirs, "more": more}))
 
 
+class DirectoriesHandler(AuthMixin, tornado.web.RequestHandler):
+    async def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                None, browse_directories, self.get_argument("path", "~"),
+                self.get_argument("hidden", "0") == "1")
+        except ValueError as exc:
+            self.set_status(400)
+            self.write({"error": str(exc)})
+            return
+        self.write(result)
+
+    async def post(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "application/json")
+        origin = self.request.headers.get("Origin")
+        if origin:
+            try:
+                parsed = urllib.parse.urlsplit(origin)
+                same_origin = parsed.scheme in ("http", "https") and parsed.netloc.lower() == self.request.host.lower()
+            except ValueError:
+                same_origin = False
+            if not same_origin:
+                self.set_status(403)
+                self.write({"error": "Cross-origin folder creation is not allowed"})
+                return
+        if self.request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            self.set_status(415)
+            self.write({"error": "Expected a JSON request"})
+            return
+        if len(self.request.body) > 8192:
+            self.set_status(413)
+            self.write({"error": "Request is too large"})
+            return
+        try:
+            body = json.loads(self.request.body)
+            if not isinstance(body, dict):
+                raise ValueError("Invalid request")
+            result = await asyncio.get_running_loop().run_in_executor(
+                None, create_directory, body.get("path"), body.get("name"))
+        except ValueError as exc:
+            self.set_status(400)
+            self.write({"error": str(exc)})
+        except FileExistsError:
+            self.set_status(409)
+            self.write({"error": "A file or folder with that name already exists"})
+        except PermissionError:
+            self.set_status(403)
+            self.write({"error": "No permission to create a folder here"})
+        except OSError:
+            self.set_status(500)
+            self.write({"error": "Could not create the folder"})
+        else:
+            self.set_status(201)
+            self.write(result)
+
+
 class DiffHandler(AuthMixin, tornado.web.RequestHandler):
     def get(self):
         if not self._ok_auth():
@@ -2646,8 +2845,9 @@ class ExportHandler(AuthMixin, tornado.web.RequestHandler):
             return
         self.set_header("Content-Type", "application/x-ndjson")
         self.set_header("Content-Disposition", 'attachment; filename="%s.jsonl"' % cc)
-        self.set_header("Content-Length", str(os.path.getsize(path)))
-        with open(path, "rb") as f:
+        if not path.endswith(".zst"):
+            self.set_header("Content-Length", str(os.path.getsize(path)))
+        with _open_rollout(path, binary=True) as f:
             while True:
                 chunk = f.read(1 << 20)
                 if not chunk:
@@ -2820,6 +3020,10 @@ class ChatSession:
         self._req = {}                  # aid -> {"rpc": rpc_id, "kind": ..., "raw": ...}
         self._aid = 0
         self.ctx = None                 # latest context-window usage
+        self._request_ctx = None
+        self._context_after = 0.0       # reject samples from before a reset
+        self._context_turn_id = None
+        self._context_refresh_until = time.monotonic() + 10
         self.usage = None               # latest rolling rate-limit usage (5h + weekly)
         self.queue = []                 # messages typed while busy (steering)
         self._qid = 0
@@ -2856,6 +3060,7 @@ class ChatSession:
         """Populate history from the on-disk rollout before resuming."""
         if self.resume_cc:
             self.transcript_meta = load_transcript_meta(self.resume_cc)
+            self._context_after = self.transcript_meta.get("contextAfter", 0.0)
             if (not self.model or self.model == "default") and self.transcript_meta.get("model"):
                 self.display_model = self.transcript_meta["model"]
             if self.transcript_meta.get("ctx"):
@@ -2888,8 +3093,26 @@ class ChatSession:
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, cwd=self.cwd,
             limit=APPSERVER_STREAM_LIMIT)
-        tornado.ioloop.IOLoop.current().spawn_callback(self._reader)
-        tornado.ioloop.IOLoop.current().spawn_callback(self._stderr_reader)
+        proc = self.proc
+        try:
+            tornado.ioloop.IOLoop.current().spawn_callback(self._reader)
+            tornado.ioloop.IOLoop.current().spawn_callback(self._stderr_reader)
+            await self._initialize_thread()
+        except (Exception, asyncio.CancelledError):
+            # A failed startup is never registered with the controller, so reap
+            # its child here rather than leaving an unreachable app-server alive.
+            self.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), 5)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+            raise
+
+    async def _initialize_thread(self):
         # 1. handshake
         await self._request("initialize", {"clientInfo": {
             "name": "codex-console", "version": "0.1.0", "title": "Codex Console"},
@@ -2900,17 +3123,24 @@ class ChatSession:
         base = {"cwd": self.cwd, "approvalPolicy": ap, "sandbox": sbx}
         if self.model and self.model != "default":
             base["model"] = self.model
-        res = None
         if self.resume_cc:
             try:
                 res = await self._request("thread/resume", {**base, "threadId": self.resume_cc})
-            except Exception:
-                res = None
-        if res is None:
+            except Exception as exc:
+                if "already has an active writer" in str(exc).lower():
+                    raise RuntimeError(
+                        "This session is open in another Codex process. Close it there "
+                        "and retry. No new session was created.") from exc
+                raise
+        else:
             res = await self._request("thread/start", base)
-        th = (res or {}).get("thread") or {}
+        th = res.get("thread") if isinstance(res, dict) else None
+        if not isinstance(th, dict) or not isinstance(th.get("id"), str) or not th["id"].strip():
+            raise RuntimeError("Codex did not return a valid thread ID")
+        if self.resume_cc and th["id"] != self.resume_cc:
+            raise RuntimeError("Codex returned a different thread ID; refusing to resume an unrelated session")
         self.service_tier = (res or {}).get("serviceTier") or "default"
-        self.thread_id = th.get("id") or self.thread_id
+        self.thread_id = th["id"]
         self.cc_id = self.thread_id
         meta_model = self.transcript_meta.get("model") if (not self.model or self.model == "default") else ""
         self.display_model = _display_model(self.model, meta_model or (res or {}).get("model"))
@@ -3124,6 +3354,12 @@ class ChatSession:
             self._upsert_subagent(tid, state=p.get("status"))
             self._emit_subagents()
             return True
+        if method in ("turn/completed", "turn/failed"):
+            status = _status_type((p.get("turn") or {}).get("status"))
+            state = "errored" if method == "turn/failed" or status == "failed" else "interrupted" if status == "interrupted" else "completed"
+            self._upsert_subagent(tid, state=state, message="turn " + state)
+            self._emit_subagents()
+            return True
         item = (p or {}).get("item") if isinstance((p or {}).get("item"), dict) else {}
         msg = ""
         if item.get("type") == "agentMessage" and item.get("text"):
@@ -3162,8 +3398,8 @@ class ChatSession:
             error = "thread/read failed: %r" % ex
         try:
             res = await self._request("thread/items/list", {
-                "threadId": thread_id, "limit": limit, "sortDirection": "asc"})
-            entries = (res or {}).get("data") or []
+                "threadId": thread_id, "limit": limit, "sortDirection": "desc"})
+            entries = list(reversed((res or {}).get("data") or []))
         except Exception as ex:
             if error:
                 error += "; "
@@ -3177,7 +3413,7 @@ class ChatSession:
             except Exception:
                 pass
         messages = []
-        for entry in entries:
+        for entry in entries[-limit:]:
             msg = _subagent_item_message(entry)
             if msg:
                 messages.append(msg)
@@ -3193,6 +3429,40 @@ class ChatSession:
                     "updatedAt": thread.get("updatedAt"),
                 },
                 "messages": messages}
+
+    async def background_terminals(self):
+        if not self.proc or self.ended or not self.thread_id:
+            return {"ok": False, "error": "Session is not running", "terminals": []}
+        rows, cursor, seen = [], None, set()
+        try:
+            for _ in range(10):
+                params = {"threadId": self.thread_id, "limit": 100}
+                if cursor:
+                    params["cursor"] = cursor
+                result = await self._request("thread/backgroundTerminals/list", params)
+                rows.extend(result.get("data") or [])
+                cursor = result.get("nextCursor")
+                if not cursor:
+                    return {"ok": True, "terminals": rows}
+                if cursor in seen:
+                    break
+                seen.add(cursor)
+            return {"ok": False, "terminals": rows, "error": "Terminal list is incomplete"}
+        except Exception as exc:
+            return {"ok": False, "terminals": [], "error": "Terminal listing unavailable: %s" % exc}
+
+    async def stop_background_terminal(self, process_id):
+        current = await self.background_terminals()
+        if not current["ok"]:
+            return current
+        if not any(row.get("processId") == process_id for row in current["terminals"]):
+            return {"ok": False, "error": "Terminal has already exited or belongs to another session"}
+        try:
+            result = await self._request("thread/backgroundTerminals/terminate", {
+                "threadId": self.thread_id, "processId": process_id})
+            return {"ok": bool(result.get("terminated")), "processId": process_id}
+        except Exception as exc:
+            return {"ok": False, "error": "Terminal stop failed: %s" % exc}
 
     # ───────── inbound: notifications → normalized events ─────────
     def _on_note(self, method, p):
@@ -3217,6 +3487,8 @@ class ChatSession:
         elif method == "turn/started":
             turn = p.get("turn") or {}
             self.turn_id = turn.get("id")
+            self._context_turn_id = self.turn_id
+            self._context_refresh_until = time.monotonic() + 10
             if turn.get("items"):
                 for item in turn.get("items") or []:
                     self._on_item(item, started=True)
@@ -3307,11 +3579,12 @@ class ChatSession:
             self.goal = None
             self._push([{"kind": "goal", "goal": None}])
         elif method == "thread/tokenUsage/updated":
-            self._on_token_usage(p.get("tokenUsage") or {})
+            self._on_token_usage(p.get("tokenUsage") or {}, p.get("turnId"))
         elif method == "account/rateLimits/updated":
             self._on_rate_limits(p.get("rateLimits") or {})
         elif method == "thread/compacted":
             self.compacting = False
+            self._reset_context_usage()
             self._push([{"kind": "compacted", "trigger": "manual",
                          "pre": None, "post": None, "ms": None}])
             if self.busy and self._compact_turn:
@@ -3321,6 +3594,8 @@ class ChatSession:
         elif method == "model/rerouted":
             frm, to = p.get("fromModel"), p.get("toModel")
             if to:
+                if to != self.display_model:
+                    self._reset_context_usage()
                 self.display_model = to
             self._push([{"kind": "model_rerouted", "from": frm, "to": to,
                          "reason": _txt(p.get("reason"))}])
@@ -3397,6 +3672,8 @@ class ChatSession:
             return
         model = settings.get("model")
         if model:
+            if model != self.display_model:
+                self._reset_context_usage()
             self.display_model = model
         effort = settings.get("effort")
         if effort:
@@ -3430,16 +3707,6 @@ class ChatSession:
             return                          # echoed locally by _echo_user
         if it == "agentMessage":
             if not started:
-                questions = item.get("questions") or []
-                if questions:
-                    self._aid += 1
-                    aid = "a%d" % self._aid
-                    raw = [{"id": str(n), "question": q.get("title") or "",
-                            "options": [{"label": o} for o in (q.get("options") or [])]}
-                           for n, q in enumerate(questions) if isinstance(q, dict)]
-                    self._req[aid] = {"kind": "async_input", "raw": raw}
-                    self._push([{"kind": "question", "aid": aid, "questions": raw,
-                                 "async": True}])
                 txt = item.get("text") or ""
                 if txt.strip():
                     if book.get("streamed"):
@@ -3596,13 +3863,31 @@ class ChatSession:
                 self._push([{"kind": "compacting", "word": self.turn_word}])
             else:
                 self.compacting = False
+                self._reset_context_usage()
                 self._push([{"kind": "compacted", "trigger": "auto",
                              "pre": None, "post": None, "ms": None}])
             return
         if it in ("enteredReviewMode", "exitedReviewMode"):
             self._push([{"kind": "notice", "text": it}])
 
+    def _dismiss_pending_requests(self):
+        events = []
+        for aid, meta in list(self._req.items()):
+            kind = meta.get("kind")
+            if kind not in ("input", "exec", "patch", "perm"):
+                continue
+            self._req.pop(aid, None)
+            self._pending.pop(aid, None)
+            if kind == "input":
+                events.append({"kind": "question_resolved", "aid": aid, "answers": None})
+            else:
+                events.append({"kind": "approval_resolved", "aid": aid,
+                               "allow": False, "always": False, "dismissed": True})
+        if events:
+            self._push(events)
+
     def _finish_turn(self, error=False, compact=False):
+        self._dismiss_pending_requests()
         if not self.busy:
             return
         ev = {"kind": "turn_done", "subtype": ("compact" if compact else "ok"),
@@ -3622,14 +3907,38 @@ class ChatSession:
         self._push([ev])
         self._drain_queue()
 
-    def _on_token_usage(self, tu):
-        total = _pick(tu, "total", "total_token_usage", "totalTokenUsage") or {}
+    def _reset_context_usage(self):
+        self._context_after = time.time()
+        self._request_ctx = None
+        self.ctx = None
+        self._context_refresh_until = time.monotonic() + 10
+        self._emit({"type": "context", "ctx": None})
+
+    def _apply_context_sample(self, sample):
+        request_at = (self._request_ctx or {}).get("sampledAt", 0)
+        if (not sample or sample["sampledAt"] <= self._context_after
+                or sample["sampledAt"] < request_at - 2
+                or (self._request_ctx and sample["maxTokens"] != self._request_ctx["maxTokens"])
+                or (self._context_turn_id and sample.get("turnId") != self._context_turn_id)):
+            # Do not keep an old exact-looking value if this CLI stops logging it.
+            if self._request_ctx and self.ctx != self._request_ctx and time.time() - request_at >= 4:
+                self.ctx = dict(self._request_ctx)
+                self._emit({"type": "context", "ctx": self.ctx})
+            return
+        if self.ctx and self.ctx.get("source") == "codex" and self.ctx.get("sampledAt", 0) >= sample["sampledAt"]:
+            return
+        self.ctx = {**sample, "configuredMaxTokens": _configured_context_window(),
+                    "model": self.display_model or self.model or None}
+        self._emit({"type": "context", "ctx": self.ctx})
+
+    def _on_token_usage(self, tu, turn_id=None):
         last = _pick(tu, "last", "last_token_usage", "lastTokenUsage") or {}
         mx = _pick(tu, "modelContextWindow", "model_context_window")
-        # Context-window occupancy = the LAST request's input tokens (the full
-        # prompt the model saw, incl. cached history). NOT total.totalTokens —
-        # that's the cumulative sum over the whole thread and runs to thousands of
-        # percent on a long or resumed session (the "2508%" bug).
+        self._context_refresh_until = time.monotonic() + 10
+        if turn_id:
+            self._context_turn_id = turn_id
+        # API request usage is a fallback, not Codex's internal context estimate.
+        # Cumulative thread totals are billing usage and must never be used here.
         cur = _pick(last, "inputTokens", "input_tokens")
         if cur is None:
             cur = _pick(last, "totalTokens", "total_tokens")
@@ -3638,14 +3947,11 @@ class ChatSession:
                 meta_model = (self.transcript_meta or {}).get("model")
                 if meta_model:
                     self.display_model = meta_model
-            cfg_mx = _configured_context_window()
-            # For compaction decisions, show occupancy against the effective
-            # window reported by app-server, not a larger local config override.
-            self.ctx = {"totalTokens": cur, "maxTokens": mx,
-                        "reportedMaxTokens": mx, "configuredMaxTokens": cfg_mx,
-                        "percentage": round(cur * 100.0 / mx, 1),
-                        "model": self.display_model or self.model or None}
-            self._emit({"type": "context", "ctx": self.ctx})
+            self._request_ctx = {**_request_context(cur, mx), "sampledAt": time.time(),
+                                 "model": self.display_model or self.model or None}
+            if not self.ctx or self.ctx.get("source") != "codex" or self.ctx.get("maxTokens") != mx:
+                self.ctx = dict(self._request_ctx)
+                self._emit({"type": "context", "ctx": self.ctx})
         li = _pick(last, "inputTokens", "input_tokens")
         lc = _pick(last, "cachedInputTokens", "cached_input_tokens") or 0
         lo = _pick(last, "outputTokens", "output_tokens")
@@ -3695,6 +4001,7 @@ class ChatSession:
         elif method == "item/tool/requestUserInput":
             qs_raw = p.get("questions") or []
             qs = [{"question": q.get("question"), "header": q.get("header"),
+                   "isOther": bool(q.get("isOther", False)),
                    "options": [{"label": o.get("label"), "description": o.get("description")}
                                for o in (q.get("options") or [])]}
                   for q in qs_raw]
@@ -3722,20 +4029,11 @@ class ChatSession:
         meta = self._req.get(aid)
         if not meta:
             return
-        if meta.get("kind") not in ("input", "async_input"):
+        if meta.get("kind") != "input":
             return
         raw = meta.get("raw") or []
         picks = answers if isinstance(answers, list) else []
         if any(v is not None and not isinstance(v, str) for v in picks):
-            return
-        if meta["kind"] == "async_input":
-            if not self.proc or self.ended or len(picks) != len(raw) or not all(picks):
-                return
-            text = "\n".join("%s: %s" % (q.get("question"), picks[n])
-                             for n, q in enumerate(raw))
-            self.send_user(text)
-            self._req.pop(aid, None)
-            self._push([{"kind": "question_resolved", "aid": aid, "answers": picks}])
             return
         self._req.pop(aid, None)
         self._pending.pop(aid, None)
@@ -3961,6 +4259,7 @@ class ChatSession:
                 return
 
     def interrupt(self):
+        self._dismiss_pending_requests()
         if self.proc and not self.ended:
             if self.queue:
                 self._push([{"kind": "unqueued", "qid": it["qid"]} for it in self.queue])
@@ -4002,6 +4301,7 @@ class ChatSession:
 
     # ───────── live model / approval changes (per-turn in codex) ─────────
     def set_model(self, model):
+        self._reset_context_usage()
         self.model = model or "default"
         self.service_tier = "default"
         self.display_model = _display_model(self.model)
@@ -4035,6 +4335,7 @@ class ChatSession:
     # ───────── viewers / log ─────────
     def attach(self, ws):
         self.viewers.add(ws)
+        self._context_refresh_until = time.monotonic() + 10
 
     def detach(self, ws):
         self.viewers.discard(ws)
@@ -4075,6 +4376,7 @@ class ChatSession:
 
     def terminate(self):
         self.ended = True
+        self._dismiss_pending_requests()
         self._req.clear()
         self._pending.clear()
         for fut in list(self._waiters.values()):
@@ -4235,12 +4537,14 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             return
         mt = msg.get("type")
         if mt == "start":
+            request_id = msg.get("requestId")
+            reply = {"requestId": request_id} if isinstance(request_id, str) and len(request_id) <= 80 else {}
             if not CODEX_BIN or not os.path.exists(CODEX_BIN):
-                self._say({"type": "error", "error": "codex CLI not found"})
+                self._say({"type": "error", "error": "codex CLI not found", **reply})
                 return
             cwd = safe_cwd(msg.get("cwd") or HOME)
             if not cwd:
-                self._say({"type": "error", "error": "invalid working directory"})
+                self._say({"type": "error", "error": "invalid working directory", **reply})
                 return
             sid = secrets.token_hex(6)
             start_model = msg.get("model") or ""
@@ -4249,14 +4553,14 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             try:
                 await sess.start()
             except Exception as e:
-                self._say({"type": "error", "error": "spawn failed: %s" % e})
+                self._say({"type": "error", "error": "spawn failed: %s" % e, **reply})
                 return
             CHAT_SESSIONS[sid] = sess
             if self.session and self.session is not sess:
                 self.session.detach(self)   # keep it alive, just stop viewing it
             self.session = sess
             sess.attach(self)
-            self._say({"type": "started", "id": sid, "cwd": cwd,
+            self._say({"type": "started", "id": sid, "cwd": cwd, **reply,
                        "name": os.path.basename(cwd) or cwd,
                        "model": sess.model or "default", "display_model": sess.display_model,
                        "mode": sess.mode, "effort": sess.effort, "serviceTier": sess.service_tier,
@@ -4340,9 +4644,18 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "activity": sess.last_activity,
                        "subagents": sess.subagents_snapshot()})
         elif mt == "subagent_read" and self.session:
-            res = await self.session.read_subagent_thread(
+            sess = self.session
+            res = await sess.read_subagent_thread(
                 msg.get("threadId"), msg.get("limit") or 160)
-            self._say({"type": "subagent_thread", **res})
+            self._say({"type": "subagent_thread", "sessionId": sess.id, **res})
+        elif mt == "terminals_read" and self.session:
+            sess = self.session
+            res = await sess.background_terminals()
+            self._say({"type": "terminals", "sessionId": sess.id, **res})
+        elif mt == "terminal_stop" and self.session:
+            sess = self.session
+            res = await sess.stop_background_terminal(msg.get("processId"))
+            self._say({"type": "terminal_stopped", "sessionId": sess.id, **res})
         elif mt == "approve" and self.session:
             self.session.resolve_approval(msg.get("aid"), bool(msg.get("allow")), bool(msg.get("always")))
         elif mt == "answer" and self.session:
@@ -4544,8 +4857,6 @@ header{display:flex;gap:6px;align-items:center;padding:6px 10px;background:var(-
 .sb-brand{font-weight:700;color:var(--acc);font-size:15px;padding:11px 12px 9px;border-bottom:1px solid var(--line);white-space:nowrap}
 header select,header input{background:var(--bg3);color:var(--fg);border:1px solid var(--line);
   border-radius:5px;padding:4px 7px;font-size:12.5px}
-header select#project{flex:1;min-width:120px;max-width:380px}
-header input#cwd{flex:1;min-width:120px;display:none}
 .status{font-size:11.5px;color:var(--mut);white-space:nowrap;margin-left:auto;display:flex;gap:6px;align-items:center}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--mut)}
 .dot.on{background:var(--add);box-shadow:0 0 6px var(--add)}
@@ -4585,7 +4896,14 @@ header input#cwd{flex:1;min-width:120px;display:none}
   padding:4px 9px;font-size:12.5px;cursor:pointer;white-space:nowrap}
 .btn:hover{background:var(--line)}
 
-#chat{flex:1;overflow-y:auto;overflow-x:hidden;padding:14px;-webkit-overflow-scrolling:touch}
+#chatViewport{position:relative;flex:1;min-height:0;display:flex;flex-direction:column}
+#chat{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding:14px;-webkit-overflow-scrolling:touch}
+#jumpBottom{position:absolute;right:20px;bottom:12px;z-index:8;width:40px;height:40px;display:grid;place-items:center;
+  padding:0;border:1px solid var(--line);border-radius:50%;background:var(--bg2);color:var(--fg);
+  box-shadow:0 2px 8px rgba(0,0,0,.2);cursor:pointer}
+#jumpBottom[hidden]{display:none}
+#jumpBottom:hover{background:var(--bg3);border-color:var(--acc);color:var(--acc)}
+#jumpBottom svg{width:20px;height:20px;pointer-events:none}
 .wrap{max-width:820px;margin:0 auto}
 .msg{margin-bottom:14px;line-height:1.5;word-wrap:break-word;overflow-wrap:anywhere}
 .msg.user{display:flex;justify-content:flex-end}
@@ -4654,22 +4972,29 @@ header input#cwd{flex:1;min-width:120px;display:none}
 .tool.done .tn{opacity:.85}
 .tool .progress,.ecard .progress{font-size:11.5px;color:var(--mut);font-family:var(--fmono);white-space:pre-wrap;margin:0 0 5px}
 .tool .resmeta,.ecard .resmeta{font-size:11px;color:var(--mut);margin-left:6px}
-.toolgroup{border:1px solid var(--line);border-radius:8px;margin:6px 0 12px;background:var(--bg2);overflow:hidden}
-.toolgroup>.tgh{width:100%;min-height:38px;padding:7px 10px;border:0;background:transparent;color:var(--fg);
+.toolgroup{border:1px solid color-mix(in srgb,var(--acc) 30%,var(--line));border-left:3px solid color-mix(in srgb,var(--acc) 60%,var(--line));border-radius:8px;margin:6px 0 12px;background:var(--bg2);overflow:hidden}
+.toolgroup>.tgh{width:100%;min-height:38px;padding:7px 10px;border:0;background:color-mix(in srgb,var(--acc) 9%,var(--bg2));color:var(--fg);
   display:flex;gap:8px;align-items:center;text-align:left;cursor:pointer;font:inherit}
-.toolgroup>.tgh:hover{background:var(--bg3)}
-.toolgroup .tgico{flex:none}.toolgroup .tgname{color:var(--tool);font-weight:600;font-family:var(--fmono);font-size:12.5px;flex:none}
+.toolgroup>.tgh:hover{background:color-mix(in srgb,var(--acc) 15%,var(--bg2))}
+.toolgroup .tgico{flex:none}.toolgroup .tgname{color:var(--acc);font-weight:600;font-family:var(--fmono);font-size:12.5px;flex:none}
 .toolgroup .tgcount,.toolgroup .tgstate{color:var(--mut);font-family:var(--fmono);font-size:11.5px;flex:none}
 .toolgroup .tgsummary{color:var(--mut);font-family:var(--fmono);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
 .toolgroup.running .tgstate{color:var(--tool)}.toolgroup.err .tgstate{color:var(--del)}
-.toolgroup .eye{color:var(--mut);flex:none;display:inline-flex;align-items:center;transition:color .15s}
-.toolgroup .eye svg{width:16px;height:16px;display:block}.toolgroup .eye .e-open{display:none}
+.toolgroup>.tgh .eye{color:var(--mut);flex:none;display:inline-flex;align-items:center;transition:color .15s}
+.toolgroup>.tgh .eye svg{width:16px;height:16px;display:block}.toolgroup>.tgh .eye .e-open{display:none}
 .toolgroup.open>.tgh .eye .e-shut{display:none}.toolgroup.open>.tgh .eye .e-open{display:block}
 .toolgroup>.tgh:hover .eye{color:var(--fg)}
-.toolgroup>.tgb{display:none;border-top:1px solid var(--line)}.toolgroup.open>.tgb{display:block}
+.toolgroup>.tgb{display:none;position:relative;border-top:1px solid var(--line);background:var(--bg);padding:5px 8px 7px 20px;counter-reset:tool-call}
+.toolgroup.open>.tgb{display:block}
+.toolgroup>.tgb::before{content:'';position:absolute;left:10px;top:5px;bottom:7px;border-left:1px solid var(--line)}
 .toolgroup>.tgb>.tool{border:0;border-radius:0;margin:0;background:transparent}
 .toolgroup>.tgb>.tool+.tool{border-top:1px solid var(--line)}
-.toolgroup>.tgb>.tool .th{padding-left:12px;padding-right:12px}
+.toolgroup>.tgb>.tool>.th{position:relative;padding:8px 6px;gap:6px;min-height:36px;counter-increment:tool-call}
+.toolgroup>.tgb>.tool>.th::before{content:counter(tool-call,decimal-leading-zero);flex:0 0 3ch;color:var(--mut);font:11px var(--fmono);text-align:right;font-variant-numeric:tabular-nums}
+.toolgroup>.tgb>.tool.open>.th{background:var(--bg3)}
+.toolgroup>.tgb>.tool>.tb{margin:0 0 6px 12px;padding:8px 10px;border-top:0;border-left:2px solid var(--line);background:var(--bg2)}
+@media(max-width:480px){.toolgroup>.tgb{padding-left:14px;padding-right:4px}.toolgroup>.tgb::before{left:6px}
+  .toolgroup>.tgb>.tool>.tb{margin-left:6px;padding:6px}}
 pre{background:var(--codebg);border:1px solid var(--line);border-radius:6px;padding:8px;overflow-x:auto;margin:5px 0;
   font-family:var(--fmono);font-size:12.5px;line-height:1.45}
 code{font-family:var(--fmono);font-size:12.5px;background:var(--codebg);border:1px solid var(--line);border-radius:3px;padding:0 4px}
@@ -4786,6 +5111,15 @@ pre code{background:none;border:none;padding:0}
   padding:3px 9px;margin:2px 0 12px;display:inline-flex;gap:7px;cursor:pointer;font-family:var(--fmono);align-items:center}
 .agmark:hover{filter:brightness(1.18)}
 .agmark .mut{color:var(--mut)}
+.aginline{border:1px solid var(--line);border-radius:6px;margin:8px 0;background:var(--bg2);font-size:12px}
+.aginline summary{cursor:pointer;padding:8px;overflow-wrap:anywhere;color:var(--acc)}
+.aginline .agpreview{color:var(--mut);margin-left:8px}
+.aginline .agcontent{max-height:360px;overflow:auto;padding:8px;border-top:1px solid var(--line)}
+#terminalDialog{width:min(700px,94vw);max-height:80vh;margin:auto;padding:16px;box-sizing:border-box;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg)}
+#terminalDialog::backdrop{background:#0006}
+.terminal-head{display:flex;align-items:center;gap:8px;margin-bottom:12px}.terminal-head strong{flex:1}
+.terminal-row{display:flex;align-items:center;gap:8px;padding:10px 0;border-top:1px solid var(--line)}
+.terminal-row pre{flex:1;min-width:0;white-space:pre-wrap;overflow-wrap:anywhere;margin:0;font:12px var(--fmono)}
 /* edits-out-of-chat */
 .dh .tab{cursor:pointer;padding:3px 9px;border-radius:5px;color:var(--mut);font-size:12.5px;user-select:none}
 .dh .tab.on{background:var(--bg3);color:var(--fg)}
@@ -4834,11 +5168,15 @@ pre code{background:none;border:none;padding:0}
 .question .qopt.sel{background:var(--sel);border-color:var(--usr);color:var(--fg)}
 .question .qopt .od{display:block;color:var(--mut);font-size:11.5px;margin-top:2px}
 .question .qother{margin-top:7px;width:100%;background:var(--bg3);color:var(--fg);
-  border:1px solid var(--line);border-radius:6px;padding:7px;font-size:13px}
+  border:1px solid var(--line);border-radius:6px;padding:7px;font-size:13px;box-sizing:border-box;
+  display:block;font-family:inherit;line-height:1.35;resize:none;overflow-y:auto;max-height:124px}
+.question .qfeedback{padding:0 10px 8px;color:var(--delfg);font-size:12px}
+.question .qfeedback:empty{display:none}
 .question .qbtns{display:flex;gap:8px;padding:8px 10px;border-top:1px solid var(--infoln)}
 .question .qbtns button{flex:1;padding:9px;border-radius:6px;cursor:pointer;font-size:14px;font-weight:700;
   background:var(--okbg);color:var(--addfg);border:1px solid var(--add)}
 .question .qbtns button:disabled{opacity:.45;cursor:not-allowed}
+.question .qbtns .qdismiss{background:var(--bg3);color:var(--mut);border-color:var(--line)}
 .question.done .qbtns{display:none}
 .question.done .qopt,.question.done .qother{pointer-events:none;opacity:.7}
 .question .qdone{padding:8px 10px;border-top:1px solid var(--infoln);color:var(--addfg);font-weight:600}
@@ -4908,11 +5246,6 @@ pre code{background:none;border:none;padding:0}
 #sbresize:hover,#sbresize.drag{background:var(--acc)}
 #sidebar.collapsed + #sbresize{display:none}
 .sb-new{padding:8px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:6px}
-.sb-new select,.sb-new input{width:100%;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:5px 7px;font-size:12.5px}
-.cwdwrap{position:relative;display:none}
-.cwdwrap.show{display:block}
-#cwdac{position:absolute;left:0;right:0;top:100%;z-index:50;background:var(--bg3);border:1px solid var(--acc);border-top:none;border-radius:0 0 6px 6px;max-height:240px;overflow:auto;display:none;box-shadow:0 8px 18px rgba(0,0,0,.5)}
-#cwdac.on{display:block}
 .acitem{padding:5px 8px;cursor:pointer;border-bottom:1px solid var(--line)}
 .acitem:last-child{border-bottom:none}
 .acitem:hover,.acitem.sel{background:var(--acc)}
@@ -4920,10 +5253,8 @@ pre code{background:none;border:none;padding:0}
 .acpath{font-size:10px;font-family:var(--fmono);color:var(--mut);overflow-wrap:anywhere;line-height:1.3}
 .acitem:hover .acname,.acitem.sel .acname,.acitem:hover .acpath,.acitem.sel .acpath{color:var(--onacc)}
 .acmore{padding:5px 8px;font-size:10px;color:var(--mut);font-style:italic}
-.sb-row2{display:flex;gap:6px}.sb-row2 select{flex:1;min-width:0}
-#mrefresh{flex:0 0 auto;width:28px;padding:0;background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:5px;font-size:13px;cursor:pointer;line-height:1}
-#mrefresh:hover{color:var(--acc);border-color:var(--acc)}
-#mrefresh.busy{color:var(--acc);animation:mrspin .8s linear infinite;pointer-events:none}
+#mrefresh.busy{color:var(--acc);cursor:progress}
+#mrefresh.busy svg{animation:mrspin .8s linear infinite}
 @keyframes mrspin{to{transform:rotate(360deg)}}
 .newbtn{background:var(--acc);color:var(--onacc);font-weight:700;border:none;border-radius:6px;padding:7px;font-size:13px;cursor:pointer}
 .newbtn:hover{filter:brightness(1.08)}
@@ -5128,7 +5459,49 @@ pre code{background:none;border:none;padding:0}
 .thmore:hover{color:var(--acc);border-color:var(--acc)}
 .thend{text-align:center;font-size:11px;color:var(--mut);padding:6px}
 #sb-backdrop{display:none}
+.session-dialog{margin:auto;width:min(560px,calc(100% - 24px));max-height:calc(100dvh - 24px);
+  padding:18px;border:1px solid var(--line);border-radius:8px;background:var(--bg2);color:var(--fg);overflow:auto;
+  box-shadow:0 16px 48px rgba(0,0,0,.3);font:14px var(--fsans)}
+.session-dialog::backdrop{background:rgba(0,0,0,.5)}
+.session-dialog .dialog-heading{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:16px}
+.session-dialog .dialog-tools{display:flex;gap:6px}
+.session-dialog h2{font-size:17px;font-weight:650;line-height:1.4}
+.session-dialog label{display:block;font-size:12px;color:var(--mut);margin:0 0 6px}
+.session-dialog input:not([type=checkbox]),.session-dialog select{width:100%;min-width:0;height:36px;
+  padding:6px 8px;border:1px solid var(--line);border-radius:5px;background:var(--bg);color:var(--fg);font:13px var(--fsans)}
+.session-dialog .path-input{font-family:var(--fmono)!important}
+.session-dialog .dialog-field{min-width:0;margin-bottom:14px}
+.session-dialog .path-row{display:flex;gap:6px;min-width:0;align-items:center}
+.session-dialog .path-row input{flex:1;width:0}
+.session-dialog .path-row select{flex:1;width:0}
+.session-dialog .dialog-icon{display:grid;place-items:center;flex:none;width:36px;height:36px;padding:0;
+  border:1px solid var(--line);border-radius:5px;background:var(--bg3);color:var(--fg);cursor:pointer}
+.session-dialog .dialog-icon svg,.session-dialog .folder-row svg{width:18px;height:18px;flex:none}
+.session-dialog .dialog-icon:hover:not(:disabled){color:var(--acc);border-color:var(--acc)}
+.session-dialog .dialog-settings{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px}
+.session-dialog .dialog-settings .dialog-field{margin:0}
+.session-dialog fieldset{border:0;min-width:0}
+.session-dialog button:disabled{opacity:.45;cursor:default}
+.session-dialog .dialog-error{min-height:1.4em;margin:12px 0;color:var(--delfg);font-size:12px;overflow-wrap:anywhere}
+.session-dialog .dialog-actions{display:flex;justify-content:flex-end;align-items:center;gap:8px}
+.session-dialog .dialog-actions button{min-height:36px;padding:7px 14px}
+.session-dialog .dialog-actions .check-label{display:flex;gap:7px;align-items:center;margin:0 auto 0 0}
+.session-dialog .dialog-actions input{accent-color:var(--acc)}
+#folderList{height:min(320px,42dvh);min-height:100px;overflow:auto;margin:12px 0;border-block:1px solid var(--line);background:var(--bg)}
+#folderCreateForm{margin-top:14px}
+#folderCreateForm[hidden]{display:none}
+#folderCreateForm .path-row button{height:36px;flex:none}
+#folderCreateSubmit{width:92px}
+.session-dialog .folder-row{display:flex;gap:10px;align-items:center;width:100%;min-height:40px;padding:8px 10px;
+  border:0;border-bottom:1px solid var(--line);background:transparent;color:var(--fg);text-align:left;cursor:pointer}
+.session-dialog .folder-row:hover{background:var(--sel)}
+.session-dialog .folder-row span{flex:1;min-width:0;overflow-wrap:anywhere;line-height:1.4}
+.session-dialog .folder-row svg:first-child{color:var(--tool)}
+.session-dialog .folder-row svg:last-child{color:var(--mut)}
+@media(max-width:480px){.session-dialog{padding:14px}.session-dialog .dialog-settings{grid-template-columns:1fr}
+  .session-dialog .dialog-icon{width:40px;height:40px}.session-dialog .dialog-actions button{min-height:40px}}
 @media(max-width:860px){
+  #jumpBottom{right:12px;width:44px;height:44px}
   #sidebar{position:fixed;left:0;top:0;bottom:0;z-index:40;transform:translateX(-100%);transition:transform .34s cubic-bezier(.32,.72,0,1);width:min(310px,86vw);box-shadow:2px 0 14px rgba(0,0,0,.5)}
   #sidebar.open{transform:none}
   #sidebar.collapsed{display:flex}
@@ -5165,6 +5538,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
   <span class="ctx" id="ctx" title="context-window usage"></span>
   <span class="usage" id="usage" title="usage limits (5h / 7d)"></span>
   <button class="iconbtn agentbtn" id="agentbtn" title="subagents"><span>Agents</span><span class="agentn" id="agentN">0</span></button>
+  <button class="iconbtn" id="terminalbtn" title="Background terminals" aria-label="Background terminals">▣</button>
 </header>
 
 <div id="shell">
@@ -5172,13 +5546,6 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     <div class="sb-brand">⬡ Codex Console</div>
     <div class="sb-new">
       <button id="srchopen" title="search all conversation history"><span>🔍 Search history</span><kbd>⌘K</kbd></button>
-      <select id="project" title="working directory for a new session"></select>
-      <div class="cwdwrap" id="cwdwrap"><input id="cwd" placeholder="type a path…  ↑↓ to pick" autocomplete="off"><div id="cwdac"></div></div>
-      <div class="sb-row2">
-        <select id="model" title="model"><option value="default">model: default</option></select>
-        <button id="mrefresh" title="refresh model list from Codex">↻</button>
-        <select id="mode" title="approval policy"><option value="full-access" selected>🔓 Full access</option><option value="on-request">🔐 Approve</option><option value="auto">⚡ Auto (sandbox)</option><option value="read-only">👁 Read-only</option></select>
-      </div>
       <button class="newbtn" id="newbtn">＋ New session</button>
       <div class="impline">
         <div class="improw">
@@ -5249,7 +5616,13 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
   </div></div>
   <div id="mainCol">
     <div id="sessionTabs" role="tablist" aria-label="Open sessions" hidden></div>
-    <div id="chat"><div class="plandock" id="planDock" hidden></div><div class="wrap" id="stream"></div></div>
+    <div id="chatViewport">
+      <div id="chat"><div class="plandock" id="planDock" hidden></div><div class="wrap" id="stream"></div></div>
+      <button id="jumpBottom" type="button" title="Jump to latest message" aria-label="Jump to latest message" aria-controls="chat" hidden>
+        <!-- Lucide ArrowDown; license in static/icons/lucide-LICENSE.txt. -->
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="m19 12-7 7-7-7"/></svg>
+      </button>
+    </div>
     <div id="composer">
       <button id="pageUpdate" class="choicebtn" type="button" hidden>Update available · Reload</button>
       <div class="pillrow">
@@ -5285,6 +5658,50 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     <div id="agentDetail"><div class="empty">select a subagent</div></div>
   </div>
 </div>
+<dialog id="newSessionDialog" class="session-dialog" aria-labelledby="newSessionTitle">
+  <form id="newSessionForm">
+    <div class="dialog-heading"><h2 id="newSessionTitle">New session</h2><button id="newSessionClose" class="dialog-icon" type="button" title="Close" aria-label="Close" data-session-icon="x"></button></div>
+    <fieldset id="newSessionFields">
+      <div class="dialog-field"><label for="newRecent">Recent folders</label><select id="newRecent"></select></div>
+      <div class="dialog-field"><label for="newCwd">Working directory</label><div class="path-row">
+        <input id="newCwd" class="path-input" autocomplete="off" spellcheck="false" placeholder="~/project" required>
+        <button id="newBrowse" class="dialog-icon" type="button" title="Browse folders" aria-label="Browse folders" data-session-icon="folder-open"></button>
+      </div></div>
+      <div class="dialog-field"><label for="newModel">Model</label><div class="path-row">
+        <select id="newModel"><option value="default">model: default</option></select>
+        <button id="mrefresh" class="dialog-icon" type="button" title="Refresh model list" aria-label="Refresh model list" data-session-icon="refresh"></button>
+      </div></div>
+      <div class="dialog-settings">
+        <div class="dialog-field"><label for="newEffort">Thinking depth</label><select id="newEffort"></select></div>
+        <div class="dialog-field"><label for="newMode">Permissions</label><select id="newMode"></select></div>
+      </div>
+    </fieldset>
+    <div id="newSessionError" class="dialog-error" role="alert"></div>
+    <div class="dialog-actions"><button id="newSessionCancel" class="btn" type="button">Cancel</button><button id="newSessionSubmit" class="newbtn" type="submit">Start session</button></div>
+  </form>
+</dialog>
+<dialog id="folderDialog" class="session-dialog" aria-labelledby="folderTitle">
+  <div class="dialog-heading"><h2 id="folderTitle">Select folder</h2><div class="dialog-tools">
+    <button id="folderNew" class="dialog-icon" type="button" title="New folder" aria-label="New folder" data-session-icon="folder-plus" disabled></button>
+    <button id="folderClose" class="dialog-icon" type="button" title="Close" aria-label="Close" data-session-icon="x"></button>
+  </div></div>
+  <form id="folderPathForm" class="path-row">
+    <button id="folderUp" class="dialog-icon" type="button" title="Parent folder" aria-label="Parent folder" data-session-icon="arrow-up"></button>
+    <button id="folderHome" class="dialog-icon" type="button" title="Home folder" aria-label="Home folder" data-session-icon="house"></button>
+    <input id="folderPath" class="path-input" aria-label="Folder path" autocomplete="off" spellcheck="false">
+    <button class="dialog-icon" type="submit" title="Open folder path" aria-label="Open folder path" data-session-icon="arrow-right"></button>
+  </form>
+  <form id="folderCreateForm" hidden>
+    <label for="folderName">Folder name</label>
+    <div class="path-row"><input id="folderName" autocomplete="off" spellcheck="false" required>
+      <button id="folderCreateSubmit" class="newbtn" type="submit">Create</button>
+      <button id="folderCreateCancel" class="btn" type="button">Cancel</button></div>
+    <div id="folderCreateError" class="dialog-error" role="alert"></div>
+  </form>
+  <div id="folderList" aria-label="Folders" aria-busy="false"></div>
+  <div id="folderError" class="dialog-error" role="status"></div>
+  <div class="dialog-actions"><label class="check-label"><input id="folderHidden" type="checkbox">Hidden folders</label><button id="folderSelect" class="newbtn" type="button" disabled>Select folder</button></div>
+</dialog>
 <div id="fimp" hidden>
   <div id="fimppanel">
     <div class="fh"><span class="ft">📁 Import folder</span>
@@ -5311,6 +5728,10 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
   </div>
 </div>
 <div id="cardMenu"></div>
+<dialog id="terminalDialog" aria-labelledby="terminalTitle"><div class="terminal-head"><strong id="terminalTitle">Background terminals</strong>
+<button class="iconbtn" id="terminalRefresh" title="Refresh" aria-label="Refresh terminals">↻</button>
+<button class="iconbtn" id="terminalClose" title="Close" aria-label="Close terminals">✕</button></div>
+<div id="terminalList"></div></dialog>
 
 <script>
 const $=s=>document.querySelector(s);
@@ -5321,6 +5742,10 @@ let activeTier=null;
 let tokUp=0,tokOut=0,tokShow=false;   /* live streaming token counts shown in the pill */
 let sid=null, curCC=null, editCount=0, pendingStart=false, reconnectT=0;
 const FALLBACK_EFFORTS=['minimal','low','medium','high','xhigh'];
+const MODE_OPTIONS=[['full-access','🔓 Full access'],['on-request','🔐 Approve'],['auto','⚡ Auto (sandbox)'],['read-only','👁 Read-only']];
+let preferredModel=localStorage.getItem('al_model')||'default';
+let preferredMode=localStorage.getItem('al_mode')||'full-access';
+if(!MODE_OPTIONS.some(([id])=>id===preferredMode))preferredMode='full-access';
 let MODELS=[];   /* live Codex app-server catalog: [{id,name,isDefault,...}] */
 let DEFAULT_MODEL_ID='';   /* resolved from config.toml, not catalog isDefault */
 let MODEL_OPTIONS=[['default','model: default']];
@@ -5330,6 +5755,7 @@ let curEffort=localStorage.getItem('al_effort')||'xhigh';
 let activeModel='default';
 let showThink=false;
 let liveSessions=[], projData=[], HOMEDIR='';
+let recentFolders=[],selectedFolder='';
 let subagents={}, subagentCurrent='';
 let currentCtx=null,sessionViewCache=new Map(),restoredViewId='';
 /* which project groups are expanded — per device, survives reloads */
@@ -5447,12 +5873,18 @@ let replaying=false;   /* true while bulk-replaying a session log on attach — 
                           a single scroll-to-bottom runs once at the end instead. */
 let follow=true,autoTop=0;
 function atBottom(){return !replaying&&follow;}
-function setChatTop(y,f){const c=$('#chat');c.scrollTop=y;autoTop=c.scrollTop;follow=f;}
+function syncJumpBottom(){const c=$('#chat');
+  $('#jumpBottom').hidden=replaying||c.scrollHeight-c.scrollTop-c.clientHeight<140;}
+function setChatTop(y,f){const c=$('#chat');c.scrollTop=y;autoTop=c.scrollTop;follow=f;if(!replaying)syncJumpBottom();}
 function scroll(){if(replaying)return;setChatTop($('#chat').scrollHeight,true);}
 (()=>{const c=$('#chat');let prev=c.scrollTop;
   c.addEventListener('wheel',e=>{if(e.deltaY<0&&c.scrollTop>0)follow=false;},{passive:true});
   c.addEventListener('scroll',()=>{const top=c.scrollTop,gap=c.scrollHeight-top-c.clientHeight;
-    if(top<autoTop-1&&gap>2)follow=false;else if(top>prev&&gap<140)follow=true;prev=top;},{passive:true});})();
+    if(top<autoTop-1&&gap>2)follow=false;else if(top>prev&&gap<140)follow=true;prev=top;syncJumpBottom();},{passive:true});
+  $('#jumpBottom').onclick=()=>{scroll();const id=sid;requestAnimationFrame(()=>{if(sid===id&&atBottom())scroll();});};
+  // Layout changes also occur without scroll events (tools, math, composer, tab restore).
+  let frame=0;const observer=new ResizeObserver(()=>{if(!frame)frame=requestAnimationFrame(()=>{frame=0;syncJumpBottom();});});
+  [c,stream,$('#planDock')].forEach(el=>observer.observe(el));})();
 
 const ICON={Edit:'✏️',MultiEdit:'✏️',Write:'📝',Bash:'▶',Read:'📖',List:'📂',Search:'🔍',
   Glob:'🔍',Grep:'🔍',Task:'🤖',Agent:'🤖',ViewImage:'🖼',ImageGeneration:'🖼',
@@ -5508,6 +5940,7 @@ function renderWindowMarker(){let marker=stream.querySelector(':scope > .window-
     '<button type="button" title="Search full session history" aria-label="Search full session history">🕘</button>';
   marker.querySelector('button').onclick=()=>{openSearch();$('#srchscope').value='session';$('#srchq').focus();};}
 function windowProtected(el){return el.matches('.streaming,.tool:not(.done),.approval:not(.done),.question:not(.done)')||
+  el.matches('.aginline:not(.done),.aginline[open]')||
   (el.classList.contains('toolgroup')&&!!el.querySelector('.tool:not(.done)'));}
 function sweepWindowRefs(){const edits=$('#edits'),kept=el=>el&&(stream.contains(el)||(edits&&edits.contains(el)));
   Object.keys(textItems).forEach(k=>{if(!kept(textItems[k]&&textItems[k].el))delete textItems[k];});
@@ -5597,7 +6030,7 @@ function addNotice(t){const d=document.createElement('div');d.className='notice'
 function addStatus(ev){const s=atBottom(),st=ev.status||{},se=st.session||{},sv=st.service||{},g=st.git||{};
   const ctx=st.context||{},u=st.usage||{};
   const state=se.ended?'ended':(se.compacting?'compacting':(se.busy?'busy '+fmtSecs((se.turn_age||0)*1000):'ready'));
-  let ctxText=ctx.percentage!=null?(ctx.percentage+'% · '+fmtTok(ctx.totalTokens)+' / '+fmtTok(ctx.maxTokens)):'unknown';
+  let ctxText=ctx.percentage!=null?((ctx.source==='codex'?'':'~')+ctx.percentage+'% · '+fmtTok(ctx.totalTokens)+' / '+fmtTok(ctx.maxTokens)):'unknown';
   const win=(o)=>o&&o.utilization!=null?Math.round(o.utilization)+'%':'unknown';
   const usageBits=[];if(u.five_hour&&u.five_hour.utilization!=null)usageBits.push('5h '+win(u.five_hour));
   if(u.seven_day&&u.seven_day.utilization!=null)usageBits.push('weekly '+win(u.seven_day));const usageText=usageBits.join(' · ')||'unknown';
@@ -5644,7 +6077,7 @@ function mergeSubagents(list,reset){
   const rows=agentRows();
   if(subagentCurrent&&!subagents[subagentCurrent])subagentCurrent='';
   if(!subagentCurrent&&rows.length)subagentCurrent=rows[0].threadId;
-  renderSubagentBadge();renderSubagents();}
+  renderSubagentBadge();renderSubagents();refreshInlineAgents();}
 function renderSubagentBadge(){const btn=$('#agentbtn');if(!btn)return;
   const rows=agentRows(),active=rows.filter(agentActive).length;
   btn.classList.toggle('on',rows.length>0);btn.classList.toggle('busy',active>0);
@@ -5681,6 +6114,12 @@ function loadSubagentThread(threadId){
   wsSend({type:'subagent_read',threadId:threadId,limit:160});}
 function renderSubagentThread(m){
   if(!m||!m.threadId)return;
+  if(m.sessionId&&m.sessionId!==sid)return;
+  for(const card of stream.querySelectorAll('.aginline')){if(card.dataset.tid!==m.threadId)continue;
+    card.dataset.loading='';
+    const body=card.querySelector('.agcontent'),html=m.ok?(m.messages||[]).map(agentMsgHTML).join('')||'No visible messages yet':esc(m.error||'Unable to load messages');
+    if(body._html!==html){const top=body.scrollTop,stick=body.scrollHeight-top-body.clientHeight<30;
+      body.innerHTML=html;body._html=html;if(card.open)typesetMath(body);body.scrollTop=stick?body.scrollHeight:top;}}
   if(m.subagent)mergeSubagents([m.subagent]);
   if(subagentCurrent&&m.threadId!==subagentCurrent)return;
   subagentCurrent=m.threadId;renderSubagents();
@@ -5704,11 +6143,32 @@ function agentMsgHTML(x){
   return '<div class="agmsg '+escAttr(role)+'"><div class="agr">'+esc(label)+'</div><div class="agtxt">'+body+'</div></div>';}
 function addSubagentMarker(ev){
   const a=ev.subagent||{};if(a.threadId)mergeSubagents([a]);
-  const s=atBottom(),d=document.createElement('div');d.className='agmark';
-  d.innerHTML='<span>Agents</span><span>'+esc(a.label||'subagent')+'</span><span class="mut">'+
-    esc(ev.activity||a.state||'updated')+' — open</span>';
-  d.onclick=()=>openSubagents(a.threadId||'');
-  stream.appendChild(d);if(s)scroll();}
+  if(!a.threadId)return;
+  if([...stream.querySelectorAll('.aginline')].some(c=>c.dataset.tid===a.threadId)){refreshInlineAgents();return;}
+  const s=atBottom(),d=document.createElement('details');d.className='aginline';d.dataset.tid=a.threadId;
+  d.innerHTML='<summary></summary><div class="agcontent">Loading...</div>';
+  d.addEventListener('toggle',()=>{if(d.open)loadInlineAgent(d);});
+  stream.appendChild(d);refreshInlineAgents();if(s)scroll();}
+function refreshInlineAgents(){for(const c of stream.querySelectorAll('.aginline')){const a=subagents[c.dataset.tid];if(!a)continue;
+  c.classList.toggle('done',!agentActive(a));c.querySelector('summary').innerHTML='Agent · '+esc(a.label||'subagent')+' · '+esc(a.state||'running')+
+    '<span class="agpreview">'+esc((a.message||a.prompt||'').slice(0,140))+'</span>';}}
+function loadInlineAgent(c){if(!ws||ws.readyState!==1)return;
+  if(Date.now()-Number(c.dataset.loading||0)<15000)return;
+  c.dataset.loading=Date.now();wsSend({type:'subagent_read',threadId:c.dataset.tid,limit:60});}
+function requestTerminals(){if(!sid||!ready){$('#terminalList').textContent='No running session';return;}
+  $('#terminalList').textContent='Loading...';wsSend({type:'terminals_read'});}
+function renderTerminals(m){if(m.sessionId!==sid)return;const host=$('#terminalList');host.innerHTML='';
+  if(!m.ok){host.textContent=m.error||'Terminal listing unavailable';return;}
+  if(!(m.terminals||[]).length){host.textContent='No background terminals';return;}
+  for(const t of m.terminals){const row=document.createElement('div'),text=document.createElement('pre'),stop=document.createElement('button');
+    row.className='terminal-row';text.textContent=t.command+'\n'+t.cwd+' · process '+t.processId+
+      (t.cpuPercent!=null?' · CPU '+t.cpuPercent+'%':'')+(t.rssKb!=null?' · RAM '+Math.round(t.rssKb/1024)+' MiB':'');
+    stop.className='iconbtn';stop.textContent='■';stop.title='Stop this terminal';stop.setAttribute('aria-label','Stop '+t.command);
+    stop.onclick=()=>{if(confirm('Stop this background command?\n'+t.command)){stop.disabled=true;wsSend({type:'terminal_stop',processId:t.processId});}};
+    row.append(text,stop);host.appendChild(row);}}
+$('#terminalbtn').onclick=()=>{$('#terminalDialog').showModal();requestTerminals();};
+$('#terminalRefresh').onclick=requestTerminals;
+$('#terminalClose').onclick=()=>$('#terminalDialog').close();
 /* turn-complete footer line — ✻ {past verb} for {N}s · {YYYY-MM-DD HH:MM:SS} UTC (server-stamped) */
 function utcStamp(sec){const d=new Date(sec*1000),p=n=>String(n).padStart(2,'0');
   return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+
@@ -5806,10 +6266,7 @@ function statset(t){const el=$('#thinking');if(!el)return;
   if(!running){const m=el.querySelector('.meta');if(m)m.textContent='';}}
 /* CLI-style ↑input / ↓output token counts for the pill (reuses the project fmtTok) */
 function tokStr(){return '↑'+fmtTok(tokUp)+' ↓'+fmtTok(tokOut);}
-function bindProject(p){if(!p)return;const sel=$('#project');let ok=false;
-  for(const o of sel.options){if(o.value===p){ok=true;break;}}
-  if(!ok){const o=document.createElement('option');o.value=p;o.textContent='● '+p.split('/').slice(-2).join('/');sel.insertBefore(o,sel.firstChild);}
-  sel.value=p;}
+function bindProject(p){if(p)selectedFolder=p;}
 function setComposerEnabled(on){ta.disabled=!on;syncVoiceComposerState();syncVoiceButton();renderSessionChoices();}
 function setBusy(b,wordSeed,elapsedMs){running=b;$('#dot').className='dot '+(b?'busy':(ready?'on':''));
   setSessionTabBusy(sid,b);
@@ -5903,6 +6360,7 @@ function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty"
   if(windowTrimT){clearTimeout(windowTrimT);windowTrimT=0;}windowHidden=0;windowHiddenChars=0;
   textItems={};thinkItems={};planItems={};turnDiffCards={};planCollapsed=false;
   const pd=$('#planDock');if(pd){pd.hidden=true;pd.innerHTML='';}
+  setChatTop(0,true);
   mergeSubagents([],true);
   queued={};renderQueue();stopThinking();}
 
@@ -5936,35 +6394,48 @@ function addApproval(ev){const c=document.createElement('div');c.className='appr
   c.querySelector('.deny').onclick=()=>decide(ev.aid,false,false);
   stream.appendChild(c);scroll();}
 function decide(aid,allow,always){wsSend({type:'approve',aid:aid,allow:allow,always:!!always});resolveApprovalCard(aid,allow,always);}
-function resolveApprovalCard(aid,allow,always){const c=stream.querySelector('.approval[data-aid="'+aid+'"]');
+function resolveApprovalCard(aid,allow,always,dismissed){const c=stream.querySelector('.approval[data-aid="'+aid+'"]');
   if(c&&!c.classList.contains('done')){c.classList.add('done');
-    const bt=c.querySelector('.abtns');if(bt)bt.innerHTML='<span class="'+(allow?'ok':'no')+'">'+(allow?('✓ Approved'+(always?" · won't ask again this session":'')):'✕ Denied')+'</span>';}}
-function qval(bl){const other=bl.querySelector('.qother').value.trim();
-  if(other)return other;
-  return [...bl.querySelectorAll('.qopt.sel')].map(x=>x.dataset.label).join(', ');}
+    const bt=c.querySelector('.abtns');if(bt)bt.innerHTML='<span class="'+(allow?'ok':'no')+'">'+(dismissed?'✕ dismissed':allow?('✓ Approved'+(always?" · won't ask again this session":'')):'✕ Denied')+'</span>';}}
+function growOther(o){o.style.height='auto';o.style.height=Math.min(o.scrollHeight+2,124)+'px';}
+function qval(bl){const other=bl.querySelector('.qother'),selected=bl.querySelector('.qopt.sel');
+  if(other&&other.value.trim())return other.value.trim();
+  return selected?selected.dataset.label:'';}
 function addQuestion(ev){const c=document.createElement('div');c.className='question';c.dataset.aid=ev.aid;
-  const qs=ev.questions||[];let h='<div class="qh">❓ <b>Question'+(qs.length>1?'s':'')+'</b>'+(ev.async?' · answer when ready':'')+'</div>';
-  qs.forEach((q,qi)=>{h+='<div class="qblk" data-qi="'+qi+'"'+(q.multiSelect?' data-multi="1"':'')+'>'+
+  const qs=ev.questions||[];let h='<div class="qh">❓ <b>Question'+(qs.length>1?'s':'')+'</b></div>';
+  qs.forEach((q,qi)=>{h+='<div class="qblk" data-qi="'+qi+'">'+
     '<div class="qtext">'+(q.header?'<span class="chip">'+esc(q.header)+'</span>':'')+esc(q.question||('Question '+(qi+1)))+'</div>'+
     '<div class="qopts">';
     (q.options||[]).forEach(o=>{h+='<button class="qopt" data-label="'+esc(o.label)+'">'+esc(o.label)+
       (o.description?'<span class="od">'+esc(o.description)+'</span>':'')+'</button>';});
-    h+='</div><input class="qother" placeholder="Other… custom answer'+(q.multiSelect?' (comma-separated)':'')+'"></div>';});
-  h+='<div class="qbtns"><button class="qsub" disabled>Submit</button></div>';
-  c.innerHTML=h;const sub=c.querySelector('.qsub');
-  function refresh(){let ok=qs.length>0;c.querySelectorAll('.qblk').forEach(bl=>{if(!qval(bl))ok=false;});sub.disabled=!ok;}
-  c.querySelectorAll('.qblk').forEach(bl=>{const multi=bl.dataset.multi==='1';
+    h+='</div>';
+    if(q.isOther||!(q.options||[]).length)h+='<textarea class="qother" rows="1" aria-label="'+escAttr(q.question||'Custom answer')+'" placeholder="Custom answer…"></textarea>';
+    h+='</div>';});
+  h+='<div class="qfeedback" role="status" aria-live="polite"></div><div class="qbtns"><button class="qsub" type="button" disabled>Submit</button><button class="qdismiss" type="button">Dismiss</button></div>';
+  c.innerHTML=h;const sub=c.querySelector('.qsub'),dismiss=c.querySelector('.qdismiss'),feedback=c.querySelector('.qfeedback');
+  function refresh(){let ok=qs.length>0;c.querySelectorAll('.qblk').forEach(bl=>{if(!qval(bl))ok=false;});
+    const locked=c._sending||c.classList.contains('done');sub.disabled=!!locked||!ok;dismiss.disabled=!!locked;}
+  c.querySelectorAll('.qblk').forEach(bl=>{const other=bl.querySelector('.qother');
     bl.querySelectorAll('.qopt').forEach(b=>{b.onclick=()=>{
-      if(multi)b.classList.toggle('sel');
-      else bl.querySelectorAll('.qopt').forEach(x=>x.classList.toggle('sel',x===b));
+      if(c._sending||c.classList.contains('done'))return;
+      if(other){other.value='';growOther(other);}
+      bl.querySelectorAll('.qopt').forEach(x=>x.classList.toggle('sel',x===b));
       refresh();};});
-    bl.querySelector('.qother').oninput=refresh;});
-  sub.onclick=()=>{const picks=qs.map((q,qi)=>qval(c.querySelector('.qblk[data-qi="'+qi+'"]')));
-    if(!ws||ws.readyState!==1)return;
-    wsSend({type:'answer',aid:ev.aid,answers:picks});};
+    if(other){other.oninput=()=>{if(other.value.trim())bl.querySelectorAll('.qopt.sel').forEach(b=>b.classList.remove('sel'));growOther(other);refresh();};
+      other.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing&&e.keyCode!==229){e.preventDefault();if(!sub.disabled)sub.click();}};}});
+  function submit(picks){if(c._sending||c.classList.contains('done'))return;
+    if(!ws||ws.readyState!==1){feedback.textContent='Not connected — try again';refresh();return;}
+    c._sending=true;feedback.textContent='';refresh();
+    c.querySelectorAll('.qopt,.qother').forEach(el=>el.disabled=true);
+    try{ws.send(JSON.stringify({type:'answer',aid:ev.aid,answers:picks}));}
+    catch(e){c._sending=false;c.querySelectorAll('.qopt,.qother').forEach(el=>el.disabled=false);feedback.textContent='Not connected — try again';refresh();}}
+  sub.onclick=()=>{if(!sub.disabled)submit(qs.map((q,qi)=>qval(c.querySelector('.qblk[data-qi="'+qi+'"]'))));};
+  dismiss.onclick=()=>submit([]);
   stream.appendChild(c);scroll();}
 function resolveQuestionCard(aid,ans){const c=stream.querySelector('.question[data-aid="'+aid+'"]');
   if(!c||c.classList.contains('done'))return;c.classList.add('done');
+  c.querySelectorAll('button,textarea,input').forEach(el=>el.disabled=true);
+  const feedback=c.querySelector('.qfeedback');if(feedback)feedback.textContent='';
   let vals=null;if(Array.isArray(ans))vals=ans.filter(Boolean);
   else if(ans&&typeof ans==='object')vals=Object.values(ans);
   const bt=c.querySelector('.qbtns');const has=vals&&vals.length;
@@ -5998,7 +6469,7 @@ function route(ev){const seq=Number(ev&&ev._seq||0),tab=sessionTabById(sid);
   else if(ev.kind==='tool_progress')addToolProgress(ev);
   else if(ev.kind==='tool_result')addResult(ev);
   else if(ev.kind==='approval')addApproval(ev);
-  else if(ev.kind==='approval_resolved')resolveApprovalCard(ev.aid,ev.allow,ev.always);
+  else if(ev.kind==='approval_resolved')resolveApprovalCard(ev.aid,ev.allow,ev.always,ev.dismissed);
   else if(ev.kind==='question')addQuestion(ev);
   else if(ev.kind==='question_resolved')resolveQuestionCard(ev.aid,ev.answers);
   else if(ev.kind==='turn_start'){tokShow=false;setBusy(true,ev.word,0);}
@@ -6026,7 +6497,8 @@ function markEnded(msg){ready=false;setComposerEnabled(false);$('#dot').classNam
   localStorage.removeItem(SKEY);if(msg)addNotice(msg);}
 function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='hello'){if(m.stamp&&m.stamp!==PAGE_STAMP)$('#pageUpdate').hidden=false;return;}
-  if(m.type==='started'||m.type==='attached')activeTier=m.serviceTier||null;
+  if(handleNewSessionReply(m))return;
+  if(m.type==='started'||m.type==='attached'){activeTier=m.serviceTier||null;$('#terminalDialog').close();}
   if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);loadDraft(sid);
     activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');setEffortPill(m.effort);renderCtx(null);statset('ready');
     const startedTab=ensureSessionTab(m,true);planCollapsed=!!(startedTab&&startedTab.planCollapsed);
@@ -6070,6 +6542,8 @@ function onMsg(e){const m=JSON.parse(e.data);
   else if(m.type==='context')renderCtx(m.ctx);
   else if(m.type==='usage')renderUsage(m.usage);
   else if(m.type==='subagent_thread')renderSubagentThread(m);
+  else if(m.type==='terminals')renderTerminals(m);
+  else if(m.type==='terminal_stopped'&&m.sessionId===sid){if(!m.ok)$('#terminalList').textContent=m.error||'Terminal already exited';else requestTerminals();}
   else if(m.type==='tokens'){tokUp=m.up||0;tokOut=m.out||0;tokShow=true;
     if(m.word!=null&&m.word!==lastWordSeed){lastWordSeed=m.word;if(running&&!compacting)setWord(m.word);}}
   else if(m.type==='projects'){projData=m.projects||[];renderSidebar();}
@@ -6080,6 +6554,7 @@ function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
     if(cb)cb();else{const saved=localStorage.getItem(SKEY);if(saved&&!pendingStart){const req={type:'attach',id:saved},tab=sessionTabById(saved);
       if(restoredViewId===saved&&tab)req.after_seq=Number(tab.lastSeq||0);else statset('reattaching…');ws.send(JSON.stringify(req));}}};
   ws.onclose=()=>{$('#dot').className='dot';statset('disconnected');setComposerEnabled(false);
+    if(newSessionRequest){resetNewSessionRequest();$('#newSessionError').textContent='Connection lost. Check Live sessions before trying again.';}
     clearTimeout(reconnectT);reconnectT=setTimeout(()=>openWs(),1800);};
   ws.onmessage=onMsg;}
 function wsSend(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}
@@ -6182,11 +6657,14 @@ function cellBar(pct){const p=Math.max(0,Math.min(100,pct)),lit=Math.min(5,Math.
   return s+'</span>';}
 function renderCtx(c){currentCtx=c||null;const el=$('#ctx');
   if(!c||c.percentage==null){el.style.display='none';return;}
-  const pct=Math.round(c.percentage);
+  const pct=Math.round(c.percentage),approx=c.source!=='codex';
   el.className='ctx';el.style.display='inline-flex';
-  el.innerHTML='<span class="ulabel">Context</span>'+cellBar(pct)+'<span>'+pct+'%</span>';
-  let title='context '+(c.totalTokens||'?')+' / '+(c.maxTokens||'?')+' tokens ('+pct+'%)'+(c.model?' · '+c.model:'');
-  el.title=title;
+  el.innerHTML='<span class="ulabel">Context</span>'+cellBar(pct)+'<span>'+(approx?'~':'')+pct+'%</span>';
+  let title=(approx?'Last request (Codex context estimate unavailable): ':'Codex context estimate: ')+
+    (c.totalTokens??'?')+' / '+(c.maxTokens??'?')+' tokens ('+pct+'%)'+(c.model?' · '+c.model:'');
+  if(!approx&&c.autoCompactLimit!=null){title+='\nAuto-compaction: '+(c.autoCompactTokens??c.totalTokens)+' / '+c.autoCompactLimit+' tokens';
+    if(c.autoCompactScope&&c.autoCompactScope!=='Total')title+=' ('+c.autoCompactScope+')';}
+  el.title=title;el.setAttribute('aria-label',title);
   setResolvedModel(c.model, c.maxTokens);}
 function fmtDur(ms){if(ms==null||ms<=0)return '0m';const m=Math.floor(ms/60000),h=Math.floor(m/60);
   return h>0?(h+'h '+(m%60)+'m'):(m+'m');}
@@ -6217,23 +6695,26 @@ function rebuildModelOptions(){const d=(DEFAULT_MODEL_ID&&MODELS.find(m=>m.id===
 function modelOptionsFor(current){const opts=MODEL_OPTIONS.map(x=>x.slice());
   if(current&&!opts.some(x=>x[0]===current))opts.push([current,current+' (not in catalog)']);
   return opts;}
-function rebuildModelPicker(){const sel=$('#model');if(!sel)return;
-  const want=localStorage.getItem('al_model')||sel.value||'default';
-  rebuildModelOptions();const known=MODEL_OPTIONS.some(x=>x[0]===want),catalogReady=MODELS.length>0;
-  const opts=modelOptionsFor(catalogReady&&!known?'':want);sel.innerHTML='';
+function rebuildModelPicker(){rebuildModelOptions();const catalogReady=MODELS.length>0;
+  if(catalogReady&&!MODEL_OPTIONS.some(x=>x[0]===preferredModel)){
+    preferredModel='default';localStorage.setItem('al_model','default');}
+  if(!$('#newSessionDialog').open||newSessionRequest)return;
+  const sel=$('#newModel'),want=sel.value||preferredModel,effort=$('#newEffort').value;
+  const known=MODEL_OPTIONS.some(x=>x[0]===want),opts=modelOptionsFor(catalogReady&&!known?'':want);sel.innerHTML='';
   opts.forEach(([v,t])=>{const o=document.createElement('option');o.value=v;o.textContent=t;
     const meta=MODELS.find(m=>m.id===v);if(meta&&meta.description)o.title=meta.description;sel.appendChild(o);});
   if(catalogReady&&!known){const stale=document.createElement('option');stale.value=want;
     stale.textContent=want+' (saved; unavailable)';stale.disabled=true;sel.appendChild(stale);
-    sel.value='default';localStorage.setItem('al_model','default');}
-  else if(opts.some(x=>x[0]===want))sel.value=want;}
+    sel.value=preferredModel;}
+  else if(opts.some(x=>x[0]===want))sel.value=want;
+  newEffortOptions(effort);}
 function retryModelLoad(){if(MODELS.length)return;clearTimeout(modelRetryT);
   modelRetryT=setTimeout(loadModels,31000);}
 function loadModels(force){return fetch('api/models'+(force?'?fresh=1':''),{cache:'no-store'}).then(r=>r.json()).then(j=>{
   if(j.models&&j.models.length){clearTimeout(modelRetryT);DEFAULT_MODEL_ID=j.defaultModel||'';MODELS=j.models;rebuildModelPicker();
-    if(!sid||!ready){curEffort=effortForModel(curEffort,$('#model').value);
-      localStorage.setItem('al_effort',curEffort);setEffortPill(curEffort);}renderSessionChoices();}
-  else retryModelLoad();}).catch(retryModelLoad);}
+    if(!sid||!ready){curEffort=effortForModel(curEffort,preferredModel);
+      localStorage.setItem('al_effort',curEffort);setEffortPill(curEffort);}renderSessionChoices();return true;}
+  retryModelLoad();return false;}).catch(()=>{retryModelLoad();return false;});}
 /* Per-model effort capabilities come from model/list. The fallback is used only
    before that catalog arrives (or for a retired/custom model absent from it). */
 function modelMeta(value){if(value&&value!=='default')return MODELS.find(m=>m.id===value)||null;
@@ -6245,7 +6726,7 @@ function effortOptionsFor(modelValue){const m=modelMeta(modelValue);
 function effortForModel(e,modelValue){const opts=effortOptionsFor(modelValue);if(opts.includes(e))return e;
   const m=modelMeta(modelValue),d=m&&m.defaultReasoningEffort;
   if(d&&opts.includes(d))return d;if(opts.includes('xhigh'))return 'xhigh';return opts[0]||'xhigh';}
-function currentEffortModel(){return sid&&ready?activeModel:($('#model').value||'default');}
+function currentEffortModel(){return sid&&ready?activeModel:preferredModel;}
 /* reasoning effort is per-turn. A change applies to the next turn and is also
    remembered as the starting preference for future sessions. */
 function setEffortPill(e){if(e)curEffort=e;const el=$('#effort');if(el)el.textContent='🧠 '+curEffort;renderSessionChoices();}
@@ -6284,9 +6765,7 @@ function modelLabel(real,maxTok){
   let lbl=fam+(m?(' '+m[1]+'.'+m[2]):'');
   if(maxTok)lbl+='['+fmtTok(maxTok)+']';
   return lbl;}
-/* the sidebar #model picker now holds the NEW-session default, so it no longer
-   reflects the live session's resolved model (that moved to ⚙ Configure). Kept
-   as a no-op shim so existing callers (ready / context) stay valid. */
+/* Active-session choices stay separate from the new-session defaults. */
 function setResolvedModel(real,maxTok){if(real)_rmodel=real;if(maxTok)_rmax=maxTok;renderSessionChoices();}
 
 /* sidebar: live sessions (in-RAM) + resume-from-disk (past transcripts) */
@@ -6321,7 +6800,7 @@ function openConfigure(s,anchor){const m=$('#cardMenu');m.innerHTML='';m._anchor
   const initialEffortModel=currentModel!=='default'?currentModel:(s.display_model||currentModel);
   const currentEffort=effortForModel(s.effort||'',initialEffortModel);
   const modelSel=mkSel(modelOptionsFor(currentModel),currentModel);
-  const approvalSel=mkSel([['full-access','🔓 Full access'],['on-request','🔐 Approve'],['auto','⚡ Auto (sandbox)'],['read-only','👁 Read-only']],s.mode||'full-access');
+  const approvalSel=mkSel(MODE_OPTIONS,s.mode||'full-access');
   const effortSel=mkSel(effortOptionsFor(initialEffortModel).map(e=>[e,e]),currentEffort);
   modelSel.onchange=()=>{const model=modelSel.value,effort=effortForModel(effortSel.value,model);
     refill(effortSel,effortOptionsFor(model),effort);
@@ -6560,13 +7039,7 @@ function renameProject(p){
   if(nm===null)return;
   wsSend({type:'proj_rename',path:p.path,name:nm});}
 
-/* start a session in a specific folder: route through the custom-path box so the
-   picker visibly shows where the new session will run */
-function newSessionIn(path){
-  $('#project').value='__custom__';
-  $('#cwdwrap').classList.add('show');
-  $('#cwd').value=path;
-  $('#newbtn').click();}
+function newSessionIn(path){newSession(path);}
 
 function renameSession(cc,cur){
   if(!cc){alert('This session is still starting — try again in a moment.');return;}
@@ -6698,15 +7171,14 @@ function wireSearch(){
 function impMsg(t,bad){const el=$('#impmsg');if(!el)return;
   el.textContent=t||'';el.classList.toggle('bad',!!bad);
   if(t&&!bad)setTimeout(()=>{if(el.textContent===t)el.textContent='';},6000);}
-function importTarget(){const p=$('#project').value;
-  return (($('#cwd').value||'').trim())||(p==='__custom__'?'':(p||''));}
 function wireImport(){
   const btn=$('#impbtn'),inp=$('#impfile');if(!btn||!inp)return;
-  btn.onclick=()=>{if(!importTarget()){impMsg('pick a project folder above first',true);return;}
-    inp.click();};
+  let importDirectory='';
+  btn.onclick=()=>{importDirectory='';impMsg('');openFolderDialog(currentFolder()||'~',path=>{
+    importDirectory=path;inp.value='';inp.click();});};
   inp.onchange=()=>{const f=inp.files&&inp.files[0];if(!f)return;
-    const dir=importTarget();
-    if(!dir){impMsg('pick a project folder above first',true);inp.value='';return;}
+    const dir=importDirectory;
+    if(!dir){impMsg('choose an import folder first',true);inp.value='';return;}
     const fd=new FormData();fd.append('file',f);fd.append('cwd',dir);
     impMsg('importing '+f.name+' ...');
     fetch('api/import',{method:'POST',body:fd}).then(r=>r.json().then(j=>({ok:r.ok,j})))
@@ -6723,26 +7195,7 @@ function loadTree(){
     .then(j=>{projData=j.projects||[];renderSidebar();})
     .catch(()=>{});}
 
-function currentFolder(){const p=$('#project').value;
-  return p==='__custom__'?$('#cwd').value.trim():(p||'');}
-
-/* directory autocomplete for the custom path box (server /api/dircomplete) */
-let acItems=[],acSel=-1,acTimer=0;
-function acClose(){const b=$('#cwdac');b.classList.remove('on');b.innerHTML='';acItems=[];acSel=-1;}
-function acRender(j){const b=$('#cwdac');acItems=(j&&j.dirs)||[];acSel=-1;
-  if(!acItems.length){acClose();return;}
-  let html=acItems.map((p,i)=>{const base=(p.split('/').filter(Boolean).slice(-1)[0])||p;
-    return '<div class="acitem" data-i="'+i+'"><div class="acname">'+esc(base)+'</div><div class="acpath">'+esc(p)+'</div></div>';}).join('');
-  if(j&&j.more)html+='<div class="acmore">… more — keep typing to narrow</div>';
-  b.innerHTML=html;b.classList.add('on');
-  b.querySelectorAll('.acitem').forEach(el=>el.onmousedown=ev=>{ev.preventDefault();acPick(+el.dataset.i);});}
-function acPick(i){if(i<0||i>=acItems.length)return;
-  $('#cwd').value=acItems[i]+'/';   /* auto-append slash → keep drilling with the mouse, no typing */
-  $('#cwd').focus();loadTree();acQuery();}
-function acMove(d){const els=$('#cwdac').querySelectorAll('.acitem');if(!els.length)return;
-  acSel=(acSel+d+els.length)%els.length;els.forEach((el,i)=>el.classList.toggle('sel',i===acSel));els[acSel].scrollIntoView({block:'nearest'});}
-function acQuery(){clearTimeout(acTimer);const q=$('#cwd').value;
-  acTimer=setTimeout(()=>fetch('api/dircomplete?q='+encodeURIComponent(q)).then(r=>r.json()).then(acRender).catch(acClose),130);}
+function currentFolder(){return (sid&&cwd)||selectedFolder||HOMEDIR||'';}
 
 function switchSession(id){if(!id)return;if(id===sid){const current=sessionTabById(id);if(current){current.unread=false;persistSessionTabs();renderSessionTabs();}
     if(window.innerWidth<=860)closeSidebar();return;}
@@ -6753,18 +7206,143 @@ function switchSession(id){if(!id)return;if(id===sid){const current=sessionTabBy
   if(ws&&ws.readyState===1)go();else openWs(go);
   if(window.innerWidth<=860)closeSidebar();}
 function resumeSession(s){if(!s||!s.cc)return;stashSessionView(sid);saveDraft();clearUI();restoredViewId='';pendingStart=true;sid=null;renderSessionTabs();statset('resuming…');
-  const go=()=>wsSend({type:'resume',cc:s.cc,cwd:s.cwd,model:$('#model').value,mode:$('#mode').value});
+  const go=()=>wsSend({type:'resume',cc:s.cc,cwd:s.cwd,model:preferredModel,mode:preferredMode});
   if(ws&&ws.readyState===1)go();else openWs(go);
   if(window.innerWidth<=860)closeSidebar();}
-function newSession(){const proj=$('#project').value;const dir=proj==='__custom__'?$('#cwd').value.trim():proj;
-  if(!dir){addErr('pick a project directory first');return;}
-  /* keep any current session alive in the background — just spin up another */
-  const model=$('#model').value,effort=effortForModel(curEffort,model);
-  curEffort=effort;localStorage.setItem('al_effort',effort);setEffortPill(effort);
-  stashSessionView(sid);saveDraft();clearUI();restoredViewId='';pendingStart=true;sid=null;renderSessionTabs();
-  const start=()=>wsSend({type:'start',cwd:dir,model:model,mode:$('#mode').value,effort:effort});
-  if(ws&&ws.readyState===1)start();else openWs(start);statset('starting…');
-  if(window.innerWidth<=860)closeSidebar();}
+// Lucide icon paths; licenses are in static/icons/lucide-LICENSE.txt.
+const SESSION_ICON_PATHS={
+  'folder-plus':['M12 10v6','M9 13h6','M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z'],
+  refresh:['M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8','M21 3v5h-5','M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16','M8 16H3v5'],
+  x:['M18 6 6 18','m6 6 12 12'],
+  'arrow-up':['m5 12 7-7 7 7','M12 19V5'],
+  'arrow-right':['M5 12h14','m12 5 7 7-7 7'],
+  folder:['M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z'],
+  'folder-open':['m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2'],
+  house:['M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8','M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z']};
+function sessionIcon(name){return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+
+  (SESSION_ICON_PATHS[name]||[]).map(d=>'<path d="'+d+'"/>').join('')+'</svg>';}
+document.querySelectorAll('[data-session-icon]').forEach(b=>b.innerHTML=sessionIcon(b.dataset.sessionIcon));
+let newSessionRequest=null,newSessionSerial=0,folderSerial=0,folderAbort=null,folderState=null,folderSelectHandler=null;
+let folderCreateRequest=null;
+function fillSelect(sel,options,value){sel.replaceChildren();options.forEach(([v,label])=>{
+  const option=document.createElement('option');option.value=v;option.textContent=label;sel.appendChild(option);});sel.value=value;}
+function newEffortOptions(value){const model=$('#newModel').value;
+  fillSelect($('#newEffort'),effortOptionsFor(model).map(v=>[v,v]),effortForModel(value,model));}
+function newSession(path){if($('#newSessionDialog').open)return;
+  closeCardMenu();
+  const dir=(typeof path==='string'&&path)||currentFolder()||'~';
+  $('#newCwd').value=dir;$('#newSessionError').textContent='';
+  const folders=new Map();if(cwd)folders.set(cwd,cwd);
+  (projData||[]).forEach(p=>folders.set(p.path,p.path));
+  recentFolders.forEach(p=>folders.set(p,p));
+  if(selectedFolder)folders.set(selectedFolder,selectedFolder);
+  fillSelect($('#newRecent'),[['','Choose a folder'],...[...folders].map(([p])=>[p,shortPath(p)])],folders.has(dir)?dir:'');
+  fillSelect($('#newModel'),modelOptionsFor(preferredModel),preferredModel);newEffortOptions(curEffort);
+  fillSelect($('#newMode'),MODE_OPTIONS,preferredMode);
+  resetNewSessionRequest();$('#newSessionDialog').showModal();$('#newCwd').focus();}
+function resetNewSessionRequest(){if(newSessionRequest&&newSessionRequest.abort)newSessionRequest.abort.abort();newSessionRequest=null;
+  $('#newSessionFields').disabled=false;$('#newSessionSubmit').disabled=false;$('#newSessionSubmit').textContent='Start session';
+  $('#newSessionCancel').disabled=false;$('#newSessionClose').disabled=false;}
+function closeNewSession(){if(folderCreateRequest||(newSessionRequest&&newSessionRequest.phase==='starting'))return;
+  resetNewSessionRequest();$('#folderDialog').close();$('#newSessionDialog').close();}
+async function directoryData(path,hidden,signal){const r=await fetch('api/directories?path='+encodeURIComponent(path)+'&hidden='+(hidden?'1':'0'),{signal});
+  if(r.status===401)throw new Error('Authentication required. Reload after signing in.');
+  const data=await r.json();if(!r.ok||data.error)throw new Error(data.error||'Could not read this directory');
+  if(typeof data.path!=='string'||!Array.isArray(data.folders))throw new Error('Invalid directory response');return data;}
+async function submitNewSession(e){e.preventDefault();if(newSessionRequest)return;
+  const path=$('#newCwd').value.trim();if(!path){$('#newSessionError').textContent='Choose a working directory';return;}
+  if(!ws||ws.readyState!==1){$('#newSessionError').textContent='Not connected. Wait for the connection, then try again.';return;}
+  const request={id:'new-'+Date.now()+'-'+(++newSessionSerial),phase:'validating',abort:new AbortController(),
+    model:$('#newModel').value,mode:$('#newMode').value,effort:$('#newEffort').value};
+  newSessionRequest=request;$('#newSessionError').textContent='';$('#newSessionFields').disabled=true;
+  $('#newSessionSubmit').disabled=true;$('#newSessionSubmit').textContent='Checking...';
+  try{const data=await directoryData(path,false,request.abort.signal);
+    if(newSessionRequest!==request||!$('#newSessionDialog').open)return;
+    if(!ws||ws.readyState!==1)throw new Error('Not connected. Try again when the connection returns.');
+    request.phase='starting';request.cwd=data.path;$('#newCwd').value=data.path;
+    $('#newSessionSubmit').textContent='Starting...';$('#newSessionCancel').disabled=true;$('#newSessionClose').disabled=true;
+    ws.send(JSON.stringify({type:'start',requestId:request.id,cwd:data.path,model:request.model,mode:request.mode,effort:request.effort}));
+  }catch(error){if(newSessionRequest!==request)return;resetNewSessionRequest();$('#newSessionError').textContent=error.message||'Could not start session';}}
+function handleNewSessionReply(m){const request=newSessionRequest;
+  if(!request||request.phase!=='starting'||m.requestId!==request.id)return false;
+  if(m.type==='error'){resetNewSessionRequest();$('#newSessionError').textContent=m.error||'Could not start session';return true;}
+  if(m.type!=='started')return false;
+  // Keep the current view and draft intact until the new process actually exists.
+  stashSessionView(sid);saveDraft();clearUI();restoredViewId='';curCC=null;
+  preferredModel=request.model;preferredMode=request.mode;
+  localStorage.setItem('al_model',request.model);localStorage.setItem('al_mode',request.mode);localStorage.setItem('al_effort',request.effort);
+  resetNewSessionRequest();$('#newSessionDialog').close();if(window.innerWidth<=860)closeSidebar();return false;}
+function hideFolderCreate(){if(folderCreateRequest)return;$('#folderCreateForm').hidden=true;$('#folderCreateError').textContent='';$('#folderName').value='';}
+function syncFolderCreateBusy(){const busy=!!folderCreateRequest,valid=!!folderState&&$('#folderPath').value===folderState.path;
+  $('#folderName').disabled=busy;$('#folderCreateSubmit').disabled=busy;$('#folderCreateCancel').disabled=busy;
+  $('#folderCreateSubmit').textContent=busy?'Creating...':'Create';
+  $('#folderPath').disabled=busy;$('#folderHome').disabled=busy;$('#folderHidden').disabled=busy;$('#folderClose').disabled=busy;
+  $('#folderPathForm button[type=submit]').disabled=busy;
+  $('#folderUp').disabled=busy||!valid||folderState.path===folderState.parent;
+  $('#folderSelect').disabled=busy||!valid;$('#folderNew').disabled=busy||!valid;
+  $('#folderList').querySelectorAll('button').forEach(b=>b.disabled=busy);}
+function dismissFolderDialog(){if(folderCreateRequest)return;
+  if(!$('#folderCreateForm').hidden){hideFolderCreate();$('#folderNew').focus();}else $('#folderDialog').close();}
+async function createFolder(e){e.preventDefault();if(folderCreateRequest)return;
+  if(!folderState||$('#folderPath').value!==folderState.path)return;
+  const name=$('#folderName').value.trim();if(!name){$('#folderCreateError').textContent='Enter a folder name';return;}
+  const request={path:folderState.path,serial:folderSerial};folderCreateRequest=request;
+  $('#folderCreateError').textContent='';syncFolderCreateBusy();
+  try{const r=await fetch('api/directories',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:request.path,name})});
+    if(r.status===401)throw new Error('Authentication required. Reload after signing in.');
+    const data=await r.json();if(!r.ok||data.error)throw new Error(data.error||'Could not create folder');
+    if(typeof data.path!=='string')throw new Error('Could not confirm creation. Refresh the folder before trying again.');
+    if(folderCreateRequest!==request||request.serial!==folderSerial||!$('#folderDialog').open)return;
+    folderCreateRequest=null;syncFolderCreateBusy();hideFolderCreate();$('#folderPath').value=data.path;
+    await loadFolder(data.path);if($('#folderDialog').open&&folderState&&folderState.path===data.path)$('#folderSelect').focus();
+  }catch(error){if(folderCreateRequest===request&&$('#folderDialog').open)
+    $('#folderCreateError').textContent=error instanceof TypeError?'Could not confirm creation. Refresh the folder before trying again.':error.message;
+  }finally{if(folderCreateRequest===request){folderCreateRequest=null;syncFolderCreateBusy();}}}
+function openFolderDialog(path,onSelect){if($('#folderDialog').open)return;
+  folderState=null;folderCreateRequest=null;hideFolderCreate();syncFolderCreateBusy();folderSelectHandler=onSelect;
+  $('#folderDialog').showModal();loadFolder(path||HOMEDIR||'~');}
+async function loadFolder(path){if(folderCreateRequest)return;hideFolderCreate();const serial=++folderSerial;
+  if(folderAbort)folderAbort.abort();folderAbort=new AbortController();folderState=null;
+  $('#folderError').textContent='';$('#folderList').textContent='Loading...';$('#folderList').setAttribute('aria-busy','true');
+  $('#folderSelect').disabled=true;$('#folderUp').disabled=true;$('#folderNew').disabled=true;
+  try{const data=await directoryData(path,$('#folderHidden').checked,folderAbort.signal);
+    if(serial!==folderSerial||!$('#folderDialog').open)return;
+    folderState=data;$('#folderPath').value=data.path;$('#folderUp').disabled=data.path===data.parent;$('#folderList').replaceChildren();
+    data.folders.forEach(folder=>{const b=document.createElement('button');b.type='button';b.className='folder-row';
+      b.innerHTML=sessionIcon('folder')+'<span></span>'+sessionIcon('arrow-right');b.querySelector('span').textContent=folder.name;
+      b.onclick=()=>loadFolder(folder.path);$('#folderList').appendChild(b);});
+    if(!data.folders.length)$('#folderList').textContent='No subfolders';
+    if(data.truncated)$('#folderError').textContent='Showing the first 500 folders';$('#folderSelect').disabled=false;$('#folderNew').disabled=false;
+  }catch(error){if(serial!==folderSerial||!$('#folderDialog').open)return;$('#folderList').replaceChildren();$('#folderError').textContent=error.message||'Could not read directory';
+  }finally{if(serial===folderSerial)$('#folderList').setAttribute('aria-busy','false');}}
+$('#newSessionForm').onsubmit=submitNewSession;
+$('#newSessionCancel').onclick=$('#newSessionClose').onclick=closeNewSession;
+$('#newSessionDialog').addEventListener('cancel',e=>{e.preventDefault();closeNewSession();});
+document.addEventListener('keydown',e=>{if(e.key!=='Escape'||e.isComposing||!document.querySelector('.session-dialog[open]'))return;
+  e.preventDefault();e.stopImmediatePropagation();if($('#folderDialog').open)dismissFolderDialog();else closeNewSession();},true);
+$('#newRecent').onchange=()=>{if($('#newRecent').value)$('#newCwd').value=$('#newRecent').value;};
+$('#newCwd').oninput=()=>{$('#newRecent').value='';};
+$('#newModel').onchange=()=>newEffortOptions($('#newEffort').value);
+$('#newBrowse').onclick=()=>openFolderDialog($('#newCwd').value.trim()||currentFolder(),path=>{
+  $('#newCwd').value=path;$('#newRecent').value='';});
+$('#folderNew').onclick=()=>{if(!folderState||folderCreateRequest)return;
+  $('#folderCreateForm').hidden=false;$('#folderCreateError').textContent='';$('#folderName').value='';$('#folderName').focus();};
+$('#folderCreateForm').onsubmit=createFolder;
+$('#folderCreateCancel').onclick=()=>{hideFolderCreate();$('#folderNew').focus();};
+$('#folderName').addEventListener('keydown',e=>{if(e.key==='Enter'&&e.isComposing)e.preventDefault();});
+$('#folderClose').onclick=()=>{if(!folderCreateRequest)$('#folderDialog').close();};
+$('#folderDialog').addEventListener('cancel',e=>{e.preventDefault();e.stopPropagation();dismissFolderDialog();});
+$('#folderDialog').addEventListener('close',()=>{if($('#folderDialog').open)return;folderSerial++;
+  if(folderAbort)folderAbort.abort();folderState=null;folderSelectHandler=null;folderCreateRequest=null;hideFolderCreate();syncFolderCreateBusy();
+  if($('#newSessionDialog').open)$('#newCwd').focus();});
+$('#folderPathForm').onsubmit=e=>{e.preventDefault();loadFolder($('#folderPath').value.trim()||'~');};
+$('#folderPath').oninput=()=>{folderSerial++;if(folderAbort)folderAbort.abort();folderState=null;
+  hideFolderCreate();$('#folderNew').disabled=true;$('#folderSelect').disabled=true;$('#folderUp').disabled=true;$('#folderList').setAttribute('aria-busy','false');};
+$('#folderUp').onclick=()=>{if(folderState)loadFolder(folderState.parent);};
+$('#folderHome').onclick=()=>loadFolder(HOMEDIR||'~');
+$('#folderHidden').onchange=()=>loadFolder($('#folderPath').value||HOMEDIR||'~');
+$('#folderSelect').onclick=()=>{if(!folderState||$('#folderSelect').disabled)return;
+  const path=folderState.path,select=folderSelectHandler;folderSelectHandler=null;$('#folderDialog').close();if(select)select(path);};
 function endSessionById(id,name){if(!id)return;
   if(!confirm('End session '+(name?'« '+name+' »':'')+'?\nIts codex process stops; you can still resume it from disk later.'))return;
   wsSend({type:'end',id:id});
@@ -7058,8 +7636,8 @@ document.addEventListener('keydown',e=>{if(e.repeat||!e.altKey||e.ctrlKey||e.met
 sendBtn.onclick=sendMsg;
 $('#stop').onclick=doInterrupt;
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'&&running&&!srchOpen()&&!agentPanelOpen()&&!$('#cwdac').classList.contains('on')){e.preventDefault();doInterrupt();}});
-$('#newbtn').onclick=newSession;
+  if(e.key==='Escape'&&running&&!document.querySelector('.session-dialog[open]')&&!srchOpen()&&!agentPanelOpen()){e.preventDefault();doInterrupt();}});
+$('#newbtn').onclick=()=>newSession();
 /* color theme: apply + persist (the <head> script already set it pre-paint) */
 function applyTheme(t){if(t&&t!=='dark')document.documentElement.setAttribute('data-theme',t);
   else document.documentElement.removeAttribute('data-theme');}
@@ -7112,15 +7690,7 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeCardMenu();
   if(fimpOpened())fimpClose();if(pmanOpened())pmanClose();if(agentPanelOpen())closeSubagents();}});
 window.addEventListener('resize',closeCardMenu);
 window.addEventListener('scroll',closeCardMenu,true);
-/* model/mode pickers set the NEW-session default only (persisted). A running
-   session is reconfigured per-session via the ⚙ Configure menu, so editing the
-   new-session default no longer disturbs the current session. */
-$('#model').onchange=()=>{const model=$('#model').value;localStorage.setItem('al_model',model);
-  if(!sid||!ready){curEffort=effortForModel(curEffort,model);
-    localStorage.setItem('al_effort',curEffort);setEffortPill(curEffort);}};
-$('#mode').onchange=()=>localStorage.setItem('al_mode',$('#mode').value);
 rebuildModelPicker();   /* restore a saved model even before the live catalog arrives */
-{const smd=localStorage.getItem('al_mode');if(smd){const o=$('#mode');for(const x of o.options)if(x.value===smd){o.value=smd;break;}}}
 $('#tabEdits').onclick=()=>showTab('edits');
 $('#tabGit').onclick=()=>showTab('git');
 $('#dclose').onclick=()=>$('#drawer').classList.remove('open');
@@ -7134,24 +7704,11 @@ document.addEventListener('click',e=>{
   if(agentPanelOpen()&&!path.includes($('#agentPanel'))&&!e.target.closest('#agentbtn')&&!e.target.closest('.agmark'))closeSubagents();});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&drawerOpen())$('#drawer').classList.remove('open');});
 $('#grefresh').onclick=refreshGit;
-$('#project').onchange=()=>{const c=$('#project').value==='__custom__';
-  $('#cwdwrap').classList.toggle('show',c);
-  if(c){if(!$('#cwd').value)$('#cwd').value=HOMEDIR?(HOMEDIR+'/'):'';$('#cwd').focus();acQuery();}else acClose();
-  loadTree();};
-$('#cwd').addEventListener('input',acQuery);
-$('#cwd').addEventListener('focus',acQuery);
-$('#cwd').addEventListener('change',loadTree);
-$('#cwd').addEventListener('blur',()=>setTimeout(acClose,160));
-$('#cwd').addEventListener('keydown',e=>{const b=$('#cwdac');if(!b.classList.contains('on'))return;
-  if(e.key==='ArrowDown'){e.preventDefault();acMove(1);}
-  else if(e.key==='ArrowUp'){e.preventDefault();acMove(-1);}
-  else if(e.key==='Enter'&&acSel>=0){e.preventDefault();acPick(acSel);}
-  else if(e.key==='Escape')acClose();});
 
 /* ── Import folder ────────────────────────────────────────────────────────
    Register a directory as a sidebar project. Folders normally reach the sidebar
    by owning a session, so a fresh directory would otherwise be invisible until
-   its first session existed. Same /api/dircomplete backend as the path box. */
+   its first session existed. Paths use /api/dircomplete for autocomplete. */
 let fimpItems=[],fimpSel=-1,fimpT=0;
 function fimpMsg(t,bad){const e=$('#fimpmsg');if(!e)return;e.textContent=t||'';e.classList.toggle('bad',!!bad);}
 function fimpOpen(){const w=$('#fimp');w.removeAttribute('hidden');fimpMsg('');
@@ -7196,22 +7753,16 @@ $('#fimpq').addEventListener('keydown',e=>{
     else fimpAdd();}
   else if(e.key==='Escape'){e.preventDefault();fimpClose();}});
 
-/* project picker: custom path plus recent session dirs */
-(async function(){try{const r=await fetch('api/projects');const j=await r.json();HOMEDIR=j.home||'';const sel=$('#project');
-  /* Custom path… first (easy to reach); recent session dirs stay as a small
-     convenience list without scanning the filesystem for repositories. */
-  const cust=document.createElement('option');cust.value='__custom__';cust.textContent='✎  Custom path…';sel.appendChild(cust);
-  const mk=(label,items)=>{if(!items.length)return;const g=document.createElement('optgroup');g.label=label;
-    items.forEach(p=>{const o=document.createElement('option');o.value=p.path;o.textContent=p.path.split('/').slice(-2).join('/');o.title=p.path;g.appendChild(o);});sel.appendChild(g);};
-  const recent=(j.projects||[]).filter(p=>p.recent);
-  mk('Recent',recent);
-  const first=recent[0];
-  sel.value=first?first.path:'__custom__';
-  $('#cwdwrap').classList.toggle('show',sel.value==='__custom__');
+/* Recent-folder defaults for dialogs; never scan for Git repositories. */
+(async function(){try{const r=await fetch('api/projects');const j=await r.json();HOMEDIR=j.home||'';
+  recentFolders=(j.projects||[]).filter(p=>p.recent&&p.path).map(p=>p.path);
+  if(!selectedFolder)selectedFolder=recentFolders[0]||'';
   loadTree();
 }catch(e){}})();
 
-setInterval(()=>reqList(),8000);
+setInterval(()=>{reqList();if(!document.hidden&&sid&&ready){
+  for(const c of stream.querySelectorAll('.aginline[open]'))loadInlineAgent(c);
+  if($('#terminalDialog').open)wsSend({type:'terminals_read'});}},8000);
 setInterval(loadTree,30000);
 loadTree();
 loadUsage();
@@ -7223,13 +7774,33 @@ wireImport();
 wireSearch();
 loadVoiceCapabilities();
 $('#mrefresh').onclick=()=>{const b=$('#mrefresh');if(b.classList.contains('busy'))return;
-  b.classList.add('busy');loadModels(true).finally(()=>b.classList.remove('busy'));};
+  b.classList.add('busy');b.disabled=true;
+  loadModels(true).then(ok=>{if($('#newSessionDialog').open&&!newSessionRequest)
+    $('#newSessionError').textContent=ok?'':'Could not refresh model list. Try again.';})
+    .finally(()=>{b.classList.remove('busy');b.disabled=false;});};
 openWs();
 </script>
 </body>
 </html>"""
 
 PAGE_STAMP = hashlib.sha256(CONSOLE_HTML.encode("utf-8")).hexdigest()[:16]
+
+async def _context_tick():
+    now = time.monotonic()
+    pending = [(s, s.cc_id, s._context_after) for s in list(CHAT_SESSIONS.values())
+               if s.cc_id and not s.ended and (s.busy or now < s._context_refresh_until)]
+    if not pending:
+        return
+
+    def read_samples():
+        return [read_context_usage(cc, since) for _, cc, since in pending]
+
+    samples = await asyncio.get_running_loop().run_in_executor(None, read_samples)
+    for (session, cc, since), sample in zip(pending, samples):
+        if (CHAT_SESSIONS.get(session.id) is session and not session.ended
+                and session.cc_id == cc and session._context_after == since):
+            session._apply_context_sample(sample)
+
 
 def _recap_tick():
     """Periodic sweep: any session idle past the threshold gets a one-line recap,
@@ -7255,6 +7826,7 @@ def main():
         (r"/api/tree", TreeHandler),
         (r"/api/pinfolder", PinFolderHandler),
         (r"/api/dircomplete", DirCompleteHandler),
+        (r"/api/directories", DirectoriesHandler),
         (r"/api/diff", DiffHandler),
         (r"/api/usage", UsageHandler),
         (r"/api/models", ModelsHandler),
@@ -7271,6 +7843,7 @@ def main():
     loopback = BIND in ("127.0.0.1", "localhost", "::1")
     app.listen(PORT, address=BIND, max_buffer_size=IMPORT_MAX, max_body_size=IMPORT_MAX)
     tornado.ioloop.IOLoop.current().run_in_executor(None, reindex)
+    tornado.ioloop.PeriodicCallback(_context_tick, 1000).start()
     if RECAP_ENABLED:   # idle-session recap sweep (every 30s)
         tornado.ioloop.PeriodicCallback(_recap_tick, 30000).start()
     print("Codex Console on http://%s:%d" % (BIND, PORT))

@@ -164,6 +164,10 @@ class ModelCatalogTests(unittest.TestCase):
 
     def test_both_pickers_use_the_shared_dynamic_catalog(self):
         html = codex_console.CONSOLE_HTML
+        self.assertNotIn('id="model"', html)
+        self.assertNotIn('id="mode"', html)
+        self.assertIn('id="newModel"', html)
+        self.assertIn('id="newMode"', html)
         self.assertIn('<option value="default">model: default</option>', html)
         self.assertIn("fetch('api/models'", html)
         self.assertIn("modelOptionsFor(currentModel)", html)

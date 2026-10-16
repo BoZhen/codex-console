@@ -21,6 +21,66 @@ def _emitted_events(messages):
 
 
 class AppServerV2EventTests(unittest.TestCase):
+    def test_turn_end_dismisses_questions_and_approvals_without_rpc(self):
+        for error in (False, True):
+            session, _ = _session()
+            session.busy = True
+            session._on_request(17, "item/tool/requestUserInput", {
+                "questions": [{"id": "scope", "question": "Scope?"}]})
+            aid = session.log[-1]["aid"]
+            session._on_request(18, "item/commandExecution/requestApproval", {"command": "pwd"})
+            approval = session.log[-1]["aid"]
+            with mock.patch.object(session, "_send") as send:
+                session._finish_turn(error=error)
+                self.assertEqual(session._req, {})
+                resolved = [e for e in session.log if e["kind"] == "question_resolved"]
+                self.assertEqual(resolved[-1]["answers"], None)
+                self.assertTrue(next(e for e in session.log if e["kind"] == "approval_resolved")["dismissed"])
+                before = len(session.log)
+                session.resolve_answer(aid, ["local"])
+                session.resolve_approval(approval, True)
+                self.assertEqual(len(session.log), before)
+                send.assert_not_called()
+
+    def test_interrupt_invalidates_question_before_interrupt_response(self):
+        session, _ = _session()
+        session.proc = object()
+        session.turn_id = "turn-1"
+        session._on_request(17, "item/tool/requestUserInput", {
+            "questions": [{"id": "scope", "question": "Scope?"}]})
+        aid = session.log[-1]["aid"]
+        with mock.patch.object(codex_console.tornado.ioloop.IOLoop, "current"):
+            session.interrupt()
+        with mock.patch.object(session, "_send") as send:
+            session.resolve_answer(aid, ["local"])
+            send.assert_not_called()
+        self.assertNotIn(aid, session._req)
+        self.assertEqual(session.log[-1]["kind"], "question_resolved")
+
+    def test_dismiss_sends_empty_answers_once_without_ending_turn(self):
+        session, _ = _session()
+        session.busy = True
+        session._on_request(17, "item/tool/requestUserInput", {
+            "questions": [{"id": "scope", "question": "Scope?"}]})
+        aid = session.log[-1]["aid"]
+        with mock.patch.object(session, "_send") as send:
+            session.resolve_answer(aid, [])
+            session.resolve_answer(aid, [])
+        send.assert_called_once_with({"jsonrpc": "2.0", "id": 17, "result": {"answers": {}}})
+        self.assertTrue(session.busy)
+        self.assertIsNone(session.log[-1]["answers"])
+        self.assertEqual(session.queue, [])
+
+    def test_question_custom_answer_permission_is_forwarded(self):
+        session, _ = _session()
+        session._on_request(17, "item/tool/requestUserInput", {"questions": [
+            {"id": "a", "question": "A?", "options": [{"label": "yes"}]},
+            {"id": "b", "question": "B?", "isOther": True, "options": None}]})
+        a, b = session.log[-1]["questions"]
+        self.assertFalse(a["isOther"])
+        self.assertTrue(b["isOther"])
+        self.assertEqual(b["options"], [])
+
     def test_question_answers_use_id_keyed_protocol_object(self):
         session, _ = _session()
         sent = []
@@ -35,22 +95,28 @@ class AppServerV2EventTests(unittest.TestCase):
         session.resolve_answer(session.log[-1]["aid"], [])
         self.assertEqual(sent[-1]["result"], {"answers": {}})
 
-    def test_async_question_without_text_is_visible_and_answered_once(self):
+    def test_async_question_metadata_does_not_create_duplicate_question_card(self):
         session, _ = _session()
-        session.proc = object()
-        item = {"type": "agentMessage", "id": "async-1", "text": "",
+        item = {"type": "agentMessage", "id": "async-1", "text": "Preferred scope? local or all",
                 "questions": [{"title": "Preferred scope?", "options": ["local", "all"]}]}
         session._on_item(item, started=True)
         session._on_item(item, started=False)
         session._on_item(item, started=False)
-        events = [e for e in session.log if e["kind"] == "question"]
-        self.assertEqual(len(events), 1)
-        self.assertTrue(events[0]["async"])
-        self.assertEqual(events[0]["questions"][0]["options"][0]["label"], "local")
+        self.assertEqual([e["kind"] for e in session.log], ["assistant_text"])
+        self.assertEqual(session.log[0]["text"], item["text"])
+        self.assertEqual(session._req, {})
+
+    def test_obsolete_async_answer_never_enters_user_message_queue(self):
+        session, _ = _session()
+        session.proc = object()
+        session.busy = True
+        session._req["old-question"] = {"kind": "async_input", "raw": [
+            {"id": "scope", "question": "Preferred scope?"}]}
         with mock.patch.object(session, "send_user") as send:
-            session.resolve_answer(events[0]["aid"], ["local"])
-            session.resolve_answer(events[0]["aid"], ["all"])
-        send.assert_called_once_with("Preferred scope?: local")
+            session.resolve_answer("old-question", ["local"])
+        send.assert_not_called()
+        self.assertEqual(session.queue, [])
+        self.assertEqual(session.log, [])
 
     def test_speed_selection_validates_catalog_and_reaches_next_turn(self):
         session, _ = _session()

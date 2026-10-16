@@ -2,7 +2,7 @@
 
 ## Source of truth
 - Status: Active
-- Last refreshed: 2026-09-05
+- Last refreshed: 2026-09-09
 - Primary product surfaces: session sidebar, session tabs, chat stream, composer, changes drawer
 - Evidence reviewed: `README.md`, inline HTML/CSS/JS in `codex_console.py`, `faster_whisper_worker.py`, current multi-session behavior
 
@@ -59,13 +59,24 @@
 - Touch/hover differences: close, attachment, and microphone controls remain large enough for touch; tooltips are supplemental; mobile users choose images or files through the system picker while desktop paste remains available
 
 ## Interaction states
+- New session: a modal confirms the working directory, model, effort and permissions. Recent folders and a home-scoped server-side folder browser are available without repository scanning. Opening, cancelling or failing validation preserves the active session and draft; switch views only after a correlated successful start response. Escape closes the modal without interrupting a running turn.
+- Folder selection: the sidebar has no duplicate directory picker. New sessions choose their directory in the modal; importing a transcript first chooses its destination through the same folder browser. Search scope follows the active session, not an unconfirmed dialog selection.
+- Folder creation: an inline name form creates a single child of the currently browsed folder, then opens it for selection. Never overwrite an existing entry or initialize a repository. Validate names and home containment on the server, accept only JSON and reject cross-origin browser writes, and lock navigation during creation to prevent duplicate or misdirected requests.
+- Creation settings: model, catalog refresh, effort and permission controls live in the New session modal, not the sidebar. Persist model/permission defaults only after successful creation; cancelling leaves active-session settings untouched. Refresh the open modal's catalog without discarding an available selection.
+- Tool groups: the outer summary uses an accent-tinted header and left border; child calls are numbered, indented rows along a vertical guide. Expanded child headers and inset results have separate surfaces. Preserve independent group/call expansion and existing error colors across themes.
+- Subagents: one expandable activity card per child thread; refresh only open cards and preserve detail scroll position. Terminal child turns become completed or errored instead of remaining active.
+- Background terminals: a compact modal lists the attached session's commands, with refresh and per-command stop confirmation. Ignore responses belonging to a different session; unavailable interfaces show an explicit error.
 - Session controls: model and service-tier selectors sit beside the effort control; options follow the installed CLI catalog and apply to the next turn. Standard speed is always available, with Fast only when advertised.
-- Questions: asynchronous questions do not block ongoing work; submission is marked complete only after server acknowledgement. Answers follow the existing queue behavior while a turn is busy.
-- Reading: upward scrolling leaves tail-follow mode immediately; returning to the bottom resumes it. Each tab preserves that state; revealing a tab scrolls only the tab strip.
+- Context: use Codex's per-thread runtime accounting and effective window when available, with its auto-compaction threshold in the tooltip. Read local diagnostics without changing logging configuration; never substitute cumulative billing tokens. Mark request-usage fallback with `~`, invalidate samples on compaction/model changes, and ignore late samples for ended or replaced sessions.
+- Questions: render controls for explicit server requests and return answers through their RPC response. Assistant-message question metadata does not create additional controls or synthesize user messages.
+- Question lifecycle: turn completion, interruption, and termination dismiss outstanding question and approval cards without replying to expired RPCs. Dismiss skips questions without stopping the turn. Submit and Dismiss lock while sending; disconnected attempts show inline feedback.
+- Question input: single-choice options and custom answers are mutually exclusive. Custom text is offered only with `isOther` or no options, grows to 124px, submits on Enter, and inserts a newline on Shift+Enter; IME composition is not submitted.
+- Reading: upward scrolling leaves tail-follow mode immediately; returning to the bottom resumes it. A floating down-arrow appears when reading older messages and jumps to the latest message, restoring tail-follow. Each tab preserves its reading position and follow state; revealing a tab scrolls only the tab strip.
 - Updates: a page-version mismatch exposes a reload action; preserve text drafts and defer reload while recording or holding draft attachments.
 - Loading: newly resumed session tab shows its existing switching/resuming status; pressing the microphone begins model warmup concurrently with permission and initial audio capture
 - Empty: hide the strip when no tab is open
 - Error: failed attach removes stale live tabs and leaves the user in an explicit no-session state; microphone and final transcription failures retain the last usable draft; repeated live-preview failures fall back to final-only transcription without stopping the recording
+- Resume errors never create a replacement thread. An active-writer conflict asks the user to close the session in the other Codex process and retry; failed startup processes are reaped, and resumed thread IDs must match the requested session.
 - Success: activating a live tab updates chat, project binding, draft, model, and context; long sessions retain a bounded recent DOM window with explicit access to indexed history; a collapsed Plan shows only current active work and updates in place; a fully completed Plan remains visible briefly and then clears itself; adjacent calls of the same tool collapse into one summary while preserving each original call and output on expansion; subagent wait/start/input/close actions use concise labels and reserve detailed child output for the Subagents panel; pasted images and system-picked image/text/code attachments share validation, preview, draft, and send behavior; voice recording writes revisable hypotheses into the originating session draft, preserves a confirmed prefix between updates, runs a full final correction before unlocking send, restores the original selection on cancel, and never submits automatically
 - Disabled: ended/stale tabs cannot send messages
 - Offline/slow network: tabs remain visible while the socket reconnects; no session is ended by disconnect
