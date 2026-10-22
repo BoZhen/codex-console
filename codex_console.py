@@ -47,6 +47,7 @@ import tornado.web
 import tornado.websocket
 
 from context_usage import read_context_usage
+from notify_events import NotifyHub
 
 # This build drives the real `codex` CLI through its `codex app-server` JSON-RPC
 # protocol (the same backend editor integrations use). No Python SDK needed —
@@ -2984,6 +2985,64 @@ class ThreadHandler(AuthMixin, tornado.web.RequestHandler):
 
 
 CHAT_SESSIONS = {}  # id -> ChatSession (live, independent of any browser connection)
+NOTIFY = NotifyHub(lambda: CHAT_SESSIONS)
+
+
+class NotifyStreamHandler(AuthMixin, tornado.web.RequestHandler):
+    KEEPALIVE = 25
+    QUEUE_LIMIT = 128
+
+    async def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.set_header("Cache-Control", "no-store")
+        self.set_header("X-Accel-Buffering", "no")
+        self._queue = asyncio.Queue(maxsize=self.QUEUE_LIMIT)
+        self._closed = False
+        NOTIFY.streams.add(self)
+        try:
+            for event in NOTIFY.opening(self.request.headers.get("Last-Event-ID", "")):
+                self._write_event(event)
+            await self.flush()
+            while not self._closed:
+                try:
+                    event = await asyncio.wait_for(self._queue.get(), self.KEEPALIVE)
+                except asyncio.TimeoutError:
+                    self.write(": keep-alive\n\n")
+                else:
+                    if event is None:
+                        break
+                    self._write_event(event)
+                await self.flush()
+        except tornado.iostream.StreamClosedError:
+            pass
+        finally:
+            NOTIFY.streams.discard(self)
+
+    def _write_event(self, event):
+        if event.get("id"):
+            self.write("id: " + event["id"] + "\n")
+        self.write("data: " + json.dumps(event, ensure_ascii=False) + "\n\n")
+
+    def send(self, event):
+        if self._closed:
+            return
+        try:
+            self._queue.put_nowait(event)
+        except asyncio.QueueFull:
+            # Slow consumers reconnect using their last acknowledged event.
+            self._closed = True
+            while not self._queue.empty():
+                self._queue.get_nowait()
+            self._queue.put_nowait(None)
+
+    def on_connection_close(self):
+        self._closed = True
+        if hasattr(self, "_queue"):
+            while not self._queue.empty():
+                self._queue.get_nowait()
+            self._queue.put_nowait(None)
 
 
 def safe_cwd(cwd):
@@ -3287,6 +3346,8 @@ class ChatSession:
         self._waiters.clear()
         self.busy = False
         self.ended = True
+        self._dismiss_pending_requests()
+        NOTIFY.session_gone(self)
         self._emit({"type": "exit", "code": rc if rc is not None else 0})
 
     async def _stderr_reader(self):
@@ -3548,7 +3609,8 @@ class ChatSession:
             turn = p.get("turn") or {}
             for item in turn.get("items") or []:
                 self._on_item(item, started=False)
-            self._finish_turn(error=_status_type(turn.get("status")) == "failed")
+            self._finish_turn(error=_status_type(turn.get("status")) == "failed",
+                              interrupted=_status_type(turn.get("status")) == "interrupted")
         elif method == "turn/failed":
             err = (p.get("error") or {})
             self._push([{"kind": "notice", "text": "turn failed: " + _txt(err.get("message") or err)}])
@@ -3938,12 +4000,13 @@ class ChatSession:
         if events:
             self._push(events)
 
-    def _finish_turn(self, error=False, compact=False):
+    def _finish_turn(self, error=False, compact=False, interrupted=False):
         self._dismiss_pending_requests()
         if not self.busy:
             return
         ev = {"kind": "turn_done", "subtype": ("compact" if compact else "ok"),
-              "isError": bool(error)}
+              "isError": bool(error), "interrupted": bool(interrupted),
+              "notificationSilent": bool(compact or self._compact_turn)}
         if not self._compact_turn:
             ev["done_word"] = secrets.choice(DONE_PAST)
             ev["done_at"] = time.time()
@@ -4274,10 +4337,11 @@ class ChatSession:
                 if self.queue:           # messages queued before the id landed
                     self._maybe_steer()
             except Exception as ex:
-                if start:
-                    self.busy = False
                 self._push([{"kind": "notice", "text": "send failed: %r" % ex}])
-                self._drain_queue()
+                if start:
+                    self._finish_turn(error=True)
+                else:
+                    self._drain_queue()
         tornado.ioloop.IOLoop.current().spawn_callback(_q)
 
     def _maybe_steer(self):
@@ -4408,6 +4472,7 @@ class ChatSession:
         if len(self.log) > 1500:
             self.log = self.log[-1500:]
         self._emit({"type": "events", "events": evs})
+        NOTIFY.on_events(self, evs)
 
     def events_since(self, after_seq=None):
         """Return an incremental replay when the requested sequence is retained."""
@@ -4429,6 +4494,7 @@ class ChatSession:
     def terminate(self):
         self.ended = True
         self._dismiss_pending_requests()
+        NOTIFY.session_gone(self)
         self._req.clear()
         self._pending.clear()
         for fut in list(self._waiters.values()):
@@ -7891,6 +7957,7 @@ def main():
         (r"/api/transcribe/warmup", TranscribeWarmupHandler),
         (r"/api/transcribe", TranscribeHandler),
         (r"/ws/chat", ChatSocket),
+        (r"/api/notify/stream", NotifyStreamHandler),
         (r"/static/(.*)", tornado.web.StaticFileHandler,
          {"path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")}),
     ], websocket_max_message_size=WEBSOCKET_MAX_MESSAGE_SIZE)

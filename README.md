@@ -39,6 +39,7 @@ plans, file changes, and session state in one interface.
 - **Model, reasoning effort, and speed controls** from the installed Codex
   app-server, applied to the next turn.
 - **Page update notification** with draft-preserving reload.
+- **Android task notification stream** for completed turns and pending questions or approvals, with bounded reconnect replay.
 - **Context and rate-limit meters** from app-server usage events.
 - **Local `/status` and `/compact` commands**.
 - **Optional idle recap cards** generated after a configurable quiet period.
