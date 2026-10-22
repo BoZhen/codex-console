@@ -29,7 +29,7 @@ plans, file changes, and session state in one interface.
   main transcript.
 - **Expandable Agent cards** with current activity and recent child messages.
 - **Background terminals** with a command list and individual stop controls.
-- **Approvals and questions** rendered as interactive browser controls.
+- **Approvals and questions** rendered as interactive controls, with a persistent pending-question panel for non-blocking questions.
 - **Queued messages and steering** while a turn is running.
 - **Image, text, and code attachments** from desktop or mobile. Images can also
   be pasted from the clipboard. Text and code files are sent as bounded,

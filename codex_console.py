@@ -39,6 +39,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 
 import tornado.ioloop
 import tornado.iostream
@@ -935,6 +936,24 @@ def _jsonish(x):
     return x
 
 
+def _async_question_fields(questions):
+    if not isinstance(questions, list) or not 1 <= len(questions) <= 16:
+        return []
+    result = []
+    for question in questions:
+        if not isinstance(question, dict):
+            return []
+        title = question.get("title")
+        options = question.get("options") or []
+        if (not isinstance(title, str) or not title.strip() or len(title) > 8000
+                or not isinstance(options, list) or len(options) > 32
+                or any(not isinstance(o, str) or len(o) > 1000 for o in options)):
+            return []
+        result.append({"question": title, "isOther": True,
+                       "options": [{"label": o} for o in options if o.strip()]})
+    return result
+
+
 def _patch_target(patch):
     files = []
     for line in (patch or "").splitlines():
@@ -1070,7 +1089,10 @@ def parse_codex(rec, idx):
     elif pt == "function_call":
         name = p.get("name", "")
         args = _jsonish(p.get("arguments"))
-        if name == "exec_command":
+        if name == "request_user_input_async" and isinstance(args, dict) and _async_question_fields(args.get("questions")):
+            evs.append({**base, "kind": "question", "aid": "history:" + (p.get("call_id") or base["id"]),
+                        "questions": _async_question_fields(args["questions"]), "isBlocking": False, "historical": True})
+        elif name == "exec_command":
             evs.append(_codex_exec_event(base, args, p.get("call_id", "")))
         elif name == "apply_patch":
             patch = args.get("patch") if isinstance(args, dict) else _txt(args)
@@ -3129,6 +3151,8 @@ class ChatSession:
         self.turn_id = None             # current turn id (for steer / interrupt)
         self._pending = {}              # aid -> asyncio.Future (unused; kept for parity)
         self._req = {}                  # aid -> {"rpc": rpc_id, "kind": ..., "raw": ...}
+        self._async_questions = {}      # message-backed prompts; no outstanding server RPC
+        self._async_seen = {}           # also deduplicate answered prompts after item pruning
         self._aid = 0
         self.ctx = None                 # latest context-window usage
         self._request_ctx = None
@@ -3347,6 +3371,7 @@ class ChatSession:
         self.busy = False
         self.ended = True
         self._dismiss_pending_requests()
+        self._dismiss_async_questions()
         NOTIFY.session_gone(self)
         self._emit({"type": "exit", "code": rc if rc is not None else 0})
 
@@ -3579,6 +3604,17 @@ class ChatSession:
 
     # ───────── inbound: notifications → normalized events ─────────
     def _on_note(self, method, p):
+        if method == "serverRequest/resolved":
+            if "requestId" not in p:
+                return
+            # Request IDs belong to this app-server connection, including child threads.
+            for aid, meta in list(self._req.items()):
+                if meta.get("rpc") != p.get("requestId"):
+                    continue
+                if meta.get("threadId") and p.get("threadId") != meta["threadId"]:
+                    continue
+                self._dismiss_pending_requests(aid=aid, reason="resolved")
+            return
         if method == "thread/started":
             th = p.get("thread") or {}
             parent_id = th.get("parentThreadId")
@@ -3818,9 +3854,15 @@ class ChatSession:
             book["completed"] = True
             self._prune_items()
         if it == "userMessage":
+            client_id = item.get("clientId")
+            for aid, meta in list(self._async_questions.items()):
+                if client_id and meta.get("client_id") == client_id and meta.get("answers"):
+                    self._complete_async_answer(aid, meta)
             return                          # echoed locally by _echo_user
         if it == "agentMessage":
             if not started:
+                if item.get("delivery") == "async" and self._add_async_question(item):
+                    return
                 txt = item.get("text") or ""
                 if txt.strip():
                     if book.get("streamed"):
@@ -3984,24 +4026,33 @@ class ChatSession:
         if it in ("enteredReviewMode", "exitedReviewMode"):
             self._push([{"kind": "notice", "text": it}])
 
-    def _dismiss_pending_requests(self):
+    def _dismiss_pending_requests(self, aid=None, reason="expired", thread_id=None, turn_id=None):
         events = []
-        for aid, meta in list(self._req.items()):
+        for request_aid, meta in list(self._req.items()):
+            if aid is not None and request_aid != aid:
+                continue
+            if thread_id and meta.get("threadId") and meta["threadId"] != thread_id:
+                continue
+            if turn_id and meta.get("turnId") and meta["turnId"] != turn_id:
+                continue
             kind = meta.get("kind")
             if kind not in ("input", "exec", "patch", "perm"):
                 continue
-            self._req.pop(aid, None)
-            self._pending.pop(aid, None)
+            self._req.pop(request_aid, None)
+            self._pending.pop(request_aid, None)
             if kind == "input":
-                events.append({"kind": "question_resolved", "aid": aid, "answers": None})
+                events.append({"kind": "question_resolved", "aid": request_aid,
+                               "answers": None, "reason": reason})
             else:
-                events.append({"kind": "approval_resolved", "aid": aid,
+                events.append({"kind": "approval_resolved", "aid": request_aid,
                                "allow": False, "always": False, "dismissed": True})
         if events:
             self._push(events)
 
     def _finish_turn(self, error=False, compact=False, interrupted=False):
-        self._dismiss_pending_requests()
+        self._dismiss_pending_requests(thread_id=self.thread_id, turn_id=self.turn_id)
+        if interrupted:
+            self._dismiss_async_questions()
         if not self.busy:
             return
         ev = {"kind": "turn_done", "subtype": ("compact" if compact else "ok"),
@@ -4088,10 +4139,14 @@ class ChatSession:
 
     # ───────── inbound: server requests (approvals / questions) ─────────
     def _on_request(self, rpc_id, method, p):
+        if any(meta.get("rpc") == rpc_id for meta in self._req.values()):
+            return
         self._aid += 1
         aid = "ap%d" % self._aid
+        context = {"rpc": rpc_id, "threadId": p.get("threadId"),
+                   "turnId": p.get("turnId"), "itemId": p.get("itemId")}
         if method in ("item/commandExecution/requestApproval", "execCommandApproval"):
-            self._req[aid] = {"rpc": rpc_id, "kind": "exec"}
+            self._req[aid] = {**context, "kind": "exec"}
             raw_cmd = p.get("command") or ""
             cmd = _shell_command_text(raw_cmd)
             tool, shown = _codex_cmd(raw_cmd, p.get("commandActions"))
@@ -4102,26 +4157,34 @@ class ChatSession:
                                    "reason": p.get("reason"), "cwd": p.get("cwd")},
                          "toolId": p.get("itemId"), "always": True}])
         elif method in ("item/fileChange/requestApproval", "applyPatchApproval"):
-            self._req[aid] = {"rpc": rpc_id, "kind": "patch"}
+            self._req[aid] = {**context, "kind": "patch"}
             self._push([{"kind": "approval", "aid": aid, "tool": "apply_patch",
                          "input": {"reason": p.get("reason"),
                                    "changes": _cap(_summarize_changes(
                                        p.get("changes") or p.get("fileChange")))},
                          "toolId": p.get("itemId"), "always": True}])
         elif method == "item/permissions/requestApproval":
-            self._req[aid] = {"rpc": rpc_id, "kind": "perm"}
+            self._req[aid] = {**context, "kind": "perm"}
             self._push([{"kind": "approval", "aid": aid, "tool": "permissions",
                          "input": {"reason": p.get("reason")},
                          "toolId": p.get("itemId"), "always": False}])
         elif method == "item/tool/requestUserInput":
+            if p.get("itemId"):
+                self._dismiss_async_questions(item_id=p["itemId"], reason="superseded")
             qs_raw = p.get("questions") or []
             qs = [{"question": q.get("question"), "header": q.get("header"),
                    "isOther": bool(q.get("isOther", False)),
+                   "isSecret": bool(q.get("isSecret", False)),
                    "options": [{"label": o.get("label"), "description": o.get("description")}
                                for o in (q.get("options") or [])]}
                   for q in qs_raw]
-            self._req[aid] = {"rpc": rpc_id, "kind": "input", "raw": qs_raw}
-            self._push([{"kind": "question", "aid": aid, "questions": qs}])
+            blocking = p.get("isBlocking") is not False
+            event = {"kind": "question", "aid": aid, "questions": qs,
+                     "isBlocking": blocking, "threadId": p.get("threadId"),
+                     "turnId": p.get("turnId"), "itemId": p.get("itemId")}
+            self._req[aid] = {**context, "kind": "input", "raw": qs_raw,
+                              "isBlocking": blocking, "event": event}
+            self._push([event])
         else:
             # unknown server request → respond empty so codex isn't left blocked
             self._send({"jsonrpc": "2.0", "id": rpc_id, "result": {}})
@@ -4141,6 +4204,9 @@ class ChatSession:
                      "allow": bool(allow), "always": bool(allow and always)}])
 
     def resolve_answer(self, aid, answers):
+        if aid in self._async_questions:
+            self._resolve_async_answer(aid, answers)
+            return
         meta = self._req.get(aid)
         if not meta:
             return
@@ -4168,8 +4234,117 @@ class ChatSession:
         for i, q in enumerate(raw):
             val = picks[i] if i < len(picks) else None
             if val:
-                named[q.get("question") or q.get("header") or ("Q%d" % (i + 1))] = val
+                named[q.get("question") or q.get("header") or ("Q%d" % (i + 1))] = (
+                    "[hidden]" if q.get("isSecret") else val)
         self._push([{"kind": "question_resolved", "aid": aid, "answers": named or None}])
+
+    def _add_async_question(self, item):
+        iid = item.get("id")
+        questions = _async_question_fields(item.get("questions"))
+        if not iid or not questions:
+            return False
+        if iid in self._async_seen:
+            return True
+        self._async_seen[iid] = None
+        if len(self._async_seen) > 512:
+            self._async_seen.pop(next(iter(self._async_seen)))
+        if any(m.get("kind") == "input" and m.get("itemId") == iid for m in self._req.values()):
+            return True
+        aid = "async:" + iid
+        if aid not in self._async_questions:
+            event = {"kind": "question", "aid": aid, "questions": questions, "isBlocking": False,
+                     "source": "async_message", "itemId": iid, "threadId": self.thread_id}
+            self._async_questions[aid] = {"event": event, "client_id": str(uuid.uuid4())}
+            self._push([event])
+        return True
+
+    def _dismiss_async_questions(self, item_id=None, reason="expired", preserve_sending=False):
+        for aid, meta in list(self._async_questions.items()):
+            if item_id and meta["event"].get("itemId") != item_id:
+                continue
+            if preserve_sending and meta.get("sending"):
+                continue
+            del self._async_questions[aid]
+            self._push([{"kind": "question_resolved", "aid": aid, "answers": None, "reason": reason}])
+
+    def _complete_async_answer(self, aid, meta):
+        if self._async_questions.get(aid) is not meta:
+            return
+        del self._async_questions[aid]
+        self._push([{"kind": "question_resolved", "aid": aid, "answers": meta.get("answers")}])
+
+    def _resolve_async_answer(self, aid, answers):
+        meta = self._async_questions.get(aid)
+        if not meta or meta.get("sending"):
+            return
+        if answers == []:
+            self._async_questions.pop(aid)
+            self._push([{"kind": "question_resolved", "aid": aid, "answers": None}])
+            return
+        questions = meta["event"]["questions"]
+        if (meta.get("uncertain") or not isinstance(answers, list) or len(answers) != len(questions)
+                or any(not isinstance(a, str) or not a.strip() or len(a) > 16000 for a in answers)):
+            return
+        meta["answers"] = answers
+        meta["sending"] = True
+        meta["event"] = dict(meta["event"], answerState="sending")
+        self._push([{"kind": "question_state", "aid": aid, "state": "sending"}])
+        tornado.ioloop.IOLoop.current().spawn_callback(self._submit_async_answer, aid, meta)
+
+    async def _submit_async_answer(self, aid, meta):
+        if self._async_questions.get(aid) is not meta:
+            return
+        started = False
+        try:
+            if not self.proc or self.ended or self.compacting:
+                raise ValueError("Codex is not ready to receive this answer")
+            text = "\n\n".join(q["question"] + ": " + a for q, a in zip(meta["event"]["questions"], meta["answers"]))
+            params = {"threadId": self.thread_id, "clientUserMessageId": meta["client_id"],
+                      "input": [{"type": "text", "text": text}]}
+            if self.busy:
+                if not self.turn_id:
+                    raise ValueError("The active turn is not ready; try again shortly")
+                params["expectedTurnId"] = self.turn_id
+                method = "turn/steer"
+            else:
+                method = "turn/start"
+                ap, sbx = _mode_policy(self.mode)
+                params.update(approvalPolicy=ap, sandboxPolicy=_sandbox_policy(sbx))
+                if self.effort:
+                    params["effort"] = self.effort
+                if self.model and self.model != "default":
+                    params["model"] = self.model
+                if self.service_tier is not None:
+                    params["serviceTier"] = self.service_tier
+                self.busy = True
+                started = True
+                self.turn_started = time.time()
+                self.turn_word = secrets.randbelow(100000)
+                self._tok_up = self._tok_out = self._tok_chars = 0
+                self._tok_exact = False
+                self._step = 0
+                self._push([{"kind": "turn_start", "word": self.turn_word}])
+            # Message-backed questions have no reply RPC. Deliver once directly,
+            # never via send_user/_dispatch or the ordinary chat-message queue.
+            result = await self._request(method, params)
+            if started and self.busy:
+                self.turn_id = ((result or {}).get("turn") or {}).get("id") or self.turn_id
+            self._complete_async_answer(aid, meta)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if self._async_questions.get(aid) is not meta:
+                return
+            unknown = isinstance(error, (asyncio.TimeoutError, ConnectionError))
+            meta["sending"] = False
+            meta["uncertain"] = unknown
+            state = "uncertain" if unknown else "failed"
+            meta["event"] = dict(meta["event"], answerState=state)
+            message = ("Delivery not confirmed. Check the conversation before sending another answer."
+                       if unknown else "Answer was not sent. Check the connection or turn state, then try again.")
+            self._push([{"kind": "question_error", "aid": aid, "state": state, "message": message}])
+            if started and not unknown:
+                self._finish_turn(error=True)
 
     # ───────── outbound: user messages / turns ─────────
     def turn_age(self):
@@ -4231,6 +4406,8 @@ class ChatSession:
             return
         if self._handle_local_command(text, images, files):
             return
+        if text.strip() != "/compact":
+            self._dismiss_async_questions(reason="continued", preserve_sending=True)
         if self.busy:
             self._qid += 1
             qid = "q%d" % self._qid
@@ -4376,6 +4553,7 @@ class ChatSession:
 
     def interrupt(self):
         self._dismiss_pending_requests()
+        self._dismiss_async_questions()
         if self.proc and not self.ended:
             if self.queue:
                 self._push([{"kind": "unqueued", "qid": it["qid"]} for it in self.queue])
@@ -4449,6 +4627,11 @@ class ChatSession:
         self._notice("⚙ approval → %s (applies next turn)" % self.mode)
 
     # ───────── viewers / log ─────────
+    def pending_questions_snapshot(self):
+        return ([dict(meta["event"]) for meta in self._req.values()
+                 if meta.get("kind") == "input" and meta.get("event")]
+                + [dict(meta["event"]) for meta in self._async_questions.values()])
+
     def attach(self, ws):
         self.viewers.add(ws)
         self._context_refresh_until = time.monotonic() + 10
@@ -4494,6 +4677,7 @@ class ChatSession:
     def terminate(self):
         self.ended = True
         self._dismiss_pending_requests()
+        self._dismiss_async_questions()
         NOTIFY.session_gone(self)
         self._req.clear()
         self._pending.clear()
@@ -4684,6 +4868,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "mode": sess.mode, "effort": sess.effort, "serviceTier": sess.service_tier,
                        "activity": sess.last_activity,
                        "event_seq": sess.event_seq,
+                       "pending_questions": sess.pending_questions_snapshot(),
                        "subagents": sess.subagents_snapshot()})
         elif mt == "detach":
             old = self.session
@@ -4708,6 +4893,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "mode": sess.mode, "serviceTier": sess.service_tier,
                        "busy": sess.busy, "ended": sess.ended, "events": events,
                        "events_delta": events_delta, "event_seq": sess.event_seq,
+                       "pending_questions": sess.pending_questions_snapshot(),
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
                        "compacting": sess.compacting,
                        "activity": sess.last_activity,
@@ -4757,6 +4943,7 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "mode": sess.mode, "serviceTier": sess.service_tier,
                        "busy": sess.busy, "ended": sess.ended, "events": sess.log,
                        "events_delta": False, "event_seq": sess.event_seq,
+                       "pending_questions": sess.pending_questions_snapshot(),
                        "turn_age": sess.turn_age(), "word": sess.turn_word, "effort": sess.effort,
                        "compacting": sess.compacting, "resumed": True,
                        "activity": sess.last_activity,
@@ -5278,6 +5465,8 @@ pre code{background:none;border:none;padding:0}
 .question .qh{padding:8px 10px;color:var(--usr);font-weight:600;display:flex;gap:7px;align-items:center}
 .question .qblk{padding:8px 10px;border-top:1px solid var(--infoln)}
 .question .qtext{font-weight:600;margin-bottom:7px}
+.question .qtext{white-space:pre-wrap;overflow-wrap:anywhere}
+.question .qmode{font-size:11px;font-weight:400;color:var(--mut);margin-left:auto}
 .question .qtext .chip{font-weight:600;color:var(--mut);font-size:11px;border:1px solid var(--line);border-radius:4px;padding:1px 5px;margin-right:6px}
 .question .qopts{display:flex;flex-direction:column;gap:6px}
 .question .qopt{text-align:left;padding:8px 10px;border-radius:6px;cursor:pointer;background:var(--bg3);
@@ -5298,6 +5487,18 @@ pre code{background:none;border:none;padding:0}
 .question.done .qbtns{display:none}
 .question.done .qopt,.question.done .qother{pointer-events:none;opacity:.7}
 .question .qdone{padding:8px 10px;border-top:1px solid var(--infoln);color:var(--addfg);font-weight:600}
+#questionDock{flex:none;background:var(--bg2);border-top:1px solid var(--line)}
+#questionDock[hidden],#questionPanel[hidden]{display:none}
+.question-bar{display:flex;align-items:center;gap:4px;padding:4px 10px}
+#questionToggle{display:flex;align-items:center;gap:8px;min-width:0;flex:1;text-align:left;
+  border:0;background:transparent;color:var(--usr);padding:6px 0;cursor:pointer;font:inherit;font-size:12px}
+#questionCount{flex:none;font-weight:600}
+#questionSummary{min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;color:var(--mut)}
+.question-nav{width:28px;height:28px;border:0;background:transparent;color:var(--fg);cursor:pointer;flex:none;border-radius:4px}
+.question-nav:hover{background:var(--bg3)}
+.question-nav:disabled{opacity:.35;cursor:default}
+#questionPanel{max-height:45vh;overflow-y:auto;padding:0 10px 4px;overscroll-behavior:contain}
+#questionPanel>.question{max-width:820px;margin:0 auto 4px}
 #stop{background:var(--nobg);color:var(--delfg);border:1px solid var(--del);border-radius:10px;width:38px;height:38px;flex:none;display:inline-flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;cursor:pointer}
 
 /* sessions sidebar + shell layout */
@@ -5741,6 +5942,15 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="m19 12-7 7-7-7"/></svg>
       </button>
     </div>
+    <div id="questionDock" hidden>
+      <div class="question-bar">
+        <button id="questionToggle" type="button" aria-expanded="false" aria-controls="questionPanel" title="Pending questions"><span id="questionCount" aria-live="polite"></span><span id="questionSummary"></span></button>
+        <button id="questionPrev" class="question-nav" type="button" title="Previous question" aria-label="Previous question" hidden>←</button>
+        <button id="questionNext" class="question-nav" type="button" title="Next question" aria-label="Next question" hidden>→</button>
+        <button id="questionClose" class="question-nav" type="button" title="Collapse questions" aria-label="Collapse questions" hidden>✕</button>
+      </div>
+      <div id="questionPanel" role="region" aria-label="Pending question" hidden></div>
+    </div>
     <div id="composer">
       <button id="pageUpdate" class="choicebtn" type="button" hidden>Update available · Reload</button>
       <div class="pillrow">
@@ -6057,7 +6267,7 @@ function renderWindowMarker(){let marker=stream.querySelector(':scope > .window-
   marker.innerHTML='<span>'+windowHidden+' earlier item'+(windowHidden===1?'':'s')+' hidden to keep this tab responsive</span>'+
     '<button type="button" title="Search full session history" aria-label="Search full session history">🕘</button>';
   marker.querySelector('button').onclick=()=>{openSearch();$('#srchscope').value='session';$('#srchq').focus();};}
-function windowProtected(el){return el.matches('.streaming,.tool:not(.done),.approval:not(.done),.question:not(.done)')||
+function windowProtected(el){return el.matches('.streaming,.tool:not(.done),.approval:not(.done),.question:not(.done),.question-anchor')||
   el.matches('.aginline:not(.done),.aginline[open]')||
   (el.classList.contains('toolgroup')&&!!el.querySelector('.tool:not(.done)'));}
 function sweepWindowRefs(){const edits=$('#edits'),kept=el=>el&&(stream.contains(el)||(edits&&edits.contains(el)));
@@ -6470,7 +6680,7 @@ function startThinking(wordSeed,elapsedMs){const el=$('#thinking');if(!el)return
 function stopThinking(){clearInterval(thinkTimer);thinkTimer=0;const el=$('#thinking');if(el)el.classList.remove('compacting');}
 function fmtSecs(ms){const s=Math.max(0,Math.round(ms/1000));if(s<60)return s+'s';const m=Math.floor(s/60);return m+'m '+(s%60)+'s';}
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
-function clearUI(){stream.innerHTML='';$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
+function clearUI(){returnDockedQuestion();stream.innerHTML='';refreshQuestionDock();$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;
   setComposerEnabled(false);
   if(asstRenderT){clearTimeout(asstRenderT);asstRenderT=0;}
@@ -6519,20 +6729,67 @@ function growOther(o){o.style.height='auto';o.style.height=Math.min(o.scrollHeig
 function qval(bl){const other=bl.querySelector('.qother'),selected=bl.querySelector('.qopt.sel');
   if(other&&other.value.trim())return other.value.trim();
   return selected?selected.dataset.label:'';}
-function addQuestion(ev){const c=document.createElement('div');c.className='question';c.dataset.aid=ev.aid;
-  const qs=ev.questions||[];let h='<div class="qh">❓ <b>Question'+(qs.length>1?'s':'')+'</b></div>';
+let questionOrder=0;
+function questionCards(){return [...stream.querySelectorAll('.question'),...$('#questionPanel').querySelectorAll('.question')];}
+function pendingQuestions(){return questionCards().filter(c=>!c.classList.contains('done')).sort((a,b)=>a._questionOrder-b._questionOrder);}
+function returnDockedQuestion(){const panel=$('#questionPanel'),c=panel.firstElementChild;
+  if(c){if(c._anchor&&stream.contains(c._anchor))c._anchor.replaceWith(c);else stream.appendChild(c);c._anchor=null;}
+  panel.hidden=true;}
+function refreshQuestionDock(){const pending=pendingQuestions(),panel=$('#questionPanel'),c=panel.firstElementChild;
+  $('#questionDock').hidden=!pending.length;
+  $('#questionCount').textContent='Questions '+pending.length;
+  $('#questionSummary').textContent=(c||pending[0])?._questionSummary||'';
+  $('#questionToggle').setAttribute('aria-expanded',String(!panel.hidden&&!!pending.length));
+  $('#questionPrev').hidden=$('#questionNext').hidden=panel.hidden||pending.length<2;
+  $('#questionClose').hidden=panel.hidden;
+  if(!pending.length)returnDockedQuestion();}
+function openQuestionPanel(aid){returnDockedQuestion();const pending=pendingQuestions();
+  const c=pending.find(x=>x.dataset.aid===aid)||pending[0];if(!c){refreshQuestionDock();return;}
+  const anchor=document.createElement('div');anchor.className='question-anchor';anchor.hidden=true;
+  c.before(anchor);c._anchor=anchor;$('#questionPanel').appendChild(c);$('#questionPanel').hidden=false;
+  refreshQuestionDock();const input=c.querySelector('.qother:not(:disabled),.qopt:not(:disabled)');if(input)input.focus({preventScroll:true});}
+function closeQuestionPanel(){returnDockedQuestion();refreshQuestionDock();}
+function syncPendingQuestions(events){if(!Array.isArray(events))return;
+  const live=new Set(events.map(e=>e.aid));
+  pendingQuestions().forEach(c=>{if(!live.has(c.dataset.aid))resolveQuestionCard(c.dataset.aid,null,'resolved');});
+  events.forEach(ev=>{let c=questionCards().find(c=>c.dataset.aid===ev.aid);
+    if(c&&c.classList.contains('done')){c.remove();c=null;}
+    if(!c){addQuestion(ev);c=questionCards().find(c=>c.dataset.aid===ev.aid);}
+    if(c)applyQuestionState(ev.aid,ev.answerState||'',ev.answerState==='uncertain'?'Delivery not confirmed. Check the conversation before resending.':'');
+  });refreshQuestionDock();}
+function cycleQuestion(step){const pending=pendingQuestions(),active=$('#questionPanel').firstElementChild;
+  if(pending.length){const i=Math.max(0,pending.indexOf(active));openQuestionPanel(pending[(i+step+pending.length)%pending.length].dataset.aid);}}
+$('#questionToggle').onclick=()=>{$('#questionPanel').hidden?openQuestionPanel():closeQuestionPanel();};
+$('#questionClose').onclick=closeQuestionPanel;
+$('#questionPrev').onclick=()=>cycleQuestion(-1);$('#questionNext').onclick=()=>cycleQuestion(1);
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape'&&!e.isComposing&&!$('#questionPanel').hidden&&$('#questionDock').contains(e.target)){
+    e.preventDefault();e.stopImmediatePropagation();closeQuestionPanel();$('#questionToggle').focus();}
+});
+function applyQuestionState(aid,state,message){const c=questionCards().find(c=>c.dataset.aid===aid);
+  if(!c||c.classList.contains('done'))return;
+  c._sending=state==='sending';c._uncertain=state==='uncertain';
+  c.querySelectorAll('.qopt,.qother').forEach(el=>el.disabled=!!(c._sending||c._uncertain));
+  c.querySelector('.qfeedback').textContent=message||'';if(c._refresh)c._refresh();}
+function addQuestion(ev){if(questionCards().some(c=>c.dataset.aid===ev.aid))return;
+  const c=document.createElement('div');c.className='question';c.dataset.aid=ev.aid;c._questionOrder=++questionOrder;
+  const qs=ev.questions||[];c._questionSummary=(qs[0]&&qs[0].question)||'Pending answer';
+  let h='<div class="qh">❓ <b>Question'+(qs.length>1?'s':'')+'</b>'+(ev.historical?'<span class="qmode">history</span>':ev.isBlocking===false?'<span class="qmode">answer when ready</span>':'')+'</div>';
   qs.forEach((q,qi)=>{h+='<div class="qblk" data-qi="'+qi+'">'+
     '<div class="qtext">'+(q.header?'<span class="chip">'+esc(q.header)+'</span>':'')+esc(q.question||('Question '+(qi+1)))+'</div>'+
     '<div class="qopts">';
     (q.options||[]).forEach(o=>{h+='<button class="qopt" data-label="'+esc(o.label)+'">'+esc(o.label)+
       (o.description?'<span class="od">'+esc(o.description)+'</span>':'')+'</button>';});
     h+='</div>';
-    if(q.isOther||!(q.options||[]).length)h+='<textarea class="qother" rows="1" aria-label="'+escAttr(q.question||'Custom answer')+'" placeholder="Custom answer…"></textarea>';
+    if(!ev.historical&&(q.isOther||!(q.options||[]).length))h+=q.isSecret?
+      '<input class="qother" type="password" autocomplete="off" aria-label="'+escAttr(q.question||'Secret answer')+'">':
+      '<textarea class="qother" rows="1" aria-label="'+escAttr(q.question||'Custom answer')+'" placeholder="Custom answer…"></textarea>';
     h+='</div>';});
   h+='<div class="qfeedback" role="status" aria-live="polite"></div><div class="qbtns"><button class="qsub" type="button" disabled>Submit</button><button class="qdismiss" type="button">Dismiss</button></div>';
   c.innerHTML=h;const sub=c.querySelector('.qsub'),dismiss=c.querySelector('.qdismiss'),feedback=c.querySelector('.qfeedback');
   function refresh(){let ok=qs.length>0;c.querySelectorAll('.qblk').forEach(bl=>{if(!qval(bl))ok=false;});
-    const locked=c._sending||c.classList.contains('done');sub.disabled=!!locked||!ok;dismiss.disabled=!!locked;}
+    const locked=c._sending||c.classList.contains('done');sub.disabled=!!locked||!!c._uncertain||!ok;dismiss.disabled=!!locked;}
+  c._refresh=refresh;
   c.querySelectorAll('.qblk').forEach(bl=>{const other=bl.querySelector('.qother');
     bl.querySelectorAll('.qopt').forEach(b=>{b.onclick=()=>{
       if(c._sending||c.classList.contains('done'))return;
@@ -6541,7 +6798,7 @@ function addQuestion(ev){const c=document.createElement('div');c.className='ques
       refresh();};});
     if(other){other.oninput=()=>{if(other.value.trim())bl.querySelectorAll('.qopt.sel').forEach(b=>b.classList.remove('sel'));growOther(other);refresh();};
       other.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing&&e.keyCode!==229){e.preventDefault();if(!sub.disabled)sub.click();}};}});
-  function submit(picks){if(c._sending||c.classList.contains('done'))return;
+  function submit(picks){if(c._sending||c.classList.contains('done')||(c._uncertain&&picks.length))return;
     if(!ws||ws.readyState!==1){feedback.textContent='Not connected — try again';refresh();return;}
     c._sending=true;feedback.textContent='';refresh();
     c.querySelectorAll('.qopt,.qother').forEach(el=>el.disabled=true);
@@ -6549,15 +6806,31 @@ function addQuestion(ev){const c=document.createElement('div');c.className='ques
     catch(e){c._sending=false;c.querySelectorAll('.qopt,.qother').forEach(el=>el.disabled=false);feedback.textContent='Not connected — try again';refresh();}}
   sub.onclick=()=>{if(!sub.disabled)submit(qs.map((q,qi)=>qval(c.querySelector('.qblk[data-qi="'+qi+'"]'))));};
   dismiss.onclick=()=>submit([]);
-  stream.appendChild(c);scroll();}
-function resolveQuestionCard(aid,ans){const c=stream.querySelector('.question[data-aid="'+aid+'"]');
+  c.addEventListener('keydown',e=>{const option=e.target.closest('.qopt');
+    if(!option||option.disabled||e.isComposing||e.altKey||e.ctrlKey||e.metaKey||e.shiftKey)return;
+    if(e.key==='ArrowUp'||e.key==='ArrowDown'){
+      e.preventDefault();e.stopPropagation();const options=[...option.parentElement.querySelectorAll('.qopt')];
+      const next=options[(options.indexOf(option)+(e.key==='ArrowDown'?1:-1)+options.length)%options.length];
+      next.focus({preventScroll:true});next.click();
+    }else if(e.key==='Enter'){
+      e.preventDefault();e.stopPropagation();option.click();if(!sub.disabled)sub.click();
+    }});
+  stream.appendChild(c);
+  if(ev.historical)resolveQuestionCard(ev.aid,null,'history');
+  else if(ev.answerState)applyQuestionState(ev.aid,ev.answerState);
+  refreshQuestionDock();if(!replaying&&ev.isBlocking!==false)scroll();}
+function resolveQuestionCard(aid,ans,reason){const c=questionCards().find(c=>c.dataset.aid===aid);
   if(!c||c.classList.contains('done'))return;c.classList.add('done');
+  c.querySelectorAll('input[type="password"]').forEach(el=>el.value='');
   c.querySelectorAll('button,textarea,input').forEach(el=>el.disabled=true);
   const feedback=c.querySelector('.qfeedback');if(feedback)feedback.textContent='';
   let vals=null;if(Array.isArray(ans))vals=ans.filter(Boolean);
   else if(ans&&typeof ans==='object')vals=Object.values(ans);
   const bt=c.querySelector('.qbtns');const has=vals&&vals.length;
-  if(bt)bt.insertAdjacentHTML('afterend','<div class="qdone">'+(has?'✓ '+vals.map(esc).join(' · '):'✕ dismissed')+'</div>');}
+  const closed=reason==='resolved'||reason==='superseded'?'Resolved':reason==='history'?'Earlier question':reason==='continued'?'Continued in chat':reason==='expired'?'✕ expired':'✕ dismissed';
+  if(bt)bt.insertAdjacentHTML('afterend','<div class="qdone">'+(has?'✓ '+vals.map(esc).join(' · '):closed)+'</div>');
+  const wasDocked=$('#questionPanel').contains(c);if(wasDocked)returnDockedQuestion();
+  refreshQuestionDock();if(wasDocked&&pendingQuestions().length)openQuestionPanel();}
 function fmtCompacted(ev){let s='🗜 context compacted';
   if(ev.pre!=null||ev.post!=null)s+=' · '+fmtTok(ev.pre)+' → '+fmtTok(ev.post)+' tokens';
   if(ev.trigger)s+=' · '+(ev.trigger==='auto'?'auto':'manual');
@@ -6589,7 +6862,8 @@ function route(ev){const seq=Number(ev&&ev._seq||0),tab=sessionTabById(sid);
   else if(ev.kind==='approval')addApproval(ev);
   else if(ev.kind==='approval_resolved')resolveApprovalCard(ev.aid,ev.allow,ev.always,ev.dismissed);
   else if(ev.kind==='question')addQuestion(ev);
-  else if(ev.kind==='question_resolved')resolveQuestionCard(ev.aid,ev.answers);
+  else if(ev.kind==='question_resolved')resolveQuestionCard(ev.aid,ev.answers,ev.reason);
+  else if(ev.kind==='question_state'||ev.kind==='question_error')applyQuestionState(ev.aid,ev.state,ev.message);
   else if(ev.kind==='turn_start'){tokShow=false;setBusy(true,ev.word,0);}
   else if(ev.kind==='compacting'){compacting=true;setBusy(true,ev.word,0);}
   else if(ev.kind==='compacted'){compacting=false;addNotice(fmtCompacted(ev));if(ev.trigger!=='auto')setBusy(false);}
@@ -6611,7 +6885,7 @@ function route(ev){const seq=Number(ev&&ev._seq||0),tab=sessionTabById(sid);
 }
 
 /* persistent server-side session: attach / reattach / switch */
-function markEnded(msg){ready=false;setComposerEnabled(false);$('#dot').className='dot';statset('ended');
+function markEnded(msg){syncPendingQuestions([]);ready=false;setComposerEnabled(false);$('#dot').className='dot';statset('ended');
   localStorage.removeItem(SKEY);if(msg)addNotice(msg);}
 function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='hello'){if(m.stamp&&m.stamp!==PAGE_STAMP)$('#pageUpdate').hidden=false;return;}
@@ -6621,14 +6895,14 @@ function onMsg(e){const m=JSON.parse(e.data);
     activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');setEffortPill(m.effort);renderCtx(null);statset('ready');
     const startedTab=ensureSessionTab(m,true);planCollapsed=!!(startedTab&&startedTab.planCollapsed);
     if(startedTab){startedTab.lastSeq=Number(m.event_seq||0);startedTab.serverSeq=startedTab.lastSeq;persistSessionTabs();}restoredViewId=m.id;
-    mergeSubagents(m.subagents||[],true);
+    mergeSubagents(m.subagents||[],true);syncPendingQuestions(m.pending_questions);
     addNotice('new session « '+(m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');reqList();loadTree();}
   else if(m.type==='attached'){const incremental=!!m.events_delta&&restoredViewId===m.id,stick=incremental&&atBottom();
     if(!incremental){clearUI();restoredViewId='';}pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
     activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setEffortPill(m.effort);renderCtx(m.ctx);renderUsage(m.usage);statset(m.ended?'ended':'ready');
     const attachedMeta=ensureSessionTab(m,true);planCollapsed=!!(attachedMeta&&attachedMeta.planCollapsed);
     if(!incremental&&m.events&&m.events.length)windowHidden=Math.max(0,Number(m.events[0]._seq||1)-1);
-    replaying=true;m.events.forEach(route);replaying=false;flushAsstRenders(!m.busy);
+    replaying=true;m.events.forEach(route);syncPendingQuestions(m.pending_questions);replaying=false;flushAsstRenders(!m.busy);
     trimChatWindow(true);
     mergeSubagents(m.subagents||[],incremental);
     compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);loadDraft(sid);
@@ -6684,10 +6958,11 @@ function sessionTabById(id){return sessionTabState.find(t=>t.id===id)||null;}
 function takeChildren(el){const f=document.createDocumentFragment();if(el)while(el.firstChild)f.appendChild(el.firstChild);return f;}
 function restoreChildren(el,frag){if(!el)return;el.innerHTML='';if(frag)el.appendChild(frag);}
 function stashSessionView(id){if(!id)return false;const t=sessionTabById(id);if(!t)return false;
+  const questionAid=$('#questionPanel').firstElementChild?.dataset.aid||'';closeQuestionPanel();
   flushAsstRenders(false);trimChatWindow(true);rememberActiveTabView();
   if(planHideT){clearTimeout(planHideT);planHideT=0;const rec=planItems['plan-current'];
     if(rec&&planAllCompleted(rec.plan))$('#planDock').hidden=true;}
-  sessionViewCache.set(id,{stream:takeChildren(stream),plan:takeChildren($('#planDock')),planHidden:$('#planDock').hidden,
+  sessionViewCache.set(id,{stream:takeChildren(stream),questionAid:questionAid,plan:takeChildren($('#planDock')),planHidden:$('#planDock').hidden,
     edits:takeChildren($('#edits')),git:takeChildren($('#gitc')),tools:tools,editCount:editCount,textItems:textItems,
     thinkItems:thinkItems,planItems:planItems,turnDiffCards:turnDiffCards,subagents:subagents,
     subagentCurrent:subagentCurrent,queued:queued,ctx:currentCtx,cwd:cwd,cc:curCC,model:activeModel,
@@ -6695,8 +6970,9 @@ function stashSessionView(id){if(!id)return false;const t=sessionTabById(id);if(
     windowHidden:windowHidden,windowHiddenChars:windowHiddenChars,planCollapsed:planCollapsed,
     elapsed:running?Math.max(0,Date.now()-thinkStart):0,tokUp:tokUp,tokOut:tokOut,tokShow:tokShow,
     title:$('#curname').textContent||t.title||'session'});
-  persistSessionTabs();return true;}
+  refreshQuestionDock();persistSessionTabs();return true;}
 function restoreSessionView(id){const v=sessionViewCache.get(id);if(!v)return false;
+  returnDockedQuestion();
   restoreChildren(stream,v.stream);restoreChildren($('#planDock'),v.plan);$('#planDock').hidden=!!v.planHidden;
   restoreChildren($('#edits'),v.edits);restoreChildren($('#gitc'),v.git);
   tools=v.tools||{};editCount=v.editCount||0;textItems=v.textItems||{};thinkItems=v.thinkItems||{};
@@ -6707,7 +6983,7 @@ function restoreSessionView(id){const v=sessionViewCache.get(id);if(!v)return fa
   activeModel=v.model||'default';activeTier=v.serviceTier||null;tokUp=v.tokUp||0;tokOut=v.tokOut||0;tokShow=!!v.tokShow;
   ready=!!v.ready;compacting=!!v.compacting;bindProject(cwd);setCurname(v.title);renderCtx(v.ctx);setEffortPill(v.effort);
   updateEditBadge();renderQueue();renderSubagentBadge();renderSubagents();running=false;setBusy(!!v.running,v.word,v.elapsed);
-  loadDraft(id);restoreSessionTabView(id);restoredViewId=id;return true;}
+  loadDraft(id);restoreSessionTabView(id);restoredViewId=id;refreshQuestionDock();if(v.questionAid)openQuestionPanel(v.questionAid);return true;}
 function persistSessionTabs(){try{localStorage.setItem(TABSKEY,JSON.stringify(sessionTabState));}catch(e){}}
 function renderSessionTabs(){const host=$('#sessionTabs');if(!host)return;
   host.hidden=!sessionTabState.length||(!tabsValidated&&!sid);host.innerHTML='';if(host.hidden)return;

@@ -21,6 +21,92 @@ def _emitted_events(messages):
 
 
 class AppServerV2EventTests(unittest.TestCase):
+    def test_pending_question_snapshot_survives_log_window_and_clears_on_answer(self):
+        session, _ = _session()
+        session._on_request(17, "item/tool/requestUserInput", {
+            "isBlocking": False, "questions": [{"id": "q", "question": "Which dataset?"}]})
+        event = dict(session.log[-1])
+        session._push([{"kind": "notice", "text": "progress"} for _ in range(1600)])
+        self.assertFalse(any(e.get("kind") == "question" for e in session.log))
+        self.assertEqual(session.pending_questions_snapshot(), [event])
+        with mock.patch.object(session, "_send"):
+            session.resolve_answer(event["aid"], ["fixture"])
+        self.assertEqual(session.pending_questions_snapshot(), [])
+
+    def test_nonblocking_question_retains_rpc_context_and_never_queues_answer(self):
+        session, _ = _session()
+        session.busy = True
+        request = {"threadId": "parent", "turnId": "turn-1", "itemId": "ask-1",
+                   "isBlocking": False, "autoResolutionMs": 100,
+                   "questions": [{"id": "scope", "question": "Which scope?", "isOther": True}]}
+        session._dispatch_rpc({"id": "rpc-ask", "method": "item/tool/requestUserInput", "params": request})
+        event = session.log[-1]
+        self.assertFalse(event["isBlocking"])
+        self.assertEqual(event["threadId"], "parent")
+        self.assertEqual(event["itemId"], "ask-1")
+        session._on_item({"id": "work-1", "type": "agentMessage", "text": "Independent work continues"}, started=False)
+        with mock.patch.object(session, "_send") as send, mock.patch.object(session, "send_user") as user:
+            session.resolve_answer(event["aid"], ["local"])
+            session.resolve_answer(event["aid"], ["duplicate"])
+        send.assert_called_once_with({"jsonrpc": "2.0", "id": "rpc-ask",
+                                      "result": {"answers": {"scope": {"answers": ["local"]}}}})
+        user.assert_not_called()
+        self.assertTrue(session.busy)
+        self.assertEqual(session.queue, [])
+
+    def test_server_request_resolution_closes_only_matching_request(self):
+        session, _ = _session()
+        session.thread_id = "parent"
+        for request_id, thread in [(17, "child"), (18, "parent")]:
+            session._on_request(request_id, "item/tool/requestUserInput", {
+                "threadId": thread, "isBlocking": False,
+                "questions": [{"id": "q", "question": "Proceed?"}]})
+        aid = session.log[0]["aid"]
+        with mock.patch.object(session, "_send") as send:
+            session._on_note("serverRequest/resolved", {"threadId": "wrong", "requestId": 17})
+            session._on_note("serverRequest/resolved", {"threadId": "child", "requestId": "17"})
+            self.assertIn(aid, session._req)
+            session._on_note("serverRequest/resolved", {"threadId": "child", "requestId": 17})
+            self.assertEqual(session.log[-1]["reason"], "resolved")
+            self.assertNotIn(aid, session._req)
+            self.assertEqual(len(session._req), 1)
+            before = len(session.log)
+            session._on_note("serverRequest/resolved", {"threadId": "child", "requestId": 17})
+            session.resolve_answer(aid, ["too late"])
+            self.assertEqual(len(session.log), before)
+            send.assert_not_called()
+
+    def test_parent_turn_completion_does_not_expire_child_question(self):
+        session, _ = _session()
+        session.thread_id, session.turn_id, session.busy = "parent", "turn-1", True
+        session._on_request(17, "item/tool/requestUserInput", {
+            "threadId": "child", "turnId": "child-turn", "isBlocking": False,
+            "questions": [{"id": "q", "question": "Proceed?"}]})
+        aid = session.log[-1]["aid"]
+        session._finish_turn()
+        self.assertIn(aid, session._req)
+        session._on_note("serverRequest/resolved", {"threadId": "child", "requestId": 17})
+        self.assertNotIn(aid, session._req)
+
+    def test_question_rpc_replay_is_not_a_second_prompt(self):
+        session, _ = _session()
+        params = {"questions": [{"id": "q", "question": "Scope?"}]}
+        session._on_request(17, "item/tool/requestUserInput", params)
+        session._on_request(17, "item/tool/requestUserInput", params)
+        self.assertEqual(len(session._req), 1)
+        self.assertEqual(len(session.log), 1)
+        self.assertTrue(session.log[-1]["isBlocking"])
+
+    def test_secret_answer_reaches_rpc_but_is_not_saved_in_transcript(self):
+        session, _ = _session()
+        session._on_request(17, "item/tool/requestUserInput", {
+            "questions": [{"id": "q", "question": "Credential?", "isSecret": True}]})
+        self.assertTrue(session.log[-1]["questions"][0]["isSecret"])
+        with mock.patch.object(session, "_send") as send:
+            session.resolve_answer(session.log[-1]["aid"], ["synthetic-secret"])
+        self.assertEqual(send.call_args.args[0]["result"]["answers"]["q"]["answers"], ["synthetic-secret"])
+        self.assertEqual(session.log[-1]["answers"], {"Credential?": "[hidden]"})
+
     def test_turn_end_dismisses_questions_and_approvals_without_rpc(self):
         for error in (False, True):
             session, _ = _session()
