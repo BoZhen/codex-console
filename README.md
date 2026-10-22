@@ -93,6 +93,7 @@ python codex_console.py
 | `CODEX_CONSOLE_AUTH` | disabled | Optional HTTP Basic Auth as `user:pass` |
 | `CODEX_CONSOLE_CODEX` | auto-detected | Path to the Codex executable |
 | `CODEX_CONSOLE_WEBFM_URL` | same host, port `7701` | Base URL for local file links |
+| `CODEX_CONSOLE_ANDROID_RELEASE_DIR` | `$XDG_DATA_HOME/codex-console/android` or `~/.local/share/codex-console/android` | Published Android client updates |
 | `CODEX_CONSOLE_IMPORT_MAX_MB` | `1024` | Maximum transcript import size |
 | `CODEX_CONSOLE_RECAP` | `0` | Enable idle recap cards |
 | `CODEX_CONSOLE_RECAP_IDLE_SEC` | `300` | Idle time before recap generation |

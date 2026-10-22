@@ -83,6 +83,7 @@ python codex_console.py
 | `CODEX_CONSOLE_AUTH` | 禁用 | 可选的 HTTP Basic Auth，格式为 `user:pass` |
 | `CODEX_CONSOLE_CODEX` | 自动检测 | Codex 可执行文件路径 |
 | `CODEX_CONSOLE_WEBFM_URL` | 相同主机，端口 `7701` | 本地文件链接的基础 URL |
+| `CODEX_CONSOLE_ANDROID_RELEASE_DIR` | `$XDG_DATA_HOME/codex-console/android` 或 `~/.local/share/codex-console/android` | 已发布的 Android 客户端更新 |
 | `CODEX_CONSOLE_IMPORT_MAX_MB` | `1024` | 对话记录的最大导入大小 |
 | `CODEX_CONSOLE_RECAP` | `0` | 启用闲置 recap 卡片 |
 | `CODEX_CONSOLE_RECAP_IDLE_SEC` | `300` | 生成 recap 前的闲置时间 |

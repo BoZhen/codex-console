@@ -65,6 +65,8 @@ AUTH = _env("AUTH", "")
 BIND = _env("BIND", "127.0.0.1")
 WEBFM_URL = _env("WEBFM_URL", "").rstrip("/")
 HOME = os.path.expanduser("~")
+ANDROID_RELEASE_DIR = _env("ANDROID_RELEASE_DIR", os.path.join(
+    os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")), "codex-console", "android"))
 CODEX_ROOT = os.path.join(HOME, ".codex", "sessions")
 CLAUDE_ROOT = os.path.join(HOME, ".claude", "projects")   # only for cross-reads, unused in v1
 # Interactive console drives the real `codex` CLI via `codex app-server`.
@@ -2335,6 +2337,56 @@ class AuthMixin:
         self.set_header("WWW-Authenticate", 'Basic realm="codex-console"')
         self.finish()
         return False
+
+
+class AndroidUpdateHandler(AuthMixin, tornado.web.RequestHandler):
+    def initialize(self, release_dir=None):
+        from android_updates import ReleaseStore
+        self.releases = ReleaseStore(release_dir or ANDROID_RELEASE_DIR)
+
+    def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Cache-Control", "no-store")
+        try:
+            self.write(self.releases.latest())
+        except FileNotFoundError:
+            self.set_status(404)
+            self.write({"error": "No Android release published"})
+        except (OSError, ValueError):
+            self.set_status(503)
+            self.write({"error": "Android release is unavailable"})
+
+
+class AndroidApkHandler(AndroidUpdateHandler):
+    async def head(self, digest):
+        await self.get(digest, include_body=False)
+
+    async def get(self, digest, include_body=True):
+        if not self._ok_auth():
+            return
+        try:
+            source = self.releases.open_apk(digest)
+        except (OSError, ValueError):
+            self.set_status(404)
+            self.finish()
+            return
+        with source:
+            self.set_header("Content-Type", "application/vnd.android.package-archive")
+            self.set_header("Content-Length", os.fstat(source.fileno()).st_size)
+            self.set_header("Content-Disposition", 'attachment; filename="codex-console-%s.apk"' % digest[:12])
+            self.set_header("Cache-Control", "private, max-age=31536000, immutable")
+            self.set_header("X-Content-Type-Options", "nosniff")
+            if include_body:
+                try:
+                    while True:
+                        block = await asyncio.to_thread(source.read, 128 * 1024)
+                        if not block:
+                            break
+                        self.write(block)
+                        await self.flush()
+                except tornado.iostream.StreamClosedError:
+                    return
 
 
 def _transcribe_status():
@@ -7830,6 +7882,8 @@ def main():
         (r"/api/diff", DiffHandler),
         (r"/api/usage", UsageHandler),
         (r"/api/models", ModelsHandler),
+        (r"/api/app/android/latest", AndroidUpdateHandler),
+        (r"/api/app/android/releases/([0-9a-f]{64})\.apk", AndroidApkHandler),
         (r"/api/export", ExportHandler),
         (r"/api/import", ImportHandler),
         (r"/api/search", SearchHandler),
