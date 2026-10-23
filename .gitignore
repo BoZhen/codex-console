@@ -7,3 +7,6 @@ __pycache__/
 .claude/
 .venv/
 docs/snapshot.md
+docs/codex_snapshot.md
+session_snapshot/
+test-results/

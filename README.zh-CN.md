@@ -7,7 +7,7 @@ OpenAI Codex CLI 的浏览器界面。它运行 `codex app-server`，让 Codex s
 状态。
 
 <p align="center">
-  <img src="docs/codex-console-overview.png" alt="包含项目侧栏、session 标签页、Plan、分组工具活动和语音输入的 Codex Console 界面" width="600">
+  <img src="docs/codex-console-overview.png" alt="包含示例 session、附件预览、固定 Plan 和分组工具调用的 Codex Console 界面" width="600">
 </p>
 
 ## 功能
@@ -19,6 +19,7 @@ OpenAI Codex CLI 的浏览器界面。它运行 `codex app-server`，让 Codex s
 - **持久 session**，由 `~/.codex/sessions` 下的 Codex rollout JSONL 文件支持。
 - **Session 标签页和侧栏**，可同时保持多个 session 运行，并在不同项目间切换
   而不中止活动任务。
+- **新建 session 对话框**，支持浏览和新建目录，以及设置模型、思考深度和权限。
 - **历史记录搜索、导入和导出**，用于管理 Codex rollout 对话记录。
 - **固定的 Plan 面板**，可原位更新、折叠，并在所有任务完成后清除。
 - **Subagents 子代理面板**，将子代理状态和消息与主对话分开显示。
@@ -27,12 +28,14 @@ OpenAI Codex CLI 的浏览器界面。它运行 `codex app-server`，让 Codex s
 - **审批和提问**，以交互控件呈现；非阻塞提问可通过常驻的待回答入口单独作答。
 - **消息排队和中途引导**，可在当前 turn 运行期间继续发送消息。
 - **图片、文本和代码附件**，支持桌面端和移动端。图片也可从剪贴板粘贴；
-  文本和代码文件会作为有长度限制、带文件名标识的文本输入发送。
+  已发送的附件支持预览、下载到当前设备及另存到服务器。
+  文本和代码文件仍作为有长度限制的文本输入发送。
 - **可选的本地语音输入**，支持实时转写并在发送前完成最终校正。
 - **模型、思考深度和速度控制**，选项来自已安装的 Codex app-server，从下一轮生效。
+  新建和重新 Resume 的 session 默认使用 Standard，支持时可手动切换 Fast。
 - **页面更新提示**，刷新时保留文本草稿。
-- **Android 任务通知事件流**，支持完成、待回答和待审批提醒，以及有限的断线补发。
-- **上下文和用量计量**，数据来自 app-server 使用量事件。
+- **Android 客户端接入**，提供需认证的应用更新下载，以及任务完成、待回答和待审批通知。
+- **上下文和用量计量**，数据来自 Codex 运行时。
 - **本地 `/status` 和 `/compact` 命令**。
 - **可选的闲置 recap 卡片**，在可配置的闲置时段后生成。
 - **可选的本地文件链接**，通过
@@ -54,8 +57,7 @@ python -m pip install tornado
 
 本地语音转写为可选功能。请在为转写 worker 配置的 Python 运行环境中安装
 `faster-whisper`；启用中文文字规范化时还需安装 `opencc`。浏览器麦克风需要
-HTTPS 或 localhost。中文实时转写仅保留最近 10 个字符可修正，更早确认的词语
-和标点不会再被后续结果改写。
+HTTPS 或 localhost。中文实时预览最多修正最近 10 个字符。
 
 ## 运行
 
@@ -85,6 +87,7 @@ python codex_console.py
 | `CODEX_CONSOLE_CODEX` | 自动检测 | Codex 可执行文件路径 |
 | `CODEX_CONSOLE_WEBFM_URL` | 相同主机，端口 `7701` | 本地文件链接的基础 URL |
 | `CODEX_CONSOLE_ANDROID_RELEASE_DIR` | `$XDG_DATA_HOME/codex-console/android` 或 `~/.local/share/codex-console/android` | 已发布的 Android 客户端更新 |
+| `CODEX_CONSOLE_ATTACHMENT_DIR` | `$XDG_DATA_HOME/codex-console/attachments` 或 `~/.local/share/codex-console/attachments` | 已发送附件的私有副本 |
 | `CODEX_CONSOLE_IMPORT_MAX_MB` | `1024` | 对话记录的最大导入大小 |
 | `CODEX_CONSOLE_RECAP` | `0` | 启用闲置 recap 卡片 |
 | `CODEX_CONSOLE_RECAP_IDLE_SEC` | `300` | 生成 recap 前的闲置时间 |
@@ -114,8 +117,10 @@ python codex_console.py
 - 历史记录搜索索引：`~/.cache/codex-console/history.db`
 
 发送前，附件内容仅保存在浏览器内存中。发送后的文本和代码附件会成为 Codex
-turn 的一部分，并可能存储在对应的 rollout JSONL 中。图片在作为本地图片输入
-传递给 app-server 前，会写入临时文件。每次实时语音预览和最终校正都使用权限
+turn 的一部分，并可能存储在对应的 rollout JSONL 中。新上传的附件还会在服务器
+保存私有副本：图片保留原始字节，文本和代码保存为 UTF-8。这些副本在服务重启后
+仍然保留，不会自动删除；删除副本不会移除已记录在 Codex rollout 中的内容。
+另存到服务器的副本仅限家目录内，且不会覆盖已有文件。每次实时语音预览和最终校正都使用权限
 受限的临时文件，并在转写后删除；转写文本只有在用户发送编辑后的草稿时才会
 进入 Codex。
 

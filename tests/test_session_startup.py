@@ -103,6 +103,25 @@ class SessionStartupTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(session._request.await_count, 1)
                 self.assert_stopped(session)
 
+    async def test_start_and_resume_override_inherited_fast_with_standard(self):
+        for resume in (None, 'original-thread'):
+            with self.subTest(resume=resume):
+                session = self.session(resume)
+                self.assertEqual(session.service_tier, 'default')
+
+                async def request(method, params):
+                    if method == 'initialize':
+                        return {}
+                    return {'thread': {'id': resume or 'new-thread'},
+                            'serviceTier': params.get('serviceTier', 'fast')}
+
+                session._request.side_effect = request
+                await session.start()
+                call = session._request.await_args_list[1]
+                self.assertEqual(call.args[0], 'thread/resume' if resume else 'thread/start')
+                self.assertEqual(call.args[1]['serviceTier'], 'default')
+                self.assertEqual(session.service_tier, 'default')
+
     async def test_failed_new_session_is_reaped(self):
         session = self.session(None)
         session._request.side_effect = [{}, RuntimeError('start failed')]

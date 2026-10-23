@@ -7,7 +7,7 @@ Codex sessions alive in the background, and presents conversation, tool calls,
 plans, file changes, and session state in one interface.
 
 <p align="center">
-  <img src="docs/codex-console-overview.png" alt="Codex Console interface with project sidebar, session tabs, Plan, grouped tool activity, and voice input" width="600">
+  <img src="docs/codex-console-overview.png" alt="Codex Console with sample sessions, attachment previews, a pinned Plan, and grouped tool calls" width="600">
 </p>
 
 ## Features
@@ -22,6 +22,8 @@ plans, file changes, and session state in one interface.
   `~/.codex/sessions`.
 - **Session tabs and sidebar** for keeping multiple sessions running and
   switching between projects without ending active work.
+- **New-session dialog** with directory browsing and folder creation, model,
+  reasoning effort, and permission settings.
 - **History search, import, and export** for Codex rollout transcripts.
 - **Pinned Plan dock** that updates in place, supports collapse, and clears
   after all tasks complete.
@@ -32,15 +34,17 @@ plans, file changes, and session state in one interface.
 - **Approvals and questions** rendered as interactive controls, with a persistent pending-question panel for non-blocking questions.
 - **Queued messages and steering** while a turn is running.
 - **Image, text, and code attachments** from desktop or mobile. Images can also
-  be pasted from the clipboard. Text and code files are sent as bounded,
-  filename-labelled text input.
+  be pasted from the clipboard. Sent attachments have previews, device downloads,
+  and a save-to-server option. Text and code are sent as bounded text input.
 - **Optional local voice input** with live transcription and final correction
   before sending.
 - **Model, reasoning effort, and speed controls** from the installed Codex
-  app-server, applied to the next turn.
+  app-server, applied to the next turn. New and resumed sessions start at
+  Standard speed; Fast remains available when supported.
 - **Page update notification** with draft-preserving reload.
-- **Android task notification stream** for completed turns and pending questions or approvals, with bounded reconnect replay.
-- **Context and rate-limit meters** from app-server usage events.
+- **Android client integration** with authenticated app-update downloads and
+  task notifications for completed turns and pending questions or approvals.
+- **Context and rate-limit meters** from Codex runtime data.
 - **Local `/status` and `/compact` commands**.
 - **Optional idle recap cards** generated after a configurable quiet period.
 - **Optional local file links** through
@@ -63,8 +67,7 @@ python -m pip install tornado
 Local voice transcription is optional. Install `faster-whisper` in the Python
 runtime configured for the transcription worker; install `opencc` there as well
 when Chinese script normalization is enabled. Browser microphone access requires
-HTTPS or localhost. During live Chinese dictation, the latest 10 characters
-remain revisable; earlier confirmed text and punctuation are preserved.
+HTTPS or localhost. Live Chinese previews revise up to the latest 10 characters.
 
 ## Run
 
@@ -95,6 +98,7 @@ python codex_console.py
 | `CODEX_CONSOLE_CODEX` | auto-detected | Path to the Codex executable |
 | `CODEX_CONSOLE_WEBFM_URL` | same host, port `7701` | Base URL for local file links |
 | `CODEX_CONSOLE_ANDROID_RELEASE_DIR` | `$XDG_DATA_HOME/codex-console/android` or `~/.local/share/codex-console/android` | Published Android client updates |
+| `CODEX_CONSOLE_ATTACHMENT_DIR` | `$XDG_DATA_HOME/codex-console/attachments` or `~/.local/share/codex-console/attachments` | Private copies of sent attachments |
 | `CODEX_CONSOLE_IMPORT_MAX_MB` | `1024` | Maximum transcript import size |
 | `CODEX_CONSOLE_RECAP` | `0` | Enable idle recap cards |
 | `CODEX_CONSOLE_RECAP_IDLE_SEC` | `300` | Idle time before recap generation |
@@ -125,8 +129,11 @@ python codex_console.py
 
 Before sending, attachment bodies remain in browser memory. Sent text and code
 attachments become part of the Codex turn and may be stored in its rollout
-JSONL. Images are written to temporary files before being passed to app-server
-as local image input. Every live voice preview and final correction uses a
+JSONL. New uploads also have private server-side copies: original image bytes and
+UTF-8 text/code. These copies survive service restarts and are not automatically
+deleted. Removing them does not remove content already recorded in Codex rollouts.
+Save-to-server copies are restricted to the home directory and never overwrite
+existing files. Every live voice preview and final correction uses a
 permission-restricted temporary file that is deleted after transcription;
 transcribed text enters Codex only after the user sends the edited draft.
 

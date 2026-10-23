@@ -49,6 +49,7 @@ import tornado.websocket
 
 from context_usage import read_context_usage
 from notify_events import NotifyHub
+from attachments import AttachmentStore, safe_name
 
 # This build drives the real `codex` CLI through its `codex app-server` JSON-RPC
 # protocol (the same backend editor integrations use). No Python SDK needed —
@@ -69,6 +70,8 @@ WEBFM_URL = _env("WEBFM_URL", "").rstrip("/")
 HOME = os.path.expanduser("~")
 ANDROID_RELEASE_DIR = _env("ANDROID_RELEASE_DIR", os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")), "codex-console", "android"))
+ATTACHMENTS = AttachmentStore(_env("ATTACHMENT_DIR", os.path.join(
+    os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")), "codex-console", "attachments")))
 CODEX_ROOT = os.path.join(HOME, ".codex", "sessions")
 CLAUDE_ROOT = os.path.join(HOME, ".claude", "projects")   # only for cross-reads, unused in v1
 # Interactive console drives the real `codex` CLI via `codex app-server`.
@@ -903,10 +906,7 @@ def _sanitize_text_files(files):
         size = len(text.encode("utf-8"))
         if size > MAX_TEXT_FILE_BYTES or total + size > MAX_TEXT_FILES_TOTAL_BYTES:
             continue
-        name = os.path.basename(str(raw.get("name") or "attachment.txt"))
-        name = "".join(ch for ch in name if ch >= " " and ch not in "\x7f\r\n")[:180]
-        if not name:
-            name = "attachment.txt"
+        name = safe_name(raw.get("name"))
         out.append({"name": name, "media_type": str(raw.get("media_type") or "text/plain")[:100],
                     "text": text, "size": size})
         total += size
@@ -923,8 +923,89 @@ def _sanitize_images(images):
         data = raw.get("data")
         if not isinstance(data, str) or len(data) > MAX_IMAGE_B64_CHARS:
             continue
-        out.append({"data": data, "media_type": str(raw.get("media_type") or "image/png")[:100]})
+        item = {"data": data, "media_type": str(raw.get("media_type") or "image/png")[:100]}
+        if raw.get("name"):
+            item["name"] = safe_name(raw["name"], "image.png")
+        out.append(item)
     return out
+
+
+def _store_attachments(images, files):
+    created = []
+    try:
+        for kind, items in (("image", images or []), ("text", files or [])):
+            for item in items:
+                if "attachment" not in item:
+                    item["attachment"] = ATTACHMENTS.save(item, kind)
+                    created.append(item)
+    except (OSError, ValueError):
+        for item in created:
+            meta = item.pop("attachment")
+            try:
+                ATTACHMENTS.discard(meta)
+            except OSError:
+                pass
+        raise
+
+
+_FILE_ATTACHMENT_RE = re.compile(
+    r'Attached text/code file [^\n]*\n<attached_file name=("[^\n]*") console_attachment="([0-9a-f]{32})">\n'
+    r'.*?\n</attached_file console_attachment="\2">', re.S)
+_IMAGE_ATTACHMENT_RE = re.compile(r'<image\s+name=\[[^\]\n]*\]\s+path="([^"\n]+)">')
+
+
+def _codex_user_content(content):
+    """Restore upload references without replaying file bodies or image base64."""
+    blocks = content if isinstance(content, list) else [content]
+    texts, refs, nimages = [], {}, 0
+
+    def reference(aid, kind, name):
+        try:
+            refs[aid] = ATTACHMENTS.metadata(aid)
+        except (OSError, ValueError):
+            refs[aid] = {"id": aid, "kind": kind, "name": safe_name(name), "unavailable": True}
+
+    for block in blocks:
+        if isinstance(block, str):
+            texts.append(block)
+        elif isinstance(block, dict):
+            if "text" in block:
+                texts.append(str(block["text"]))
+            elif block.get("type") in ("input_image", "image", "localImage", "local_image"):
+                nimages += 1
+                aid = ATTACHMENTS.image_id(block.get("path"))
+                if aid:
+                    reference(aid, "image", "image")
+            else:
+                texts.append(_txt(block))
+    text = "\n".join(texts)
+
+    def file_ref(match):
+        try:
+            name = json.loads(match[1])
+        except ValueError:
+            return match[0]
+        reference(match[2], "text", name)
+        return ""
+
+    def image_ref(match):
+        aid = ATTACHMENTS.image_id(match[1])
+        if not aid:
+            return match[0]
+        reference(aid, "image", "image")
+        return ""
+
+    text = _FILE_ATTACHMENT_RE.sub(file_ref, text)
+    text = _IMAGE_ATTACHMENT_RE.sub(image_ref, text)
+    if refs:
+        text = text.strip("\n")
+    ev = {"text": _cap(text)}
+    if refs:
+        ev["attachments"] = sorted(refs.values(), key=lambda ref: ref["kind"] != "image")
+    nimages = max(nimages, sum(r["kind"] == "image" for r in refs.values()))
+    if nimages:
+        ev["images"] = nimages
+    return ev
 
 
 def _jsonish(x):
@@ -1078,10 +1159,11 @@ def parse_codex(rec, idx):
         role = p.get("role", "assistant")
         if role not in ("user", "assistant"):
             return []                       # developer/system/tool = harness plumbing
-        text = _txt(p.get("content"))
-        if text.strip() and not (role == "user" and _codex_injected(text)):
+        user = _codex_user_content(p.get("content")) if role == "user" else None
+        text = user["text"] if user is not None else _txt(p.get("content"))
+        if (text.strip() or (user and (user.get("attachments") or user.get("images")))) and not (role == "user" and _codex_injected(text)):
             kind = "user_text" if role == "user" else "assistant_text"
-            evs.append({**base, "kind": kind, "role": role, "text": _cap(text)})
+            evs.append({**base, "kind": kind, "role": role, **(user or {"text": _cap(text)})})
     elif pt == "reasoning":
         text = _txt(p.get("summary") or p.get("content"))
         if text.strip():
@@ -2362,6 +2444,61 @@ class AuthMixin:
         return False
 
 
+class AttachmentHandler(AuthMixin, tornado.web.RequestHandler):
+    async def get(self, aid):
+        if not self._ok_auth():
+            return
+        try:
+            meta, raw = await asyncio.to_thread(ATTACHMENTS.read, aid)
+        except (OSError, ValueError):
+            raise tornado.web.HTTPError(404, reason="Attachment is unavailable")
+        download = self.get_argument("download", "0") == "1"
+        self.set_header("Content-Type", meta["media_type"] + ("; charset=utf-8" if meta["kind"] == "text" else ""))
+        self.set_header("X-Content-Type-Options", "nosniff")
+        self.set_header("Content-Security-Policy", "default-src 'none'; sandbox")
+        self.set_header("Cache-Control", "private, no-store")
+        disposition = "attachment" if download else "inline"
+        self.set_header("Content-Disposition", disposition + "; filename*=UTF-8''" + urllib.parse.quote(meta["name"], safe=""))
+        self.write(raw)
+
+
+class AttachmentSaveHandler(AuthMixin, tornado.web.RequestHandler):
+    async def post(self, aid):
+        if not self._ok_auth():
+            return
+        origin = self.request.headers.get("Origin")
+        if origin:
+            try:
+                parsed = urllib.parse.urlsplit(origin)
+                same = parsed.scheme in ("http", "https") and parsed.netloc.lower() == self.request.host.lower()
+            except ValueError:
+                same = False
+            if not same:
+                raise tornado.web.HTTPError(403)
+        if self.request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            raise tornado.web.HTTPError(415)
+        if len(self.request.body) > 8192:
+            raise tornado.web.HTTPError(413)
+        try:
+            body = json.loads(self.request.body)
+            if not isinstance(body, dict):
+                raise ValueError("Invalid request")
+            folder = _directory_path(body.get("dir"))
+            result = await asyncio.to_thread(ATTACHMENTS.copy_to, aid, HOME, folder, body.get("name"))
+        except ValueError as exc:
+            self.set_status(400)
+            self.finish({"error": str(exc)})
+        except FileNotFoundError:
+            self.set_status(404)
+            self.finish({"error": "Attachment or destination folder is unavailable"})
+        except OSError:
+            self.set_status(400)
+            self.finish({"error": "Could not save the copy in this folder"})
+        else:
+            self.set_status(201)
+            self.finish(result)
+
+
 class AndroidUpdateHandler(AuthMixin, tornado.web.RequestHandler):
     def initialize(self, release_dir=None):
         from android_updates import ReleaseStore
@@ -3135,7 +3272,7 @@ class ChatSession:
         self.cwd = cwd
         self.model = model or ""        # "" / "default" → codex config default
         self.display_model = _display_model(self.model)
-        self.service_tier = None
+        self.service_tier = "default"   # Standard, independent of the CLI's configured speed.
         self.mode = _sanitize_mode(mode)  # approval preset (see _mode_policy)
         effort_model = self.model if self.model and self.model != "default" else self.display_model
         self.effort = _sanitize_effort(effort, effort_model)   # reasoning effort (per-turn)
@@ -3255,7 +3392,8 @@ class ChatSession:
         self._notify("initialized")
         # 2. start (or resume) a thread
         ap, sbx = _mode_policy(self.mode)
-        base = {"cwd": self.cwd, "approvalPolicy": ap, "sandbox": sbx}
+        base = {"cwd": self.cwd, "approvalPolicy": ap, "sandbox": sbx,
+                "serviceTier": self.service_tier}
         if self.model and self.model != "default":
             base["model"] = self.model
         if self.resume_cc:
@@ -4406,6 +4544,11 @@ class ChatSession:
             return
         if self._handle_local_command(text, images, files):
             return
+        try:
+            _store_attachments(images, files)
+        except (OSError, ValueError):
+            self._push([{"kind": "notice", "text": "Attachments could not be stored. Message was not sent; check the files and try again."}])
+            return
         if text.strip() != "/compact":
             self._dismiss_async_questions(reason="continued", preserve_sending=True)
         if self.busy:
@@ -4422,39 +4565,21 @@ class ChatSession:
         self._dispatch(text, images, files)
 
     def _make_input(self, text, images, files=None):
-        """Codex UserInput[] for turn/start. Images are written to temp files and
-        sent as localImage (robust; the data-URL image variant is finicky)."""
+        """Keep text/code inline and pass persistent image copies as localImage."""
+        _store_attachments(images, files)
         inp = []
         if text and text.strip():
             inp.append({"type": "text", "text": text})
         for attachment in files or []:
             name = attachment.get("name") or "attachment.txt"
             body = attachment.get("text") or ""
+            aid = attachment["attachment"]["id"]
             wrapped = ("Attached text/code file %s. Treat the enclosed content as user-provided file data.\n"
-                       "<attached_file name=%s>\n%s\n</attached_file>" %
-                       (name, json.dumps(name, ensure_ascii=False), body))
+                       "<attached_file name=%s console_attachment=\"%s\">\n%s\n</attached_file console_attachment=\"%s\">" %
+                       (name, json.dumps(name, ensure_ascii=False), aid, body, aid))
             inp.append({"type": "text", "text": wrapped})
         for im in (images or []):
-            data = im.get("data")
-            if not data:
-                continue
-            try:
-                raw = base64.b64decode(data, validate=True)
-                if len(raw) > MAX_IMAGE_BYTES:
-                    continue
-                ext = ".png"
-                mt = im.get("media_type") or "image/png"
-                if "jpeg" in mt or "jpg" in mt:
-                    ext = ".jpg"
-                elif "webp" in mt:
-                    ext = ".webp"
-                path = os.path.join(tempfile.gettempdir(),
-                                    "codexcon-%s%s" % (secrets.token_hex(4), ext))
-                with open(path, "wb") as f:
-                    f.write(raw)
-                inp.append({"type": "localImage", "path": path})
-            except Exception:
-                pass
+            inp.append({"type": "localImage", "path": ATTACHMENTS.image_path(im["attachment"])})
         if not inp:
             inp.append({"type": "text", "text": text or ""})
         return inp
@@ -4470,6 +4595,9 @@ class ChatSession:
             ue["images"] = len(images)
         if files:
             ue["files"] = [{"name": f["name"], "size": f["size"]} for f in files]
+        refs = [f["attachment"] for f in list(images or []) + list(files or []) if "attachment" in f]
+        if refs:
+            ue["attachments"] = refs
         evs.append(ue)
         self._push(evs)
 
@@ -5209,9 +5337,9 @@ header select,header input{background:var(--bg3);color:var(--fg);border:1px soli
 #jumpBottom[hidden]{display:none}
 #jumpBottom:hover{background:var(--bg3);border-color:var(--acc);color:var(--acc)}
 #jumpBottom svg{width:20px;height:20px;pointer-events:none}
-.wrap{max-width:820px;margin:0 auto}
+.wrap{max-width:var(--chat-content-width,820px);margin:0 auto}
 .msg{margin-bottom:14px;line-height:1.5;word-wrap:break-word;overflow-wrap:anywhere}
-.msg.user{display:flex;justify-content:flex-end}
+.msg.user{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
 .msg.user .b{background:var(--sel);border:1px solid var(--selln);border-radius:10px;padding:8px 12px;max-width:85%;white-space:pre-wrap}
 .msg.asst .b{color:var(--fg);text-wrap:pretty}
 .msg.asst.streaming .b{text-wrap:wrap}
@@ -5219,7 +5347,7 @@ header select,header input{background:var(--bg3);color:var(--fg);border:1px soli
 .think.hide{display:none}
 .notice{color:var(--mut);font-size:11.5px;margin:6px 0}
 .errline{color:var(--del);font-size:12px;font-family:var(--fmono);margin:4px 0;white-space:pre-wrap}
-.plandock{position:sticky;top:0;z-index:7;max-width:820px;margin:0 auto 10px;padding:0 0 8px;
+.plandock{position:sticky;top:0;z-index:7;max-width:var(--chat-content-width,820px);margin:0 auto 10px;padding:0 0 8px;
   background:linear-gradient(to bottom,var(--bg) 0%,var(--bg) calc(100% - 8px),transparent 100%)}
 .plandock[hidden]{display:none}
 .plandock .plan{margin:0;box-shadow:0 7px 18px rgba(0,0,0,.18)}
@@ -5334,6 +5462,33 @@ pre code{background:none;border:none;padding:0}
 .attfile .rm{width:24px;height:24px;flex:none;border:0;background:transparent;color:var(--mut);cursor:pointer;font-size:13px;padding:0}
 .attfile .rm:hover{color:var(--del);background:var(--nobg)}
 .msg.user .attachments{margin-top:5px;font-size:11.5px;color:var(--mut)}
+.sent-attachments{display:flex;flex-wrap:wrap;align-items:flex-start;justify-content:flex-end;gap:8px;max-width:100%}
+.sent-attachment{margin:0;width:180px;max-width:100%;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:var(--bg2)}
+.sent-attachment.is-text{width:248px}
+.attachment-preview{display:block;width:100%;padding:0;border:0;color:var(--fg);background:var(--bg3);cursor:pointer}
+.attachment-preview img{display:block;width:100%;height:120px;object-fit:contain}
+.attachment-preview .file-symbol{display:grid;place-items:center;height:52px;color:var(--mut)}
+.file-symbol svg{width:25px;height:25px}
+.attachment-caption{display:flex;align-items:center;gap:2px;padding:6px}
+.attachment-caption .attachment-label{flex:1;min-width:0;font-size:12px;line-height:1.4;overflow-wrap:anywhere;color:var(--fg)}
+.attachment-size{display:block;color:var(--mut);font-size:11px}
+.attachment-action{display:inline-flex;align-items:center;justify-content:center;flex:none;width:32px;height:34px;
+  padding:6px;border:0;border-radius:4px;color:var(--fg);background:transparent;cursor:pointer;text-decoration:none}
+.attachment-action svg{width:18px;height:18px;pointer-events:none}
+.attachment-action:hover{background:var(--sel);color:var(--acc)}
+.attachment-action:disabled,.attachment-action[aria-disabled=true]{opacity:.4;cursor:default;pointer-events:none}
+.attachment-action:focus-visible,.attachment-preview:focus-visible{outline:2px solid var(--acc);outline-offset:-2px}
+.attachment-unavailable{padding:10px;color:var(--mut);font-size:12px}
+.attachment-dialog{width:min(1000px,calc(100vw - 24px));max-height:90vh;max-height:90dvh;margin:auto;padding:0;
+  border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg)}
+.attachment-dialog::backdrop{background:rgba(0,0,0,.55)}
+.attachment-heading{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line)}
+.attachment-heading h2{flex:1;min-width:0;margin:0;font-size:14px;font-weight:600;overflow-wrap:anywhere}
+.attachment-body{overflow:auto;max-height:65vh;max-height:65dvh;min-height:100px;padding:12px;text-align:center}
+.attachment-body img{display:block;max-width:100%;max-height:60vh;max-height:60dvh;object-fit:contain;margin:auto}
+.attachment-body pre{margin:0;text-align:left;white-space:pre;overflow:auto}
+.attachment-feedback{padding:8px 12px;font-size:12px;overflow-wrap:anywhere;min-height:32px;color:var(--mut)}
+@media(pointer:coarse){.attachment-action{width:40px;height:40px}.sent-attachment{width:192px}}
 /* queued messages (typed while the agent is busy) */
 #queue{width:100%;display:none;flex-direction:column;gap:5px;padding:0 0 8px}
 #queue.on{display:flex}
@@ -5498,7 +5653,7 @@ pre code{background:none;border:none;padding:0}
 .question-nav:hover{background:var(--bg3)}
 .question-nav:disabled{opacity:.35;cursor:default}
 #questionPanel{max-height:45vh;overflow-y:auto;padding:0 10px 4px;overscroll-behavior:contain}
-#questionPanel>.question{max-width:820px;margin:0 auto 4px}
+#questionPanel>.question{max-width:var(--chat-content-width,820px);margin:0 auto 4px}
 #stop{background:var(--nobg);color:var(--delfg);border:1px solid var(--del);border-radius:10px;width:38px;height:38px;flex:none;display:inline-flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;cursor:pointer}
 
 /* sessions sidebar + shell layout */
@@ -5986,6 +6141,15 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     <div id="agentDetail"><div class="empty">select a subagent</div></div>
   </div>
 </div>
+<dialog id="attachmentDialog" class="attachment-dialog" aria-labelledby="attachmentTitle">
+  <div class="attachment-heading"><h2 id="attachmentTitle"></h2>
+    <a id="attachmentDownload" class="attachment-action" title="Download to this device" aria-label="Download to this device" data-session-icon="download"></a>
+    <button id="attachmentSave" type="button" class="attachment-action" title="Save a copy on the server" aria-label="Save a copy on the server" data-session-icon="folder-input"></button>
+    <button id="attachmentClose" type="button" class="attachment-action" title="Close preview" aria-label="Close preview" data-session-icon="x"></button>
+  </div>
+  <div id="attachmentBody" class="attachment-body"></div>
+  <div id="attachmentFeedback" class="attachment-feedback" role="status"></div>
+</dialog>
 <dialog id="newSessionDialog" class="session-dialog" aria-labelledby="newSessionTitle">
   <form id="newSessionForm">
     <div class="dialog-heading"><h2 id="newSessionTitle">New session</h2><button id="newSessionClose" class="dialog-icon" type="button" title="Close" aria-label="Close" data-session-icon="x"></button></div>
@@ -6288,11 +6452,56 @@ function trimChatWindow(force){if(replaying&&!force)return;if(windowTrimT){clear
   else renderWindowMarker();}
 function scheduleChatWindowTrim(){if(replaying||windowTrimT)return;
   windowTrimT=setTimeout(()=>trimChatWindow(false),120);}
-function addUser(text,nImg,files){const s=atBottom(),d=document.createElement('div'),meta=[];d.className='msg user';
-  if(nImg)meta.push('🖼 '+nImg+' image'+(nImg>1?'s':''));const fl=Array.isArray(files)?files:[];
-  if(fl.length){const names=fl.slice(0,3).map(f=>esc((f&&f.name)||f||'file')).join(', ');meta.push('📎 '+names+(fl.length>3?(' +'+(fl.length-3)) :''));}
+function addUser(text,nImg,files,attachments){const s=atBottom(),d=document.createElement('div'),meta=[];d.className='msg user';
+  const refs=(Array.isArray(attachments)?attachments:[]).filter(f=>f&&/^[a-f0-9]{32}$/.test(f.id));
+  const missingImages=Math.max(0,(nImg||0)-refs.filter(f=>f.kind==='image').length);
+  if(missingImages)meta.push('🖼 '+missingImages+' image'+(missingImages>1?'s':''));const fl=Array.isArray(files)?files:[];
+  if(fl.length&&!refs.some(f=>f.kind==='text')){const names=fl.slice(0,3).map(f=>esc((f&&f.name)||f||'file')).join(', ');meta.push('📎 '+names+(fl.length>3?(' +'+(fl.length-3)) :''));}
   d.innerHTML=(text?'<div class="b">'+esc(text)+'</div>':'')+(meta.length?'<div class="attachments">'+meta.join(' · ')+'</div>':'');
+  if(refs.length){const group=document.createElement('div');group.className='sent-attachments';
+    for(const f of refs){const card=document.createElement('figure');card.className='sent-attachment'+(f.kind==='text'?' is-text':'');
+      card.innerHTML='<button type="button" class="attachment-preview" aria-label="'+escAttr('Preview '+f.name)+'">'+
+        (f.kind==='image'?'<img loading="lazy" decoding="async" src="'+attachmentUrl(f)+'" alt="'+escAttr(f.name)+'">':'<span class="file-symbol">'+sessionIcon('file-text')+'</span>')+'</button>'+
+        '<figcaption class="attachment-caption"><span class="attachment-label">'+esc(f.name)+'<span class="attachment-size">'+(f.size===undefined?'':fmtFileBytes(f.size))+'</span></span>'+
+        '<a class="attachment-action" href="'+attachmentUrl(f,true)+'" download="'+escAttr(f.name)+'" title="Download to this device" aria-label="Download to this device">'+sessionIcon('download')+'</a>'+
+        '<button type="button" class="attachment-action save-copy" title="Save a copy on the server" aria-label="Save a copy on the server">'+sessionIcon('folder-input')+'</button></figcaption>';
+      card.querySelector('.attachment-preview').onclick=()=>openAttachment(f);
+      card.querySelector('.save-copy').onclick=()=>saveAttachmentCopy(f);
+      const img=card.querySelector('img');if(img)img.onerror=()=>{const note=document.createElement('span');note.className='attachment-unavailable';note.textContent='Preview unavailable';img.replaceWith(note);};
+      if(f.unavailable){card.querySelector('.attachment-size').textContent='Copy unavailable';
+        const link=card.querySelector('a');link.removeAttribute('href');link.setAttribute('aria-disabled','true');card.querySelector('.save-copy').disabled=true;}
+      group.appendChild(card);}
+    d.appendChild(group);}
   stream.appendChild(d);scroll();}
+function attachmentUrl(f,download){return 'api/attachments/'+f.id+(download?'?download=1':'');}
+let attachmentPreview=null,attachmentAbort=null;
+async function openAttachment(f){const dialog=$('#attachmentDialog'),body=$('#attachmentBody');
+  if(attachmentAbort)attachmentAbort.abort();attachmentAbort=new AbortController();const signal=attachmentAbort.signal;attachmentPreview=f;
+  $('#attachmentTitle').textContent=f.name;$('#attachmentFeedback').textContent=f.size===undefined?'':fmtFileBytes(f.size);
+  const download=$('#attachmentDownload');download.href=attachmentUrl(f,true);download.download=f.name;
+  download.removeAttribute('aria-disabled');$('#attachmentSave').disabled=!!f.unavailable;body.replaceChildren();
+  if(!dialog.open)dialog.showModal();
+  if(f.unavailable){download.removeAttribute('href');download.setAttribute('aria-disabled','true');body.textContent='The saved copy is unavailable.';return;}
+  if(f.kind==='image'){const img=document.createElement('img');img.alt=f.name;img.src=attachmentUrl(f);
+    img.onerror=()=>{if(attachmentPreview===f)body.textContent='Image unavailable. The saved copy may have been removed.';};body.appendChild(img);return;}
+  body.textContent='Loading...';
+  try{const r=await fetch(attachmentUrl(f),{signal});if(!r.ok)throw new Error('Attachment unavailable (HTTP '+r.status+')');
+    const text=await r.text();if(signal.aborted||attachmentPreview!==f)return;
+    const pre=document.createElement('pre');pre.textContent=text;body.replaceChildren(pre);
+  }catch(e){if(!signal.aborted&&attachmentPreview===f)body.textContent=e.message||'Could not load attachment';}}
+function saveAttachmentCopy(f){const sourceSid=sid;
+  openFolderDialog(cwd||'~',async dir=>{try{
+    const r=await fetch(attachmentUrl(f)+'/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dir})});
+    const data=await r.json().catch(()=>({}));if(!r.ok)throw new Error(data.error||('Could not save (HTTP '+r.status+')'));
+    const message='Saved to '+data.shown;if(attachmentPreview===f)$('#attachmentFeedback').textContent=message;
+    if(sourceSid===sid)addNotice(message);
+  }catch(e){const message=e.message||'Could not save attachment';if(attachmentPreview===f)$('#attachmentFeedback').textContent=message;
+    if(sourceSid===sid)addNotice(message);}});}
+$('#attachmentSave').onclick=()=>{if(attachmentPreview)saveAttachmentCopy(attachmentPreview);};
+$('#attachmentClose').onclick=()=>$('#attachmentDialog').close();
+$('#attachmentDialog').addEventListener('close',()=>{if(attachmentAbort)attachmentAbort.abort();attachmentPreview=null;$('#attachmentBody').replaceChildren();});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!e.isComposing&&$('#attachmentDialog').open&&!$('#folderDialog').open){
+  e.preventDefault();e.stopImmediatePropagation();$('#attachmentDialog').close();}},true);
 function addAsst(text){const s=atBottom();const d=document.createElement('div');d.className='msg asst';
   d.innerHTML='<div class="b bubble">'+md(text)+'</div>';typesetMath(d,!replaying);stream.appendChild(d);if(s)scroll();}
 function addThink(text){const s=atBottom();const d=document.createElement('div');d.className='think'+(showThink?'':' hide');d.dataset.t=1;
@@ -6843,7 +7052,7 @@ function route(ev){const seq=Number(ev&&ev._seq||0),tab=sessionTabById(sid);
   if(!running&&['assistant_text','assistant_delta','assistant_update','thinking','thinking_delta',
       'thinking_update','plan','plan_delta','plan_text','tool_use','tool_delta','tool_progress',
       'tool_update'].includes(ev.kind))setBusy(true);
-  if(ev.kind==='user_text')addUser(ev.text,ev.images,ev.files);
+  if(ev.kind==='user_text')addUser(ev.text,ev.images,ev.files,ev.attachments);
   else if(ev.kind==='ready'){ready=true;cwd=ev.cwd||cwd;curCC=ev.session_id||curCC;
     if(!replaying)activeModel=(ev.model&&ev.model!=='default'?ev.model:(ev.display_model||activeModel));
     const modelName=ev.display_model||ev.model||'';if(modelName)setResolvedModel(modelName);
@@ -7126,7 +7335,7 @@ function currentEffortModel(){return sid&&ready?activeModel:preferredModel;}
 function setEffortPill(e){if(e)curEffort=e;const el=$('#effort');if(el)el.textContent='🧠 '+curEffort;renderSessionChoices();}
 function renderSessionChoices(){const m=modelMeta(activeModel),b=$('#modelpill'),s=$('#speedpill');if(!b||!s)return;
   b.textContent=m&&m.name||activeModel||'Model';b.title='Model for next turn: '+(activeModel||'default');b.disabled=!sid||!ready;
-  const tiers=speedOptions(m),tier=tiers.find(t=>t.id===(activeTier||(m&&m.defaultServiceTier)||'default'));
+  const tiers=speedOptions(m),tier=tiers.find(t=>t.id===(activeTier||'default'));
   s.textContent=tier?tier.name:'Speed: inherited';s.disabled=!sid||!ready||tiers.length<2;
   s.title=tier?tier.description:'Uses the Codex configured speed';}
 function speedOptions(m){return [{id:'default',name:'Standard',description:'Standard speed'},
@@ -7134,7 +7343,7 @@ function speedOptions(m){return [{id:'default',name:'Standard',description:'Stan
 $('#modelpill').onclick=ev=>{ev.stopPropagation();toggleCardMenu(ev.currentTarget,MODELS.map(m=>({
   label:(m.id===activeModel?'● ':'')+m.name,fn:()=>wsSend({type:'set_model',model:m.id})})));};
 $('#speedpill').onclick=ev=>{ev.stopPropagation();const m=modelMeta(activeModel);if(!m)return;
-  toggleCardMenu(ev.currentTarget,speedOptions(m).map(t=>({label:((activeTier||m.defaultServiceTier||'default')===t.id?'● ':'')+t.name,
+  toggleCardMenu(ev.currentTarget,speedOptions(m).map(t=>({label:((activeTier||'default')===t.id?'● ':'')+t.name,
     fn:()=>wsSend({type:'set_service_tier',serviceTier:t.id})})));};
 $('#pageUpdate').onclick=()=>{if(voiceJob){$('#pageUpdate').textContent='Finish recording before reloading';return;}
   saveDraft();
@@ -7608,6 +7817,9 @@ const SESSION_ICON_PATHS={
   'folder-plus':['M12 10v6','M9 13h6','M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z'],
   refresh:['M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8','M21 3v5h-5','M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16','M8 16H3v5'],
   x:['M18 6 6 18','m6 6 12 12'],
+  download:['M12 15V3','M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4','m7 10 5 5 5-5'],
+  'folder-input':['M2 9V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-1','M2 13h10','m9 16 3-3-3-3'],
+  'file-text':['M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z','M14 2v5a1 1 0 0 0 1 1h5','M10 9H8','M16 13H8','M16 17H8'],
   'arrow-up':['m5 12 7-7 7 7','M12 19V5'],
   'arrow-right':['M5 12h14','m12 5 7 7-7 7'],
   folder:['M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z'],
@@ -7769,7 +7981,7 @@ function addImageFile(file){
   if(OK_IMG.indexOf(file.type)<0){addNotice('⚠ unsupported image type: '+(file.type||'?'));return;}
   if(file.size>MAX_IMG_BYTES){addNotice('⚠ image too large ('+Math.round(file.size/1048576)+'MB, max 5MB)');return;}
   const r=new FileReader(),targetSid=sid;pendingImageReads++;
-  r.onload=()=>{pendingImageReads--;const url=''+r.result;keepAttachmentFor(targetSid,'images',{media_type:file.type,data:url.split(',')[1]||'',url:url});};
+  r.onload=()=>{pendingImageReads--;const url=''+r.result;keepAttachmentFor(targetSid,'images',{name:file.name||'image.png',media_type:file.type,data:url.split(',')[1]||'',url:url});};
   r.onerror=()=>{pendingImageReads--;addNotice('⚠ could not read image: '+(file.name||'unknown file'));};
   r.readAsDataURL(file);}
 function addTextFile(file){
@@ -7950,8 +8162,9 @@ async function startVoiceInput(){const reason=voiceUnavailableReason();if(reason
 function toggleVoiceInput(){if(voiceJob&&voiceJob.mode==='recording')stopVoiceInput();else if(!voiceJob)startVoiceInput();}
 
 function sendMsg(){const t=ta.value.trim();
+  if(pendingImageReads||pendingFileReads){addNotice('Attachments are still loading. Try sending again in a moment.');return;}
   if((voiceJob&&voiceJob.targetSid===sid)||(!t&&!pendingImages.length&&!pendingFiles.length)||!ready||!sid||!ws||ws.readyState!==1)return;
-  wsSend({type:'user',text:t,images:pendingImages.map(im=>({media_type:im.media_type,data:im.data})),
+  wsSend({type:'user',text:t,images:pendingImages.map(im=>({name:im.name,media_type:im.media_type,data:im.data})),
     files:pendingFiles.map(f=>({name:f.name,media_type:f.media_type,text:f.text,size:f.size}))});
   ta.value='';ta.style.height='auto';pendingImages=[];pendingFiles=[];renderAttach();dropDraft(sid);}
   /* busy state (and the thinking word/timer) is driven by the server's
@@ -8030,7 +8243,7 @@ document.addEventListener('keydown',e=>{if(e.repeat||!e.altKey||e.ctrlKey||e.met
 sendBtn.onclick=sendMsg;
 $('#stop').onclick=doInterrupt;
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'&&running&&!document.querySelector('.session-dialog[open]')&&!srchOpen()&&!agentPanelOpen()){e.preventDefault();doInterrupt();}});
+  if(e.key==='Escape'&&running&&!document.querySelector('dialog[open]')&&!srchOpen()&&!agentPanelOpen()){e.preventDefault();doInterrupt();}});
 $('#newbtn').onclick=()=>newSession();
 /* color theme: apply + persist (the <head> script already set it pre-paint) */
 function applyTheme(t){if(t&&t!=='dark')document.documentElement.setAttribute('data-theme',t);
@@ -8221,6 +8434,8 @@ def main():
         (r"/api/pinfolder", PinFolderHandler),
         (r"/api/dircomplete", DirCompleteHandler),
         (r"/api/directories", DirectoriesHandler),
+        (r"/api/attachments/([0-9a-f]{32})", AttachmentHandler),
+        (r"/api/attachments/([0-9a-f]{32})/save", AttachmentSaveHandler),
         (r"/api/diff", DiffHandler),
         (r"/api/usage", UsageHandler),
         (r"/api/models", ModelsHandler),

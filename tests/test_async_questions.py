@@ -72,6 +72,7 @@ class AsyncQuestionTests(unittest.IsolatedAsyncioTestCase):
         self.session.resolve_answer(aid, ["Custom dataset"])
         await self.settle()
         self.assertEqual(self.session._request.call_args.args[0], "turn/start")
+        self.assertEqual(self.session._request.call_args.args[1]["serviceTier"], "default")
         self.assertTrue(self.session.busy)
         self.assertEqual(self.session.turn_id, "answer-turn")
         self.assertEqual(self.session.queue, [])

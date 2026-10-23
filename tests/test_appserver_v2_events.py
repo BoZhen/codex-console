@@ -1,5 +1,6 @@
 import inspect
 import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -21,6 +22,13 @@ def _emitted_events(messages):
 
 
 class AppServerV2EventTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patcher = mock.patch.object(codex_console, "ATTACHMENTS", codex_console.AttachmentStore(tmp.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_pending_question_snapshot_survives_log_window_and_clears_on_answer(self):
         session, _ = _session()
         session._on_request(17, "item/tool/requestUserInput", {
@@ -209,17 +217,20 @@ class AppServerV2EventTests(unittest.TestCase):
         spec = {"id": "test-model", "serviceTiers": [{"id": "default"}, {"id": "fast"}]}
         with mock.patch.object(codex_console, "_model_catalog_entry", return_value=spec):
             session.set_service_tier("invalid")
-            self.assertIsNone(session.service_tier)
-            session.set_service_tier("fast")
-        calls = []
-        with mock.patch.object(codex_console.tornado.ioloop.IOLoop, "current") as loop:
-            loop.return_value.spawn_callback.side_effect = calls.append
-            session._dispatch("hello", [])
-        request = mock.AsyncMock(return_value={"turn": {"id": "t1"}})
-        with mock.patch.object(session, "_request", request):
-            import asyncio
-            asyncio.run(calls[0]())
-        self.assertEqual(request.call_args.args[1]["serviceTier"], "fast")
+            self.assertEqual(session.service_tier, "default")
+            for selection in (None, "fast", "default"):
+                with self.subTest(selection=selection):
+                    if selection is not None:
+                        session.set_service_tier(selection)
+                    calls = []
+                    with mock.patch.object(codex_console.tornado.ioloop.IOLoop, "current") as loop:
+                        loop.return_value.spawn_callback.side_effect = calls.append
+                        session._dispatch("hello", [])
+                    request = mock.AsyncMock(return_value={"turn": {"id": "t1"}})
+                    with mock.patch.object(session, "_request", request):
+                        import asyncio
+                        asyncio.run(calls[0]())
+                    self.assertEqual(request.call_args.args[1]["serviceTier"], selection or "default")
 
     def test_streamed_agent_message_is_updated_not_duplicated_on_completion(self):
         session, _ = _session()

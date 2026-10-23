@@ -266,12 +266,12 @@ async def verify(cdp, url, output):
         print(f'{width}px: arrow selection and Enter answer exactly once PASS')
 
 
-async def main(output, verify_page=verify):
+async def main(output, verify_page=verify, page_handler=PageHandler):
     chrome_bin = shutil.which('google-chrome')
     if not chrome_bin:
         raise RuntimeError('google-chrome is required')
     output.mkdir(parents=True, exist_ok=True)
-    server = ThreadingHTTPServer(('127.0.0.1', 0), PageHandler)
+    server = ThreadingHTTPServer(('127.0.0.1', 0), page_handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     with tempfile.TemporaryDirectory(prefix='question-browser-') as profile:
         with socket.socket() as sock:
