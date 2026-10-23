@@ -7,12 +7,8 @@ Codex sessions alive in the background, and presents conversation, tool calls,
 plans, file changes, and session state in one interface.
 
 <p align="center">
-  <img src="docs/codex-console-overview.png" alt="Codex Console with sample sessions, attachment previews, a pinned Plan, and grouped tool calls" width="600">
-</p>
-
-<p align="center">
-  <img src="docs/codex-console-mobile.png" alt="Codex Console in a mobile browser with session tabs, a collapsed Plan, and attachment previews" width="280">
-  <br><sub>Mobile web</sub>
+  <img src="docs/codex-console-overview.png" alt="Codex Console with sample sessions, attachment previews, a pinned Plan, and grouped tool calls" width="76%">
+  <img src="docs/codex-console-mobile.png" alt="Codex Console in a mobile browser with session tabs, a collapsed Plan, and attachment previews" width="22%">
 </p>
 
 ## Features
