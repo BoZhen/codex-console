@@ -10,6 +10,11 @@ OpenAI Codex CLI 的浏览器界面。它运行 `codex app-server`，让 Codex s
   <img src="docs/codex-console-overview.png" alt="包含示例 session、附件预览、固定 Plan 和分组工具调用的 Codex Console 界面" width="600">
 </p>
 
+<p align="center">
+  <img src="docs/codex-console-mobile.png" alt="手机浏览器中的 Codex Console，包含 session 标签页、折叠 Plan 和附件预览" width="280">
+  <br><sub>手机网页</sub>
+</p>
+
 ## 功能
 
 - **流式聊天**，支持 Markdown 和 KaTeX 数学公式渲染。
