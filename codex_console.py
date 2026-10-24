@@ -72,7 +72,7 @@ ANDROID_RELEASE_DIR = _env("ANDROID_RELEASE_DIR", os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")), "codex-console", "android"))
 ATTACHMENTS = AttachmentStore(_env("ATTACHMENT_DIR", os.path.join(
     os.environ.get("XDG_DATA_HOME", os.path.join(HOME, ".local", "share")), "codex-console", "attachments")))
-CODEX_ROOT = os.path.join(HOME, ".codex", "sessions")
+CODEX_ROOT = os.path.join(os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex"), "sessions")
 CLAUDE_ROOT = os.path.join(HOME, ".claude", "projects")   # only for cross-reads, unused in v1
 # Interactive console drives the real `codex` CLI via `codex app-server`.
 # Prefer the NATIVE binary over the npm node-wrapper (`~/.local/bin/codex` →
@@ -1311,7 +1311,19 @@ def _open_rollout(path, binary=False):
         return
     executable = shutil.which("zstd")
     if not executable:
-        raise RuntimeError("Reading compressed Codex history requires the zstd command")
+        try:
+            import zstandard
+        except ImportError as exc:
+            raise RuntimeError("Reading compressed Codex history requires zstd or the zstandard Python package") from exc
+        with open(actual, "rb") as source:
+            with zstandard.ZstdDecompressor().stream_reader(source, read_across_frames=True) as reader:
+                with io.BufferedReader(reader) as buffered:
+                    if binary:
+                        yield buffered
+                    else:
+                        with io.TextIOWrapper(buffered, encoding="utf-8", errors="replace") as text:
+                            yield text
+        return
     proc = subprocess.Popen([executable, "-dc", "--", actual], stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL)
     try:
@@ -1474,7 +1486,8 @@ def trash_transcript(cc):
         return {"ok": False, "error": str(ex)}
 
 
-NAMES_FILE = os.path.join(HOME, ".codex", "console-names.json")
+CONSOLE_STATE_DIR = _env("STATE_DIR", os.path.join(HOME, ".codex"))
+NAMES_FILE = os.path.join(CONSOLE_STATE_DIR, "console-names.json")
 _names_cache = {"mtime": -1.0, "v": {}}
 
 def load_names():
@@ -1518,7 +1531,7 @@ def set_name(cc, name):
         return False
 
 
-PREFS_FILE = os.path.join(HOME, ".codex", "console-prefs.json")
+PREFS_FILE = os.path.join(CONSOLE_STATE_DIR, "console-prefs.json")
 _prefs_cache = {"mtime": -1.0, "v": {}}
 
 def load_prefs():
@@ -1602,7 +1615,7 @@ def list_favorites():
 # through a flat recency list. Folders reach the sidebar two ways: they already
 # hold a session, or they were pinned through Import folder.
 
-PROJECTS_FILE = os.path.join(HOME, ".codex", "console-projects.json")
+PROJECTS_FILE = os.path.join(CONSOLE_STATE_DIR, "console-projects.json")
 _projmeta_cache = {"mtime": -1.0, "v": {}}
 
 
@@ -1800,7 +1813,7 @@ def fetch_usage():
 # bootstrap, and AGENTS.md context. Searching raw JSONL would be noisy and slow, so
 # the index stores only conversation text plus the paths/commands tools acted on.
 
-INDEX_DB = os.path.join(HOME, ".cache", "codex-console", "history.db")
+INDEX_DB = _env("INDEX_DB", os.path.join(HOME, ".cache", "codex-console", "history.db"))
 CJK_RE = re.compile(r"[㐀-鿿぀-ヿ가-힯]")
 INDEX_REFRESH_SEC = 30
 INDEX_SCHEMA = 1
@@ -8423,9 +8436,8 @@ def _recap_tick():
             tornado.ioloop.IOLoop.current().spawn_callback(s._make_recap)
 
 
-def main():
-    moved = migrate_session_favs_to_projects()
-    app = tornado.web.Application([
+def make_application(extra_handlers=()):
+    return tornado.web.Application(list(extra_handlers) + [
         (r"/", ConsoleHandler),
         (r"/console", ConsoleHandler),
         (r"/api/projects", ProjectsHandler),
@@ -8452,8 +8464,16 @@ def main():
         (r"/static/(.*)", tornado.web.StaticFileHandler,
          {"path": os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")}),
     ], websocket_max_message_size=WEBSOCKET_MAX_MESSAGE_SIZE)
+
+
+def main(application=None, listen=None):
+    moved = migrate_session_favs_to_projects()
+    app = application if application is not None else make_application()
     loopback = BIND in ("127.0.0.1", "localhost", "::1")
-    app.listen(PORT, address=BIND, max_buffer_size=IMPORT_MAX, max_body_size=IMPORT_MAX)
+    if listen is None:
+        app.listen(PORT, address=BIND, max_buffer_size=IMPORT_MAX, max_body_size=IMPORT_MAX)
+    else:
+        listen(app)
     tornado.ioloop.IOLoop.current().run_in_executor(None, reindex)
     tornado.ioloop.PeriodicCallback(_context_tick, 1000).start()
     if RECAP_ENABLED:   # idle-session recap sweep (every 30s)
