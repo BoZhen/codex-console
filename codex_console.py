@@ -50,6 +50,7 @@ import tornado.websocket
 from context_usage import read_context_usage
 from notify_events import NotifyHub
 from attachments import AttachmentStore, safe_name
+from project_library import ProjectGroups, SessionCatalog
 
 # This build drives the real `codex` CLI through its `codex app-server` JSON-RPC
 # protocol (the same backend editor integrations use). No Python SDK needed —
@@ -1616,6 +1617,8 @@ def list_favorites():
 # hold a session, or they were pinned through Import folder.
 
 PROJECTS_FILE = os.path.join(CONSOLE_STATE_DIR, "console-projects.json")
+PROJECT_GROUPS_FILE = os.path.join(CONSOLE_STATE_DIR, "console-project-groups.json")
+_library_catalog = SessionCatalog()
 _projmeta_cache = {"mtime": -1.0, "v": {}}
 
 
@@ -1805,6 +1808,26 @@ def fetch_usage():
     `{five_hour:{utilization,resets_at}, seven_day:{...}}`, or {} until a session
     has received its first rate-limit notification."""
     return dict(_CODEX_USAGE)
+
+
+def project_library(live=()):
+    rows = _library_catalog.read(_rollout_paths(), _peek_codex, _codex_cc_from_path, load_names(), HOME)
+    by_cc = {row["cc"]: row for row in rows}
+    for row in live:
+        if row.get("cc"):
+            by_cc[row["cc"]] = {**by_cc.get(row["cc"], {}), **row}
+    folders = {}
+    for row in by_cc.values():
+        path = row["cwd"]
+        folders[path] = {"path": path, "name": os.path.basename(path) or "Unknown folder", "sub": short_path(path)}
+    for path, meta in load_project_meta().items():
+        if not isinstance(meta, dict) or not os.path.isabs(path):
+            continue
+        if path in folders or meta.get("pinned") or meta.get("fav"):
+            folders[path] = {"path": path, "name": meta.get("name") or os.path.basename(path), "sub": short_path(path),
+                             "fav": bool(meta.get("fav")), "pinned": bool(meta.get("pinned")), "renamed": bool(meta.get("name"))}
+    return {"sessions": list(by_cc.values()), "folders": list(folders.values()),
+            "groups": ProjectGroups(PROJECT_GROUPS_FILE).read()}
 
 
 # ─────────────────── history search index ───────────────────
@@ -2026,6 +2049,18 @@ def search_history(q, scope="all", cc="", cwd="", limit=200):
         item.update(_snippet(txt, q))
         out.append(item)
     return {"results": out, "more": more}
+
+
+def load_thread_for_session(cc):
+    if not isinstance(cc, str) or not _valid_cc(cc):
+        return {"error": "Invalid session ID", "messages": []}
+    reindex()
+    db = _index_conn()
+    try:
+        row = db.execute("SELECT m.rowid FROM msgs m JOIN files f ON f.fid=m.fid WHERE f.cc=? ORDER BY m.rowid LIMIT 1", (cc,)).fetchone()
+    finally:
+        db.close()
+    return load_thread(row[0], 0, 60) if row else {"error": "No indexed messages in this session", "messages": []}
 
 
 def load_thread(mid, before=40, after=40):
@@ -2522,7 +2557,7 @@ class AndroidUpdateHandler(AuthMixin, tornado.web.RequestHandler):
             return
         self.set_header("Cache-Control", "no-store")
         try:
-            self.write(self.releases.latest())
+            self.write(self.releases.latest(self.get_query_argument("package", None)))
         except FileNotFoundError:
             self.set_status(404)
             self.write({"error": "No Android release published"})
@@ -2919,8 +2954,60 @@ class ResumableHandler(AuthMixin, tornado.web.RequestHandler):
 class TreeHandler(AuthMixin, tornado.web.RequestHandler):
     """The project-grouped sidebar: folders, each with the sessions it owns."""
     def get(self):
+        if not self._ok_auth():
+            return
         self.set_header("Content-Type", "application/json")
         self.write(json.dumps({"projects": project_tree()}))
+
+
+class ProjectLibraryHandler(AuthMixin, tornado.web.RequestHandler):
+    async def snapshot(self):
+        live = [{"cc": s.cc_id, "cwd": os.path.realpath(s.cwd), "title": s.title() or os.path.basename(s.cwd),
+                 "mtime": s.last_activity, "available": bool(safe_cwd(s.cwd))}
+                for s in list(CHAT_SESSIONS.values()) if s.cc_id]
+        return await asyncio.to_thread(project_library, live)
+
+    async def get(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Cache-Control", "no-store")
+        try:
+            self.write(await self.snapshot())
+        except (OSError, ValueError):
+            self.set_status(503)
+            self.write({"error": "Could not read the project library"})
+
+    async def post(self):
+        if not self._ok_auth():
+            return
+        self.set_header("Cache-Control", "no-store")
+        origin = self.request.headers.get("Origin")
+        if origin:
+            try:
+                parsed = urllib.parse.urlsplit(origin)
+                allowed = parsed.scheme in ("http", "https") and parsed.netloc.lower() == self.request.host.lower()
+            except ValueError:
+                allowed = False
+            if not allowed:
+                self.set_status(403); self.write({"error": "Cross-origin project changes are not allowed"}); return
+        if self.request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            self.set_status(415); self.write({"error": "Expected a JSON request"}); return
+        if len(self.request.body) > 8192:
+            self.set_status(413); self.write({"error": "Request is too large"}); return
+        try:
+            body = json.loads(self.request.body)
+            if not isinstance(body, dict):
+                raise ValueError("Invalid request")
+            snapshot = await self.snapshot()
+            result = await asyncio.to_thread(ProjectGroups(PROJECT_GROUPS_FILE).update, body,
+                                             snapshot["sessions"], {p["path"] for p in snapshot["folders"]})
+        except ValueError as exc:
+            self.set_status(400); self.write({"error": str(exc)}); return
+        except OSError:
+            self.set_status(503); self.write({"error": "Could not save project groups"}); return
+        self.write({**snapshot, **result})
+        for ws in list(ChatSocket.clients):
+            ws._say({"type": "project_groups_changed"})
 
 
 class PinFolderHandler(AuthMixin, tornado.web.RequestHandler):
@@ -3151,8 +3238,11 @@ class ThreadHandler(AuthMixin, tornado.web.RequestHandler):
             after = max(0, min(400, int(self.get_argument("after", "40") or 40)))
         except Exception:
             before, after = 40, 40
-        res = await loop.run_in_executor(
-            None, load_thread, self.get_argument("mid", "0"), before, after)
+        cc = self.get_argument("cc", "")
+        if cc:
+            res = await loop.run_in_executor(None, load_thread_for_session, cc)
+        else:
+            res = await loop.run_in_executor(None, load_thread, self.get_argument("mid", "0"), before, after)
         self.write(json.dumps(res))
 
 
@@ -4982,6 +5072,11 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
         if mt == "start":
             request_id = msg.get("requestId")
             reply = {"requestId": request_id} if isinstance(request_id, str) and len(request_id) <= 80 else {}
+            start_name = msg.get("name", "")
+            if not isinstance(start_name, str):
+                self._say({"type": "error", "error": "invalid session name", **reply})
+                return
+            start_name = start_name.strip()[:120]
             if not CODEX_BIN or not os.path.exists(CODEX_BIN):
                 self._say({"type": "error", "error": "codex CLI not found", **reply})
                 return
@@ -4998,13 +5093,16 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
             except Exception as e:
                 self._say({"type": "error", "error": "spawn failed: %s" % e, **reply})
                 return
+            if start_name and not set_name(sess.cc_id, start_name):
+                # The thread already exists; report success so a retry cannot create a duplicate.
+                reply["warning"] = "Session started, but its name could not be saved. Rename it from the sidebar."
             CHAT_SESSIONS[sid] = sess
             if self.session and self.session is not sess:
                 self.session.detach(self)   # keep it alive, just stop viewing it
             self.session = sess
             sess.attach(self)
             self._say({"type": "started", "id": sid, "cwd": cwd, **reply,
-                       "name": os.path.basename(cwd) or cwd,
+                       "name": os.path.basename(cwd) or cwd, "cc": sess.cc_id, "title": sess.title(),
                        "model": sess.model or "default", "display_model": sess.display_model,
                        "mode": sess.mode, "effort": sess.effort, "serviceTier": sess.service_tier,
                        "activity": sess.last_activity,
@@ -5813,6 +5911,23 @@ pre code{background:none;border:none;padding:0}
 .pgroup .plist .srow{padding-left:31px;border-left:none}
 .pgroup .plist .srow .sname{font-size:12px}
 .pgroup .plist .sb-empty{padding-left:31px;font-size:11px}
+.library-tools{display:flex;gap:4px;margin-left:auto}
+.library-icon{display:grid;place-items:center;width:26px;height:26px;border:0;background:none;color:var(--mut);cursor:pointer;border-radius:4px}
+.library-icon svg{width:16px;height:16px}.library-icon:hover{background:var(--bg3);color:var(--acc)}
+.library-filter{padding:4px 9px 8px}.library-filter input{width:100%;min-width:0;padding:6px 8px;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:4px;font:inherit;font-size:12px}
+.library-heading{display:flex;align-items:center;gap:4px;padding:3px 6px;background:var(--bg2);border-bottom:1px solid var(--line)}
+.library-toggle{display:flex;gap:7px;align-items:center;flex:1;min-width:0;text-align:left;border:0;background:none;color:var(--fg);padding:6px 3px;cursor:pointer;font:inherit;font-size:12px;font-weight:600}
+.library-toggle svg{width:16px;height:16px;flex:none;color:var(--acc)}
+.library-toggle .library-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.library-count{color:var(--mut);font-size:11px;font-weight:400}
+.library-folders{margin-left:9px;border-left:1px solid var(--line)}
+.library-group:not(.open)>.library-folders{display:none}
+.library-group.drop-target>.library-heading{outline:2px solid var(--acc);outline-offset:-2px;background:var(--sel)}
+.library-more{width:100%;border:0;background:none;color:var(--acc);padding:7px 10px;text-align:left;cursor:pointer;font:inherit;font-size:11px}
+.library-more:hover{background:var(--bg3)}
+#projectFeedback{color:var(--delfg);font-size:11px;padding:0 9px;overflow-wrap:anywhere}
+#projectFeedback:empty{display:none}
+.srow.unavailable .sdot{opacity:.35}
 
 /* Manage sessions — a project can accumulate a lot of threads (sub-agents in
    particular), so the ⋮ menu opens a checklist for deleting several at once. */
@@ -6051,6 +6166,15 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
       <div class="sb-h sb-toggle"><span class="caret"></span>★ Favorites <span id="favN" class="cnt">0</span></div>
       <div id="favList" class="seclist"><div class="sb-empty">star a project to pin it here</div></div>
     </div>
+    <div class="sb-sec" id="secProjects">
+      <div class="sb-h sb-toggle"><span class="caret"></span>Projects
+        <span class="library-tools"><button id="projectNew" class="library-icon" title="New project" aria-label="New project" data-session-icon="folder-plus"></button>
+        <button id="projectRefresh" class="library-icon" title="Refresh all sessions" aria-label="Refresh all sessions" data-session-icon="refresh"></button></span>
+      </div>
+      <div class="seclist"><div class="library-filter"><input id="projectFilter" type="search" placeholder="Filter projects or sessions" aria-label="Filter projects or sessions"></div>
+        <div id="projectFeedback" role="status"></div><div id="projectList"></div>
+      </div>
+    </div>
     <div class="sb-sec" id="secRecent">
       <div class="sb-h sb-toggle"><span class="caret"></span>🕘 Recent <span class="grow"></span><span class="sb-ref" id="resumeRef" title="rescan">↻</span></div>
       <div id="recentList" class="seclist"><div class="sb-empty">—</div></div>
@@ -6167,6 +6291,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
   <form id="newSessionForm">
     <div class="dialog-heading"><h2 id="newSessionTitle">New session</h2><button id="newSessionClose" class="dialog-icon" type="button" title="Close" aria-label="Close" data-session-icon="x"></button></div>
     <fieldset id="newSessionFields">
+      <div class="dialog-field"><label for="newName">Session name</label><input id="newName" autocomplete="off" maxlength="120" placeholder="Optional"></div>
       <div class="dialog-field"><label for="newRecent">Recent folders</label><select id="newRecent"></select></div>
       <div class="dialog-field"><label for="newCwd">Working directory</label><div class="path-row">
         <input id="newCwd" class="path-input" autocomplete="off" spellcheck="false" placeholder="~/project" required>
@@ -6183,6 +6308,15 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     </fieldset>
     <div id="newSessionError" class="dialog-error" role="alert"></div>
     <div class="dialog-actions"><button id="newSessionCancel" class="btn" type="button">Cancel</button><button id="newSessionSubmit" class="newbtn" type="submit">Start session</button></div>
+  </form>
+</dialog>
+<dialog id="projectDialog" class="session-dialog" aria-labelledby="projectDialogTitle">
+  <form id="projectForm">
+    <div class="dialog-heading"><h2 id="projectDialogTitle">New project</h2><button id="projectClose" class="dialog-icon" type="button" title="Close" aria-label="Close" data-session-icon="x"></button></div>
+    <div id="projectNameField" class="dialog-field"><label for="projectName">Project name</label><input id="projectName" autocomplete="off" maxlength="120"></div>
+    <div id="projectTargetField" class="dialog-field" hidden><label for="projectTarget">Project</label><select id="projectTarget"></select></div>
+    <div id="projectDialogError" class="dialog-error" role="alert"></div>
+    <div class="dialog-actions"><button id="projectCancel" class="btn" type="button">Cancel</button><button id="projectSubmit" class="newbtn" type="submit">Create project</button></div>
   </form>
 </dialog>
 <dialog id="folderDialog" class="session-dialog" aria-labelledby="folderTitle">
@@ -6265,6 +6399,7 @@ let subagents={}, subagentCurrent='';
 let currentCtx=null,sessionViewCache=new Map(),restoredViewId='';
 /* which project groups are expanded — per device, survives reloads */
 let pExp=new Set();try{pExp=new Set(JSON.parse(localStorage.getItem('al_pexp')||'[]'));}catch(e){}
+let libraryDrag=null,libraryDeferred=false;
 const EDIT_TOOLS=new Set(['Edit','MultiEdit','Write','NotebookEdit','apply_patch']);
 const SKEY='al_session';
 const TABSKEY='al_session_tabs';
@@ -7113,12 +7248,13 @@ function onMsg(e){const m=JSON.parse(e.data);
   if(m.type==='hello'){if(m.stamp&&m.stamp!==PAGE_STAMP)$('#pageUpdate').hidden=false;return;}
   if(handleNewSessionReply(m))return;
   if(m.type==='started'||m.type==='attached'){activeTier=m.serviceTier||null;$('#terminalDialog').close();}
-  if(m.type==='started'){pendingStart=false;sid=m.id;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);loadDraft(sid);
-    activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=true;setBusy(false);ta.focus();setCurname(m.name||'session');setEffortPill(m.effort);renderCtx(null);statset('ready');
+  if(m.type==='started'){pendingStart=false;sid=m.id;curCC=m.cc||null;cwd=m.cwd;bindProject(m.cwd);localStorage.setItem(SKEY,sid);loadDraft(sid);
+    activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=true;setBusy(false);ta.focus();setCurname(m.title||m.name||'session');setEffortPill(m.effort);renderCtx(null);statset('ready');
     const startedTab=ensureSessionTab(m,true);planCollapsed=!!(startedTab&&startedTab.planCollapsed);
     if(startedTab){startedTab.lastSeq=Number(m.event_seq||0);startedTab.serverSeq=startedTab.lastSeq;persistSessionTabs();}restoredViewId=m.id;
     mergeSubagents(m.subagents||[],true);syncPendingQuestions(m.pending_questions);
-    addNotice('new session « '+(m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');reqList();loadTree();}
+    addNotice('new session « '+(m.title||m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');
+    if(m.warning)addNotice(m.warning);reqList();loadTree();}
   else if(m.type==='attached'){const incremental=!!m.events_delta&&restoredViewId===m.id,stick=incremental&&atBottom();
     if(!incremental){clearUI();restoredViewId='';}pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
     activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setEffortPill(m.effort);renderCtx(m.ctx);renderUsage(m.usage);statset(m.ended?'ended':'ready');
@@ -7160,7 +7296,8 @@ function onMsg(e){const m=JSON.parse(e.data);
   else if(m.type==='terminal_stopped'&&m.sessionId===sid){if(!m.ok)$('#terminalList').textContent=m.error||'Terminal already exited';else requestTerminals();}
   else if(m.type==='tokens'){tokUp=m.up||0;tokOut=m.out||0;tokShow=true;
     if(m.word!=null&&m.word!==lastWordSeed){lastWordSeed=m.word;if(running&&!compacting)setWord(m.word);}}
-  else if(m.type==='projects'){projData=m.projects||[];renderSidebar();}
+  else if(m.type==='projects'){projData=m.projects||[];renderSidebar();loadProjectLibrary(true);}
+  else if(m.type==='project_groups_changed')loadProjectLibrary(true);
 }
 function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
   ws=new WebSocket(proto+'//'+location.host+'/ws/chat');
@@ -7450,7 +7587,7 @@ function toggleSec(id){const el=$('#'+id);if(!el)return;el.classList.toggle('col
   let c={};try{c=JSON.parse(localStorage.getItem(SECKEY)||'{}');}catch(e){}
   c[id]=el.classList.contains('collapsed');localStorage.setItem(SECKEY,JSON.stringify(c));}
 function applySecCollapse(){let c={};try{c=JSON.parse(localStorage.getItem(SECKEY)||'{}');}catch(e){}
-  ['secFav','secRecent'].forEach(id=>{const el=$('#'+id);if(el)el.classList.toggle('collapsed',!!c[id]);});}
+  ['secFav','secProjects','secRecent'].forEach(id=>{const el=$('#'+id);if(el)el.classList.toggle('collapsed',!!c[id]);});}
 
 function renderLive(list){liveSessions=list||[];syncSessionTabs(liveSessions);renderSidebar();}
 
@@ -7500,6 +7637,7 @@ function buildProjects(){
 const byName=(a,b)=>(a.name||'').localeCompare(b.name||'',undefined,
                                                {numeric:true,sensitivity:'base'});
 function renderSidebar(){
+  if(libraryDrag){libraryDeferred=true;return;}
   const all=buildProjects();
   const live=all.filter(p=>p.isLive).sort(byName);
   const fav=all.filter(p=>!p.isLive&&p.fav);
@@ -7508,15 +7646,122 @@ function renderSidebar(){
   $('#favN').textContent=fav.length;
   fillSec('#liveList',live,'no active project — pick a folder, ＋ New session');
   fillSec('#favList',fav,'star a project to pin it here');
-  fillSec('#recentList',rest,'no projects yet');}
+  fillSec('#recentList',rest,'no projects yet');renderProjectLibrary();}
 
 function fillSec(sel,list,empty){const box=$(sel);if(!box)return;
   if(!list.length){box.innerHTML='<div class="sb-empty">'+esc(empty)+'</div>';return;}
   box.innerHTML='';list.forEach(p=>box.appendChild(projGroup(p)));}
 
-function projGroup(p){
+let libraryState=null,libraryLoading=false,libraryBusy=false,librarySerial=0,libraryPending=false,libraryLoadedAt=0,libraryLoadTask=null;
+let libraryDialog=null,libraryFilterTimer=null;
+const libraryLimits=new Map();
+let libraryOpen=new Set();try{libraryOpen=new Set(JSON.parse(localStorage.getItem('al_library_open')||'[]'));}catch(e){}
+function libraryMore(label,action){const b=document.createElement('button');b.type='button';b.className='library-more';b.textContent=label;b.onclick=action;return b;}
+function libraryData(data){if(!Array.isArray(data.sessions)||!Array.isArray(data.folders)||!Array.isArray(data.groups))throw new Error('Invalid project library response');return data;}
+function loadProjectLibrary(force=false){
+  if(libraryLoading||libraryBusy){if(force)libraryPending=true;return libraryLoadTask;}
+  if(!force&&libraryState&&Date.now()-libraryLoadedAt<5000)return;
+  libraryLoading=true;const serial=++librarySerial;renderProjectLibrary();
+  libraryLoadTask=(async()=>{try{const r=await fetch('api/project-library');const data=await r.json();if(!r.ok)throw new Error(data.error||'Could not load projects');
+    if(serial===librarySerial){libraryState=libraryData(data);libraryLoadedAt=Date.now();$('#projectFeedback').textContent='';}}
+  catch(e){if(serial===librarySerial)$('#projectFeedback').textContent=e.message||'Could not load projects';}
+  finally{libraryLoading=false;libraryLoadTask=null;renderProjectLibrary();if(libraryPending&&!libraryBusy){libraryPending=false;loadProjectLibrary(true);}}})();return libraryLoadTask;}
+async function mutateProject(body){if(libraryBusy)return null;
+  libraryBusy=true;librarySerial++;$('#projectFeedback').textContent='';$('#projectDialogError').textContent='';projectDialogBusy(true);
+  try{const r=await fetch('api/project-library',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const data=await r.json();if(!r.ok)throw new Error(data.error||'Could not save project');
+    libraryState=libraryData(data);libraryLoadedAt=Date.now();return data;}
+  catch(e){$('#projectFeedback').textContent=e.message;$('#projectDialogError').textContent=e.message;return null;}
+  finally{libraryBusy=false;projectDialogBusy(false);renderProjectLibrary();if(libraryPending&&!libraryLoading){libraryPending=false;loadProjectLibrary(true);}}}
+function libraryFolders(group){
+  const descriptors=new Map((libraryState?.folders||[]).map(p=>[p.path,{...p}]));
+  (projData||[]).forEach(p=>{if(descriptors.has(p.path))descriptors.set(p.path,{...descriptors.get(p.path),name:p.name,fav:p.fav,pinned:p.pinned,renamed:p.renamed});});
+  const rows=new Map((libraryState?.sessions||[]).map(s=>[s.cc,{...s}]));
+  liveSessions.forEach(s=>{if(s.cc)rows.set(s.cc,{...rows.get(s.cc),...s,cwd:s.root||s.cwd,live:true});});
+  const included=new Set(group?.sessions||[]),paths=new Set(group?.folders||[]),excluded=new Set(group?.excluded||[]);
+  const folders=new Map();
+  function folder(path){if(!folders.has(path)){const p=descriptors.get(path)||{path,name:path.split('/').filter(Boolean).at(-1)||'Unknown folder',sub:shortPath(path)};
+    folders.set(path,{...p,liveS:[],past:[],total:0});}return folders.get(path);}
+  if(group)paths.forEach(folder);else descriptors.forEach(p=>folder(p.path));
+  rows.forEach(s=>{if(group&&(!included.has(s.cc)&&!paths.has(s.cwd)||excluded.has(s.cc)))return;
+    const p=folder(s.cwd||'');(s.live?p.liveS:p.past).push(s);p.total++;});
+  const query=$('#projectFilter').value.trim().toLocaleLowerCase(),groupMatch=group&&group.name.toLocaleLowerCase().includes(query);
+  return [...folders.values()].map(p=>{
+    p.past.sort((a,b)=>(b.mtime||0)-(a.mtime||0));
+    if(query&&!groupMatch&&!(p.name+' '+p.path).toLocaleLowerCase().includes(query)){
+      const matches=s=>(s.title||s.name||'').toLocaleLowerCase().includes(query);
+      p.liveS=p.liveS.filter(matches);p.past=p.past.filter(matches);p.total=p.liveS.length+p.past.length;
+      if(!p.total)return null;}
+    return p;}).filter(Boolean).sort(byName);}
+function renderProjectLibrary(){const box=$('#projectList');if(!box)return;if(libraryDrag){libraryDeferred=true;return;}
+  box.replaceChildren();if(!libraryState){const e=document.createElement('div');e.className='sb-empty';e.textContent=libraryLoading?'Loading projects...':'No library loaded';box.appendChild(e);return;}
+  const groups=[{id:'all',name:'All sessions'},...libraryState.groups];
+  groups.forEach(group=>{const all=group.id==='all',folders=libraryFolders(all?null:group),query=$('#projectFilter').value.trim();
+    if(query&&!folders.length&&!group.name.toLocaleLowerCase().includes(query.toLocaleLowerCase()))return;
+    const root=document.createElement('div');root.className='library-group'+(libraryOpen.has(group.id)?' open':'');root.dataset.group=group.id;
+    const head=document.createElement('div');head.className='library-heading';
+    const toggle=document.createElement('button');toggle.type='button';toggle.className='library-toggle';
+    toggle.innerHTML=sessionIcon(libraryOpen.has(group.id)?'folder-open':'folder')+'<span class="library-name"></span><span class="library-count"></span>';
+    toggle.querySelector('.library-name').textContent=group.name;toggle.title=group.name;
+    toggle.querySelector('.library-count').textContent=folders.reduce((n,p)=>n+p.total,0);
+    toggle.setAttribute('aria-expanded',String(libraryOpen.has(group.id)));
+    toggle.onclick=()=>{if(libraryOpen.has(group.id))libraryOpen.delete(group.id);else libraryOpen.add(group.id);
+      localStorage.setItem('al_library_open',JSON.stringify([...libraryOpen]));renderProjectLibrary();};head.appendChild(toggle);
+    if(!all){const menu=document.createElement('button');menu.type='button';menu.className='skebab library-icon';menu.textContent='\u22ef';menu.title='Project actions';menu.setAttribute('aria-label','Project actions');
+      menu.onclick=e=>{e.stopPropagation();toggleCardMenu(menu,[
+        {label:'Rename project',fn:()=>editLibraryProject(group)},
+        {label:'Delete project',danger:true,fn:()=>{if(confirm('Delete project "'+group.name+'"? Sessions and files will not be deleted.'))mutateProject({op:'delete',id:group.id});}}]);};head.appendChild(menu);
+      root.ondragover=e=>{if(!libraryDrag||libraryBusy)return;e.preventDefault();e.dataTransfer.dropEffect='copy';root.classList.add('drop-target');};
+      root.ondragleave=e=>{if(!root.contains(e.relatedTarget))root.classList.remove('drop-target');};
+      root.ondrop=e=>{if(!libraryDrag||libraryBusy)return;e.preventDefault();e.stopPropagation();const target=libraryDrag;endLibraryDrag();
+        libraryOpen.add(group.id);mutateProject({op:'add',id:group.id,...target});};}
+    root.appendChild(head);const content=document.createElement('div');content.className='library-folders';root.appendChild(content);
+    if(libraryOpen.has(group.id)){const limit=libraryLimits.get(group.id)||80;
+      folders.slice(0,limit).forEach(p=>content.appendChild(projGroup(p,group.id)));
+      if(folders.length>limit)content.appendChild(libraryMore('Show more folders ('+(folders.length-limit)+')',()=>{libraryLimits.set(group.id,limit+80);renderProjectLibrary();}));
+      if(!folders.length){const empty=document.createElement('div');empty.className='sb-empty';empty.textContent=query?'No matches':'No sessions';content.appendChild(empty);}}
+    box.appendChild(root);});}
+function makeLibraryDraggable(node,target){if(!target.value)return;node.draggable=true;
+  node.ondragstart=e=>{if(libraryBusy){e.preventDefault();return;}e.stopPropagation();libraryDrag=target;
+    e.dataTransfer.effectAllowed='copy';e.dataTransfer.setData('application/x-codex-library',JSON.stringify(target));};
+  node.ondragend=endLibraryDrag;}
+function endLibraryDrag(){libraryDrag=null;document.querySelectorAll('.library-group.drop-target').forEach(n=>n.classList.remove('drop-target'));
+  if(libraryDeferred){libraryDeferred=false;renderSidebar();}}
+function librarySessionActions(s,scope){if(!s.cc)return [];const items=[{label:'Add to project...',fn:()=>chooseLibraryProject({kind:'session',value:s.cc})}];
+  items.push({label:'View transcript',fn:()=>openLibraryTranscript(s)});
+  if(scope&&scope!=='all')items.push({label:'Remove from project',fn:()=>mutateProject({op:'remove',id:scope,kind:'session',value:s.cc})});return items;}
+function projectDialogBusy(busy){['projectName','projectTarget','projectSubmit','projectCancel','projectClose'].forEach(id=>$('#'+id).disabled=busy);}
+function editLibraryProject(group=null,target=null){if(libraryBusy)return;closeCardMenu();libraryDialog={group,target,choose:false};
+  $('#projectDialogTitle').textContent=group?'Rename project':'New project';$('#projectNameField').hidden=false;$('#projectTargetField').hidden=true;
+  $('#projectName').value=group?.name||'';$('#projectName').required=true;$('#projectDialogError').textContent='';$('#projectSubmit').textContent=group?'Save':'Create project';
+  $('#projectDialog').showModal();$('#projectName').focus();}
+async function chooseLibraryProject(target){await loadProjectLibrary();if(!libraryState||libraryBusy)return;
+  if(!libraryState.groups.length){editLibraryProject(null,target);return;}closeCardMenu();libraryDialog={target,choose:true};
+  $('#projectDialogTitle').textContent='Add to project';$('#projectNameField').hidden=true;$('#projectName').required=false;$('#projectTargetField').hidden=false;
+  fillSelect($('#projectTarget'),[...libraryState.groups.map(g=>[g.id,g.name]),['','New project...']],libraryState.groups[0].id);
+  $('#projectDialogError').textContent='';$('#projectSubmit').textContent='Add';$('#projectDialog').showModal();$('#projectTarget').focus();}
+function closeProjectDialog(){if(libraryBusy)return;$('#projectDialog').close();libraryDialog=null;}
+$('#projectNew').onclick=e=>{e.stopPropagation();editLibraryProject();};
+$('#projectRefresh').onclick=e=>{e.stopPropagation();loadProjectLibrary(true);};
+$('#projectFilter').oninput=()=>{clearTimeout(libraryFilterTimer);libraryFilterTimer=setTimeout(renderProjectLibrary,120);};
+$('#projectCancel').onclick=$('#projectClose').onclick=closeProjectDialog;
+$('#projectDialog').addEventListener('cancel',e=>{e.preventDefault();closeProjectDialog();});
+$('#projectName').addEventListener('keydown',e=>{if(e.key==='Enter'&&e.isComposing)e.preventDefault();});
+$('#projectTarget').onchange=()=>{const fresh=!$('#projectTarget').value;$('#projectNameField').hidden=!fresh;$('#projectName').required=fresh;if(fresh)$('#projectName').focus();};
+$('#projectForm').onsubmit=async e=>{e.preventDefault();if(!libraryDialog||libraryBusy)return;const draft=libraryDialog;
+  let id=draft.choose?$('#projectTarget').value:draft.group?.id;
+  if(!draft.choose||!id){const data=await mutateProject({op:draft.group?'rename':'create',id:draft.group?.id,name:$('#projectName').value});if(!data)return;id=data.id;
+    if(draft.target){draft.choose=true;draft.group=null;$('#projectName').required=false;$('#projectNameField').hidden=true;$('#projectTargetField').hidden=false;fillSelect($('#projectTarget'),libraryState.groups.map(g=>[g.id,g.name]),id);}}
+  if(draft.target&&!await mutateProject({op:'add',id,...draft.target}))return;
+  libraryOpen.add(id);localStorage.setItem('al_library_open',JSON.stringify([...libraryOpen]));closeProjectDialog();renderProjectLibrary();};
+$('#sidebar').addEventListener('dragover',e=>{if(!libraryDrag)return;const r=$('#sidebar').getBoundingClientRect();
+  if(e.clientY<r.top+40)$('#sidebar').scrollTop-=12;else if(e.clientY>r.bottom-40)$('#sidebar').scrollTop+=12;});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&libraryDrag)endLibraryDrag();});
+
+function projGroup(p,scope=''){
+  const key=scope?('library:'+scope+':'+p.path):p.path;
   const g=document.createElement('div');
-  g.className='pgroup'+(pExp.has(p.path)?' open':'');
+  g.className='pgroup'+(pExp.has(key)?' open':'');g.dataset.path=p.path;
   const r=document.createElement('div');r.className='prow';
   r.innerHTML='<span class="caret"></span>'+
     '<div class="pmeta"><div class="pname">'+esc(p.name)+(p.fav?' <span class="pstar">★</span>':'')+'</div>'+
@@ -7524,30 +7769,37 @@ function projGroup(p){
     '<span class="pn">'+p.total+'</span>'+
     '<span class="skebab pkebab" title="project actions" aria-label="project actions"><i></i></span>';
   r.onclick=ev=>{if(ev.target.closest('.skebab'))return;
-    if(pExp.has(p.path))pExp.delete(p.path);else pExp.add(p.path);
-    saveExp();g.classList.toggle('open');};
+    if(pExp.has(key))pExp.delete(key);else pExp.add(key);
+    saveExp();g.classList.toggle('open');draw();};
+  r.tabIndex=0;r.setAttribute('role','button');r.title=p.path;
+  r.onkeydown=e=>{if(e.target===r&&['Enter',' '].includes(e.key)){e.preventDefault();r.click();}};
+  if(p.path)makeLibraryDraggable(r,{kind:'folder',value:p.path});
   r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();
     const items=[{label:'＋ New session here',fn:()=>newSessionIn(p.path)},
       {label:'☑ Manage sessions…',fn:()=>pmanOpen(p)},
       /* browse the project directory in web-file-manager (same ?open= scheme as
          file links — its openPath() loads a directory as a folder view) */
       {label:'📂 Open folder',fn:()=>window.open(webfmOpenUrl(p.path),'_blank')},
-      {label:'✎ Rename project',fn:()=>renameProject(p)},
+      {label:'Add to project...',fn:()=>chooseLibraryProject({kind:'folder',value:p.path})},
+      {label:'✎ Rename folder label',fn:()=>renameProject(p)},
       {label:p.fav?'★ Unfavorite':'☆ Favorite',fn:()=>wsSend({type:'proj_fav',path:p.path,fav:!p.fav})}];
+    if(scope&&scope!=='all')items.push({label:'Remove folder from project',fn:()=>mutateProject({op:'remove',id:scope,kind:'folder',value:p.path})});
     if(p.pinned)items.push({label:'✕ Remove from sidebar',danger:true,fn:()=>{
       if(confirm('Remove “'+p.name+'” from the sidebar?\n\nOnly the sidebar entry goes away. '+
                  'No session and no file is deleted.'))wsSend({type:'proj_unpin',path:p.path});}});
     toggleCardMenu(ev.currentTarget,items);};
   g.appendChild(r);
   const list=document.createElement('div');list.className='plist';
-  p.liveS.forEach(x=>list.appendChild(liveSessRow(x)));
-  p.past.forEach(x=>list.appendChild(pastSessRow(x)));
-  if(!list.children.length)list.innerHTML='<div class="sb-empty">no sessions yet</div>';
-  g.appendChild(list);
+  function draw(){list.replaceChildren();if(scope&&!pExp.has(key))return;
+    const rows=[...p.liveS.map(x=>({live:true,x})),...p.past.map(x=>({live:false,x}))],limit=scope?(libraryLimits.get(key)||60):rows.length;
+    rows.slice(0,limit).forEach(({live,x})=>list.appendChild(live?liveSessRow(x,scope):pastSessRow(x,scope)));
+    if(rows.length>limit)list.appendChild(libraryMore('Show more sessions ('+(rows.length-limit)+')',()=>{libraryLimits.set(key,limit+60);draw();}));
+    if(!rows.length)list.innerHTML='<div class="sb-empty">no sessions yet</div>';}
+  g.appendChild(list);draw();
   return g;}
 
 /* a running session: green dot, click to switch to it */
-function liveSessRow(s){const r=document.createElement('div');
+function liveSessRow(s,scope=''){const r=document.createElement('div');
   r.className='srow'+(s.id===sid?' active':'')+(s.ended?' ended':'');
   const dot=s.busy?'busy':(s.ended?'':'on');
   r.innerHTML='<span class="sdot '+dot+'"></span><div class="smeta">'+
@@ -7559,23 +7811,26 @@ function liveSessRow(s){const r=document.createElement('div');
     const items=[{label:'⚙ Configure',fn:()=>openConfigure(s,kebab)},
       {label:'✎ Rename',fn:()=>renameSession(s.cc,s.title||s.name)}];
     if(s.cc)items.push({label:'⤓ Export transcript',fn:()=>exportSession(s.cc)});
+    items.push(...librarySessionActions(s,scope));
     items.push({label:'✕ End session',danger:true,fn:()=>endSessionById(s.id,s.name)});
     toggleCardMenu(kebab,items);};
-  return r;}
+  if(s.cc)makeLibraryDraggable(r,{kind:'session',value:s.cc});return r;}
 
 /* an on-disk session: grey dot, click to resume */
-function pastSessRow(s){const r=document.createElement('div');r.className='srow';
+function pastSessRow(s,scope=''){const r=document.createElement('div');r.className='srow'+(s.available===false?' unavailable':'');
   r.innerHTML='<span class="sdot"></span><div class="smeta">'+
     '<div class="sname">'+esc(s.title||'session')+'</div>'+
     '<div class="ssub">↺ '+(s.mtime?esc(reltime(s.mtime)):'resume')+'</div></div>'+
     '<span class="skebab" title="more">⋮</span>';
-  r.querySelector('.smeta').onclick=()=>resumeSession(s);
-  r.querySelector('.sdot').onclick=()=>resumeSession(s);
+  const open=()=>s.available===false?openLibraryTranscript(s):resumeSession(s);
+  r.querySelector('.smeta').onclick=open;r.querySelector('.sdot').onclick=open;
+  if(s.available===false)r.title='Working directory unavailable; open transcript';
   r.querySelector('.skebab').onclick=ev=>{ev.stopPropagation();toggleCardMenu(ev.currentTarget,[
     {label:'✎ Rename',fn:()=>renameSession(s.cc,s.title)},
     {label:'⤓ Export transcript',fn:()=>exportSession(s.cc)},
+    ...librarySessionActions(s,scope),
     {label:'🗑 Delete (to trash)',danger:true,fn:()=>delResumable(s)}]);};
-  return r;}
+  makeLibraryDraggable(r,{kind:'session',value:s.cc});return r;}
 
 /* ── Manage sessions ──────────────────────────────────────────────────────
    Batch cleanup for one project. Sub-agent threads can pile up dozens deep, and
@@ -7765,9 +8020,15 @@ function loadThread(mid,before,after,q,targetMid){
       thState.cc=j.cc;thState.cwd=j.cwd;renderThread(j,q,targetMid);})
     .catch(e=>{$('#thbody').innerHTML='<div class="thend">failed: '+esc(String(e))+'</div>';});}
 function openThread(h){
+  $('#thopen').disabled=false;
   $('#srchres').setAttribute('hidden','');
   $('#srchthread').removeAttribute('hidden');
   loadThread(h.mid,40,40,$('#srchq').value.trim(),h.mid);}
+function openLibraryTranscript(s){openSearch();$('#srchres').hidden=true;$('#srchthread').hidden=false;$('#thopen').disabled=s.available===false;
+  const state=thState={cc:s.cc,cwd:s.cwd,before:0,after:60,q:''};$('#thbody').innerHTML='<div class="thend">loading...</div>';
+  fetch('api/thread?cc='+encodeURIComponent(s.cc)).then(r=>r.json()).then(j=>{if(thState!==state)return;
+    if(j.error){$('#thbody').textContent=j.error;return;}state.mid=j.messages?.[0]?.mid;renderThread(j,'',state.mid);
+  }).catch(()=>{if(thState===state)$('#thbody').textContent='Could not load transcript';});}
 function wireSearch(){
   const q=$('#srchq');if(!q)return;
   $('#thback').onclick=showResults;
@@ -7807,6 +8068,7 @@ function wireImport(){
 /* pull the folder-grouped sidebar. The socket also pushes it on connect and after
    any change, so this is the cold-start and manual-rescan path. */
 function loadTree(){
+  loadProjectLibrary(true);
   fetch('api/tree').then(r=>r.json())
     .then(j=>{projData=j.projects||[];renderSidebar();})
     .catch(()=>{});}
@@ -7850,7 +8112,7 @@ function newEffortOptions(value){const model=$('#newModel').value;
 function newSession(path){if($('#newSessionDialog').open)return;
   closeCardMenu();
   const dir=(typeof path==='string'&&path)||currentFolder()||'~';
-  $('#newCwd').value=dir;$('#newSessionError').textContent='';
+  $('#newName').value='';$('#newCwd').value=dir;$('#newSessionError').textContent='';
   const folders=new Map();if(cwd)folders.set(cwd,cwd);
   (projData||[]).forEach(p=>folders.set(p.path,p.path));
   recentFolders.forEach(p=>folders.set(p,p));
@@ -7858,7 +8120,7 @@ function newSession(path){if($('#newSessionDialog').open)return;
   fillSelect($('#newRecent'),[['','Choose a folder'],...[...folders].map(([p])=>[p,shortPath(p)])],folders.has(dir)?dir:'');
   fillSelect($('#newModel'),modelOptionsFor(preferredModel),preferredModel);newEffortOptions(curEffort);
   fillSelect($('#newMode'),MODE_OPTIONS,preferredMode);
-  resetNewSessionRequest();$('#newSessionDialog').showModal();$('#newCwd').focus();}
+  resetNewSessionRequest();$('#newSessionDialog').showModal();$('#newName').focus();}
 function resetNewSessionRequest(){if(newSessionRequest&&newSessionRequest.abort)newSessionRequest.abort.abort();newSessionRequest=null;
   $('#newSessionFields').disabled=false;$('#newSessionSubmit').disabled=false;$('#newSessionSubmit').textContent='Start session';
   $('#newSessionCancel').disabled=false;$('#newSessionClose').disabled=false;}
@@ -7872,7 +8134,7 @@ async function submitNewSession(e){e.preventDefault();if(newSessionRequest)retur
   const path=$('#newCwd').value.trim();if(!path){$('#newSessionError').textContent='Choose a working directory';return;}
   if(!ws||ws.readyState!==1){$('#newSessionError').textContent='Not connected. Wait for the connection, then try again.';return;}
   const request={id:'new-'+Date.now()+'-'+(++newSessionSerial),phase:'validating',abort:new AbortController(),
-    model:$('#newModel').value,mode:$('#newMode').value,effort:$('#newEffort').value};
+    name:$('#newName').value.trim(),model:$('#newModel').value,mode:$('#newMode').value,effort:$('#newEffort').value};
   newSessionRequest=request;$('#newSessionError').textContent='';$('#newSessionFields').disabled=true;
   $('#newSessionSubmit').disabled=true;$('#newSessionSubmit').textContent='Checking...';
   try{const data=await directoryData(path,false,request.abort.signal);
@@ -7880,7 +8142,7 @@ async function submitNewSession(e){e.preventDefault();if(newSessionRequest)retur
     if(!ws||ws.readyState!==1)throw new Error('Not connected. Try again when the connection returns.');
     request.phase='starting';request.cwd=data.path;$('#newCwd').value=data.path;
     $('#newSessionSubmit').textContent='Starting...';$('#newSessionCancel').disabled=true;$('#newSessionClose').disabled=true;
-    ws.send(JSON.stringify({type:'start',requestId:request.id,cwd:data.path,model:request.model,mode:request.mode,effort:request.effort}));
+    ws.send(JSON.stringify({type:'start',requestId:request.id,name:request.name,cwd:data.path,model:request.model,mode:request.mode,effort:request.effort}));
   }catch(error){if(newSessionRequest!==request)return;resetNewSessionRequest();$('#newSessionError').textContent=error.message||'Could not start session';}}
 function handleNewSessionReply(m){const request=newSessionRequest;
   if(!request||request.phase!=='starting'||m.requestId!==request.id)return false;
@@ -7938,7 +8200,7 @@ $('#newSessionForm').onsubmit=submitNewSession;
 $('#newSessionCancel').onclick=$('#newSessionClose').onclick=closeNewSession;
 $('#newSessionDialog').addEventListener('cancel',e=>{e.preventDefault();closeNewSession();});
 document.addEventListener('keydown',e=>{if(e.key!=='Escape'||e.isComposing||!document.querySelector('.session-dialog[open]'))return;
-  e.preventDefault();e.stopImmediatePropagation();if($('#folderDialog').open)dismissFolderDialog();else closeNewSession();},true);
+  e.preventDefault();e.stopImmediatePropagation();if($('#projectDialog').open)closeProjectDialog();else if($('#folderDialog').open)dismissFolderDialog();else closeNewSession();},true);
 $('#newRecent').onchange=()=>{if($('#newRecent').value)$('#newCwd').value=$('#newRecent').value;};
 $('#newCwd').oninput=()=>{$('#newRecent').value='';};
 $('#newModel').onchange=()=>newEffortOptions($('#newEffort').value);
@@ -8301,7 +8563,7 @@ function setDrawerW(w,save){const cap=Math.round(window.innerWidth*0.96);
 })();
 $('#resumeRef').onclick=e=>{e.stopPropagation();wsSend({type:'proj_refresh'});loadTree();};
 /* collapsible sections: clicking the header toggles; restore saved state */
-['secFav','secRecent'].forEach(id=>{
+['secFav','secProjects','secRecent'].forEach(id=>{
   const h=$('#'+id+' .sb-h');if(h)h.onclick=()=>toggleSec(id);});
 applySecCollapse();
 /* dismiss the ⋯ card menu on outside-click, Escape, scroll or resize */
@@ -8443,6 +8705,7 @@ def make_application(extra_handlers=()):
         (r"/api/projects", ProjectsHandler),
         (r"/api/resumable", ResumableHandler),
         (r"/api/tree", TreeHandler),
+        (r"/api/project-library", ProjectLibraryHandler),
         (r"/api/pinfolder", PinFolderHandler),
         (r"/api/dircomplete", DirCompleteHandler),
         (r"/api/directories", DirectoriesHandler),

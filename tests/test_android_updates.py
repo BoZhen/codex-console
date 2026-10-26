@@ -10,7 +10,7 @@ from tornado.testing import AsyncHTTPTestCase
 from tornado.web import Application
 
 import codex_console as console
-from android_updates import APK_PREFIX, PACKAGE, ReleaseStore
+from android_updates import APK_PREFIX, MANIFESTS, PACKAGE, ReleaseStore
 
 
 class AndroidUpdatesTest(AsyncHTTPTestCase):
@@ -33,14 +33,14 @@ class AndroidUpdatesTest(AsyncHTTPTestCase):
             (r"/api/app/android/releases/([0-9a-f]{64})\.apk", console.AndroidApkHandler, params),
         ])
 
-    def published(self, content=b"APK fixture"):
+    def published(self, content=b"APK fixture", package=PACKAGE):
         sha = hashlib.sha256(content).hexdigest()
         (self.directory / (sha + ".apk")).write_bytes(content)
-        data = {"schemaVersion": 1, "packageName": PACKAGE, "versionCode": 4,
+        data = {"schemaVersion": 1, "packageName": package, "versionCode": 4,
                 "versionName": "0.3.0", "minSdk": 29, "size": len(content),
                 "sha256": sha, "signingCertificateSha256": "a" * 64,
                 "apkPath": APK_PREFIX + sha + ".apk", "notes": "Fixture release", "publishedAt": "2026-01-01"}
-        (self.directory / "latest.json").write_text(json.dumps(data))
+        (self.directory / MANIFESTS[package]).write_text(json.dumps(data))
         return data
 
     def request(self, path, **kwargs):
@@ -53,6 +53,37 @@ class AndroidUpdatesTest(AsyncHTTPTestCase):
 
     def test_unpublished_channel_is_404(self):
         self.assertEqual(self.request("/api/app/android/latest").code, 404)
+
+    def test_preview_is_separate_and_legacy_requests_stay_stable(self):
+        stable = self.published()
+        path = "/api/app/android/latest?package="
+        preview_package = PACKAGE + ".preview"
+        self.assertEqual(self.request(path + preview_package).code, 404)
+        preview = self.published(b"preview APK", preview_package)
+        for suffix, expected in [("", stable), ("?package=" + PACKAGE, stable),
+                                 ("?package=" + preview_package, preview)]:
+            response = self.request("/api/app/android/latest" + suffix)
+            self.assertEqual(response.code, 200)
+            self.assertEqual(json.loads(response.body), expected)
+        self.assertEqual(self.request(preview["apkPath"]).body, b"preview APK")
+        self.assertEqual(self.fetch(path + preview_package).code, 401)
+
+    def test_unknown_packages_cannot_select_arbitrary_files(self):
+        self.published()
+        for package in ["", "other.app", PACKAGE + ".qatest", "..%2Flatest.json", "%2Ftmp%2Flatest.json"]:
+            self.assertEqual(self.request("/api/app/android/latest?package=" + package).code, 404)
+
+    def test_wrong_channel_and_symlinked_manifests_are_rejected(self):
+        stable = self.published()
+        preview_package = PACKAGE + ".preview"
+        preview_file = self.directory / MANIFESTS[preview_package]
+        preview_file.write_text(json.dumps(stable))
+        path = "/api/app/android/latest?package=" + preview_package
+        self.assertEqual(self.request(path).code, 503)
+        preview_file.unlink()
+        preview_file.symlink_to(self.directory / "latest.json")
+        self.assertEqual(self.request(path).code, 503)
+        self.assertEqual(self.request("/api/app/android/latest").code, 200)
 
     def test_manifest_and_streamed_apk(self):
         data = self.published(b"x" * 300000)

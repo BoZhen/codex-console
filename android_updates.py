@@ -6,15 +6,16 @@ import stat
 from pathlib import Path
 
 PACKAGE = "org.codexconsole.android"
+MANIFESTS = {PACKAGE: "latest.json", PACKAGE + ".preview": "latest-preview.json"}
 MAX_APK_BYTES = 128 * 1024 * 1024
 MAX_MANIFEST_BYTES = 16 * 1024
 APK_PREFIX = "/api/app/android/releases/"
 
 
-def validate_manifest(data):
+def validate_manifest(data, package=PACKAGE):
     if not isinstance(data, dict) or type(data.get("schemaVersion")) is not int or data["schemaVersion"] != 1:
         raise ValueError("Unsupported update manifest")
-    if data.get("packageName") != PACKAGE:
+    if package not in MANIFESTS or data.get("packageName") != package:
         raise ValueError("Unexpected Android package")
     for field, low, high in (("versionCode", 1, 2147483647), ("minSdk", 1, 100),
                              ("size", 1, MAX_APK_BYTES)):
@@ -54,9 +55,13 @@ class ReleaseStore:
             raise ValueError("Invalid APK digest")
         return self._open(self.directory / (digest + ".apk"), MAX_APK_BYTES)
 
-    def latest(self):
-        with self._open(self.directory / "latest.json", MAX_MANIFEST_BYTES) as source:
-            data = validate_manifest(json.loads(source.read(MAX_MANIFEST_BYTES + 1)))
+    def latest(self, package=None):
+        package = PACKAGE if package is None else package
+        name = MANIFESTS.get(package)
+        if name is None:
+            raise FileNotFoundError("No release channel for this package")
+        with self._open(self.directory / name, MAX_MANIFEST_BYTES) as source:
+            data = validate_manifest(json.loads(source.read(MAX_MANIFEST_BYTES + 1)), package)
         with self.open_apk(data["sha256"]) as apk:
             if os.fstat(apk.fileno()).st_size != data["size"]:
                 raise ValueError("APK size mismatch")

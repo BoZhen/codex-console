@@ -195,5 +195,104 @@ class NewSessionControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(socket._say.call_args.args[0],{'type':'error','error':'invalid working directory','requestId':'request-a'})
 
 
+class NamedSessionControllerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.names = Path(self.tmp.name) / 'names.json'
+        self.cc = '01234567-89ab-cdef-0123-456789abcdef'
+        for name, value in (('NAMES_FILE', str(self.names)), ('_names_cache', {'mtime': -1.0, 'v': {}}),
+                            ('CODEX_BIN', sys.executable), ('CHAT_SESSIONS', {})):
+            patcher = mock.patch.object(c, name, value)
+            patcher.start(); self.addCleanup(patcher.stop)
+        self.session_type = c.ChatSession
+        self.session = c.ChatSession('new-id', os.getcwd(), 'default', 'read-only')
+        async def start():
+            self.session.cc_id = self.cc
+            self.session.thread_id = self.cc
+        self.session.start = mock.AsyncMock(side_effect=start)
+        self.factory = mock.patch.object(c, 'ChatSession', return_value=self.session)
+        self.created = self.factory.start(); self.addCleanup(self.factory.stop)
+        sid = mock.patch.object(c.secrets, 'token_hex', return_value='new-id')
+        sid.start(); self.addCleanup(sid.stop)
+        self.socket = object.__new__(c.ChatSocket)
+        self.socket._say = mock.Mock()
+        self.previous = mock.Mock()
+        self.socket.session = self.previous
+
+    async def start(self, **extra):
+        await self.socket.on_message(json.dumps({'type': 'start', 'cwd': os.getcwd(),
+                                                'requestId': 'named-request', **extra}))
+        return self.socket._say.call_args.args[0]
+
+    async def test_name_is_persisted_and_visible_before_the_first_message(self):
+        name = '\u5b9e\u9a8c A <comparison>'
+        reply = await self.start(name='  ' + name + '  ')
+        self.assertEqual(reply['type'], 'started')
+        self.assertEqual(reply['title'], name)
+        self.assertEqual(reply['cc'], self.cc)
+        self.assertEqual(reply['requestId'], 'named-request')
+        self.assertEqual(reply['name'], os.path.basename(os.getcwd()))
+        self.assertEqual(json.loads(self.names.read_text()), {self.cc: name})
+        self.assertEqual(self.session.log, [])
+        self.session.log.append({'kind': 'user_text', 'text': 'Do not replace the custom name'})
+        self.assertEqual(self.session.title(), name)
+        await self.socket.on_message(json.dumps({'type': 'list'}))
+        self.assertEqual(self.socket._say.call_args.args[0]['sessions'][0]['title'], name)
+        await self.socket.on_message(json.dumps({'type': 'attach', 'id': 'new-id'}))
+        self.assertEqual(self.socket._say.call_args.args[0]['title'], name)
+        c._names_cache['mtime'] = -1
+        restored = self.session_type('restored', os.getcwd(), 'default', 'read-only', resume_cc=self.cc)
+        self.assertEqual(restored.title(), name)
+        self.assertTrue(c.set_name(self.cc, 'Changed later'))
+        self.assertEqual(restored.title(), 'Changed later')
+
+    async def test_blank_or_missing_name_keeps_automatic_naming(self):
+        with mock.patch.object(c, 'set_name') as save:
+            for extra in ({}, {'name': ''}, {'name': '   '}):
+                reply = await self.start(**extra)
+                self.assertEqual(reply['type'], 'started')
+                self.assertEqual(reply['title'], '')
+                self.assertNotIn('warning', reply)
+            save.assert_not_called()
+        self.assertFalse(self.names.exists())
+        self.session.log.append({'kind': 'user_text', 'text': 'Automatic title'})
+        self.assertEqual(self.session.title(), 'Automatic title')
+
+    async def test_name_uses_existing_rename_length_limit(self):
+        reply = await self.start(name='x' * 150)
+        self.assertEqual(reply['title'], 'x' * 120)
+        self.assertEqual(json.loads(self.names.read_text())[self.cc], 'x' * 120)
+
+    async def test_non_text_name_is_rejected_before_starting_a_process(self):
+        for value in (None, 42, False, [], {}):
+            reply = await self.start(name=value)
+            self.assertEqual(reply, {'type': 'error', 'error': 'invalid session name', 'requestId': 'named-request'})
+        self.created.assert_not_called()
+        self.session.start.assert_not_awaited()
+        self.assertIs(self.socket.session, self.previous)
+        self.assertFalse(self.names.exists())
+
+    async def test_failed_start_does_not_save_a_name(self):
+        self.session.start.side_effect = RuntimeError('start failed')
+        with mock.patch.object(c, 'set_name') as save:
+            reply = await self.start(name='Retained draft name')
+            save.assert_not_called()
+        self.assertEqual(reply['type'], 'error')
+        self.assertFalse(self.names.exists())
+        self.assertIs(self.socket.session, self.previous)
+        self.assertEqual(c.CHAT_SESSIONS, {})
+
+    async def test_name_save_failure_keeps_the_created_session_and_reports_a_warning(self):
+        with mock.patch.object(c, 'set_name', return_value=False):
+            reply = await self.start(name='Cannot persist')
+        self.assertEqual(reply['type'], 'started')
+        self.assertIn('name could not be saved', reply['warning'])
+        self.assertEqual(reply['title'], '')
+        self.assertIs(self.socket.session, self.session)
+        self.assertIs(c.CHAT_SESSIONS['new-id'], self.session)
+        self.session.start.assert_awaited_once()
+
+
 if __name__=='__main__':
     unittest.main()

@@ -86,6 +86,8 @@ async def verify(cdp,url,output):
           $('#newbtn').click();
         ''')
         assert await cdp.js("$('#newSessionDialog').open && $('#newCwd').value==='/demo/current'")
+        assert await cdp.js("$('#newName').value===''&&$('#newName').maxLength===120&&document.activeElement.id==='newName'")
+        await cdp.js("$('#newName').value='Cancelled name'")
         assert await cdp.js("$('#newEffort').value==='xhigh'")
         assert await cdp.js('starts().length')==0
         await escape(cdp)
@@ -95,6 +97,8 @@ async def verify(cdp,url,output):
 
         await cdp.js("newSessionIn('/demo/Project Alpha')")
         assert await cdp.js("$('#newCwd').value==='/demo/Project Alpha'")
+        assert await cdp.js("$('#newName').value===''")
+        await cdp.js("$('#newName').value='Thermal scaling'")
         for theme in ('light','dark'):
             await cdp.js(f"document.documentElement.setAttribute('data-theme','{theme}')")
             await settle(cdp)
@@ -192,20 +196,26 @@ async def verify(cdp,url,output):
         await settle(cdp)
         assert await cdp.js("starts().length===0&&!$('#newSessionDialog').open&&ta.value==='Unsent draft'")
 
-        await cdp.js("newSession('/demo/Project Alpha');$('#newSessionForm').requestSubmit();$('#newSessionForm').requestSubmit()")
+        await cdp.js("newSession('/demo/Project Alpha');window.__sessionLabel='\\u5b9e\\u9a8c A <img src=x onerror=window.__nameExecuted=true>';$('#newName').value='  '+__sessionLabel+'  ';$('#newSessionForm').requestSubmit();$('#newSessionForm').requestSubmit()")
         await settle(cdp)
         assert await cdp.js("starts().length===1&&sid==='existing'&&$('#newSessionSubmit').disabled&&$('#newSessionClose').disabled")
+        assert await cdp.js("starts()[0].name===__sessionLabel&&$('#newName').matches(':disabled')")
         await escape(cdp)
         assert await cdp.js("$('#newSessionDialog').open")
         await cdp.js("reply({type:'error',requestId:starts()[0].requestId,error:'Start failed'})")
         assert await cdp.js("sid==='existing'&&!$('#newSessionSubmit').disabled&&$('#newSessionError').textContent==='Start failed'")
+        assert await cdp.js("$('#newName').value.trim()===__sessionLabel")
         await cdp.js("$('#newModel').value='small-model';$('#newModel').dispatchEvent(new Event('change'));$('#newMode').value='read-only';$('#newSessionForm').requestSubmit()")
         await settle(cdp)
         message=await cdp.js('starts()[1]')
         assert message['cwd']=='/demo/Project Alpha' and message['model']=='small-model'
         assert message['effort']=='medium' and message['mode']=='read-only'
-        await cdp.js("reply({type:'started',requestId:starts()[1].requestId,id:'created',cwd:'/demo/Project Alpha',model:'small-model',name:'Project Alpha',effort:'medium',subagents:[]})")
+        assert message['name']==await cdp.js('__sessionLabel')
+        await cdp.js("reply({type:'started',requestId:starts()[1].requestId,id:'created',cc:'created-thread',cwd:'/demo/Project Alpha',model:'small-model',name:'Project Alpha',title:__sessionLabel,effort:'medium',subagents:[]})")
         assert await cdp.js("sid==='created'&&!$('#newSessionDialog').open&&drafts.existing.text==='Unsent draft'&&sessionViewCache.has('existing')")
+        assert await cdp.js("curCC==='created-thread'&&$('#curname').textContent===__sessionLabel&&sessionTabById('created').title===__sessionLabel")
+        await cdp.js("reply({type:'sessions',sessions:[{id:'existing',cwd:'/demo/current',title:'Existing session'},{id:'created',cc:'created-thread',cwd:'/demo/Project Alpha',title:__sessionLabel}]})")
+        assert await cdp.js("[...document.querySelectorAll('.sname')].some(e=>e.textContent===__sessionLabel)&&!window.__nameExecuted&&!$('#sessionTabs').querySelector('img')")
         assert await cdp.js("preferredModel==='small-model'&&preferredMode==='read-only'&&localStorage.getItem('al_mode')==='read-only'")
         assert not await cdp.js("__sent.some(m=>['end','detach','interrupt','resume'].includes(m.type))")
 
@@ -232,6 +242,7 @@ async def verify(cdp,url,output):
         assert await cdp.js("currentFolder()==='/demo/other'&&sid==='created'")
         await cdp.js("newSession()")
         assert await cdp.js("$('#newCwd').value==='/demo/other'")
+        assert await cdp.js("$('#newName').value===''")
         assert await cdp.js("$('#newModel').value==='small-model'&&$('#newMode').value==='read-only'")
         await cdp.js("$('#newModel').value='test-model';$('#newModel').dispatchEvent(new Event('change'));$('#newMode').value='full-access'")
         await escape(cdp)
@@ -248,7 +259,7 @@ async def verify(cdp,url,output):
         resumed=await cdp.js("__sent.filter(m=>m.type==='resume').at(-1)")
         assert resumed['model']=='small-model' and resumed['mode']=='read-only'
         assert await cdp.js('__errors')==[]
-        print(f'{width}px: dialog, folder creation, conflicts, duplicate guard, refresh, defaults, cancellation, import PASS')
+        print(f'{width}px: naming, safe title rendering, retries, dialog, folder creation, duplicate guard, defaults, cancellation, import PASS')
 
 
 if __name__=='__main__':

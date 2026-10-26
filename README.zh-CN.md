@@ -20,6 +20,8 @@ OpenAI Codex CLI 的浏览器界面。它运行 `codex app-server`，让 Codex s
 - **持久 session**，由 `~/.codex/sessions` 下的 Codex rollout JSONL 文件支持。
 - **Session 标签页和侧栏**，可同时保持多个 session 运行，并在不同项目间切换
   而不中止活动任务。
+- **Projects 会话库**，按文件夹查看全部已保存的主会话，支持筛选、自定义项目分组，
+  以及通过拖拽或菜单添加文件夹和会话。
 - **新建 session 对话框**，支持浏览和新建目录，以及设置模型、思考深度和权限。
 - **历史记录搜索、导入和导出**，用于管理 Codex rollout 对话记录。
 - **固定的 Plan 面板**，可原位更新、折叠，并在所有任务完成后清除。
@@ -115,6 +117,8 @@ python codex_console.py
 
 - Codex rollout 对话记录：`~/.codex/sessions`
 - Console session 偏好设置和名称：`~/.codex/console-*.json`
+- 自定义项目分组：`~/.codex/console-project-groups.json`。删除分组或移除成员不会
+  移动或删除对话记录及文件夹。
 - 历史记录搜索索引：`~/.cache/codex-console/history.db`
 
 发送前，附件内容仅保存在浏览器内存中。发送后的文本和代码附件会成为 Codex

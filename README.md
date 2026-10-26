@@ -23,6 +23,8 @@ plans, file changes, and session state in one interface.
   `~/.codex/sessions`.
 - **Session tabs and sidebar** for keeping multiple sessions running and
   switching between projects without ending active work.
+- **Projects library** with all stored main sessions grouped by folder, filtering,
+  and named collections. Add folders or sessions by drag-and-drop or menu.
 - **New-session dialog** with directory browsing and folder creation, model,
   reasoning effort, and permission settings.
 - **History search, import, and export** for Codex rollout transcripts.
@@ -126,6 +128,8 @@ python codex_console.py
 
 - Codex rollout transcripts: `~/.codex/sessions`
 - Console session preferences and names: `~/.codex/console-*.json`
+- Named project collections: `~/.codex/console-project-groups.json`. Removing a
+  collection or its members does not move or delete transcripts or folders.
 - History search index: `~/.cache/codex-console/history.db`
 
 Before sending, attachment bodies remain in browser memory. Sent text and code
