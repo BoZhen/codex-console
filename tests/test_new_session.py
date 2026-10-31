@@ -55,6 +55,32 @@ class DirectoryListingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'Cannot read'):
                 c.browse_directories('~')
 
+    def test_prefix_filters_before_the_limit_without_project_scanning(self):
+        for name in ('Notebook archive', 'Notebooks', 'notes.txt'):
+            path=self.home/name
+            if name.endswith('.txt'): path.write_text('not a directory')
+            else: path.mkdir()
+        with mock.patch.object(c, '_projects_cached') as projects:
+            listing=c.browse_directories('~', prefix='NOTE', limit=1)
+        projects.assert_not_called()
+        self.assertEqual([r['name'] for r in listing['folders']], ['Notebook archive'])
+        self.assertTrue(listing['truncated'])
+        listing=c.browse_directories('~', prefix='pRoJeCt a')
+        self.assertEqual([r['name'] for r in listing['folders']], ['Project Alpha'])
+        self.assertFalse(listing['truncated'])
+        self.assertEqual(c.browse_directories('~', prefix='external')['folders'], [])
+        self.assertEqual(c.browse_directories('~', prefix='no match')['folders'], [])
+
+    def test_prefix_supports_unicode_hidden_names_and_rejects_invalid_values(self):
+        name='\u5b9e\u9a8c records'
+        (self.home/name).mkdir()
+        self.assertEqual(c.browse_directories('~', prefix='\u5b9e')['folders'][0]['name'], name)
+        self.assertEqual(c.browse_directories('~', prefix='.hi')['folders'], [])
+        self.assertEqual(c.browse_directories('~', True, prefix='.hi')['folders'][0]['name'], '.hidden')
+        for prefix in ('../', 'bad\0name', 'x'*256, {}, 1):
+            with self.subTest(prefix=repr(prefix)), self.assertRaises(ValueError):
+                c.browse_directories('~', prefix=prefix)
+
     def test_create_single_child_with_spaces_unicode_and_inside_home_symlink(self):
         name='New \u5b9e\u9a8c'
         result=c.create_directory('~/Project Alpha',name)
@@ -113,6 +139,15 @@ class DirectoryHandlerTests(AsyncHTTPTestCase):
         self.assertEqual(response.code,200)
         self.assertEqual(json.loads(response.body),result)
         browse.assert_called_once_with('~/Project Alpha',True)
+
+    def test_completion_passes_literal_prefix_and_disables_cache(self):
+        result={'path':'/home/demo','parent':'/home/demo','home':'/home/demo','folders':[],'truncated':False}
+        with mock.patch.object(c,'AUTH',''), mock.patch.object(c,'browse_directories',return_value=result) as browse:
+            response=self.fetch('/api/directories?'+urlencode({'path':'~','hidden':1,'prefix':'.hi'}))
+        self.assertEqual(response.code,200)
+        self.assertEqual(response.headers['Cache-Control'], 'no-store')
+        self.assertEqual(json.loads(response.body),result)
+        browse.assert_called_once_with('~',True,prefix='.hi')
 
     def test_post_creates_folder_and_reports_conflict(self):
         with tempfile.TemporaryDirectory() as tmp,mock.patch.object(c,'HOME',tmp),mock.patch.object(c,'AUTH',''):

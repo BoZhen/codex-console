@@ -49,7 +49,7 @@ import tornado.websocket
 
 from context_usage import read_context_usage
 from notify_events import NotifyHub
-from attachments import AttachmentStore, safe_name
+from attachments import AttachmentStore, read_local_image, safe_name
 from project_library import ProjectGroups, SessionCatalog
 
 # This build drives the real `codex` CLI through its `codex app-server` JSON-RPC
@@ -669,10 +669,13 @@ def _agent_label(rec):
     return "subagent " + (tid[:8] if tid else "?")
 
 
+SUBAGENT_INACTIVE = {"completed", "interrupted", "errored", "shutdown", "notFound", "notfound", "idle", "notLoaded", "systemError"}
+
+
 def _subagent_public(rec):
     rec = dict(rec or {})
     state = _txt(rec.get("state") or "running")
-    done = state in ("completed", "interrupted", "errored", "shutdown", "notFound", "notfound")
+    done = state in SUBAGENT_INACTIVE
     out = {
         "threadId": rec.get("threadId"),
         "label": _agent_label(rec),
@@ -680,9 +683,11 @@ def _subagent_public(rec):
         "active": not done,
         "updatedAt": rec.get("updatedAt"),
         "createdAt": rec.get("createdAt"),
+        "revision": rec.get("_revision", 0),
+        "readError": rec.get("readError", ""),
     }
     for key in ("activity", "agentPath", "agentRole", "agentNickname", "prompt",
-                "message", "model", "reasoningEffort", "tool", "cwd", "title"):
+                "message", "model", "reasoningEffort", "tool", "cwd", "title", "currentTool", "readError", "checkedAt"):
         if rec.get(key):
             out[key] = rec.get(key)
     return out
@@ -2326,15 +2331,21 @@ def _directory_path(raw=""):
     return path
 
 
-def browse_directories(raw="", hidden=False, limit=500):
+def browse_directories(raw="", hidden=False, limit=500, *, prefix=None):
     """List one directory, without discovering repositories or changing projects."""
+    if prefix is not None and (not isinstance(prefix, str) or len(prefix) > 255
+                               or "/" in prefix or "\0" in prefix):
+        raise ValueError("Invalid folder prefix")
     path = _directory_path(raw)
     home = os.path.realpath(HOME)
     folders = []
+    match = prefix.casefold() if prefix is not None else ""
     try:
         with os.scandir(path) as entries:
             for entry in entries:
                 if entry.name.startswith(".") and not hidden:
+                    continue
+                if match and not entry.name.casefold().startswith(match):
                     continue
                 try:
                     target = safe_cwd(entry.path) if entry.is_dir() else None
@@ -2490,6 +2501,29 @@ class AuthMixin:
         self.set_header("WWW-Authenticate", 'Basic realm="codex-console"')
         self.finish()
         return False
+
+
+class InlineImageHandler(AuthMixin, tornado.web.RequestHandler):
+    async def head(self):
+        await self.get(include_body=False)
+
+    async def get(self, include_body=True):
+        if not self._ok_auth():
+            return
+        try:
+            meta, raw = await asyncio.to_thread(read_local_image, self.get_argument("path", ""), HOME)
+        except (OSError, ValueError):
+            raise tornado.web.HTTPError(404, reason="Image is unavailable")
+        self.set_header("Content-Type", meta["media_type"])
+        self.set_header("Content-Length", len(raw))
+        self.set_header("X-Content-Type-Options", "nosniff")
+        self.set_header("Content-Security-Policy", "default-src 'none'; sandbox")
+        self.set_header("Cross-Origin-Resource-Policy", "same-origin")
+        self.set_header("Cache-Control", "private, no-store")
+        disposition = "attachment" if self.get_argument("download", "0") == "1" else "inline"
+        self.set_header("Content-Disposition", disposition + "; filename*=UTF-8''" + urllib.parse.quote(meta["name"], safe=""))
+        if include_body:
+            self.write(raw)
 
 
 class AttachmentHandler(AuthMixin, tornado.web.RequestHandler):
@@ -3051,10 +3085,12 @@ class DirectoriesHandler(AuthMixin, tornado.web.RequestHandler):
         if not self._ok_auth():
             return
         self.set_header("Content-Type", "application/json")
+        self.set_header("Cache-Control", "no-store")
         try:
-            result = await asyncio.get_running_loop().run_in_executor(
-                None, browse_directories, self.get_argument("path", "~"),
-                self.get_argument("hidden", "0") == "1")
+            prefix = self.get_argument("prefix", None)
+            options = {"prefix": prefix} if prefix is not None else {}
+            result = await asyncio.to_thread(browse_directories, self.get_argument("path", "~"),
+                                             self.get_argument("hidden", "0") == "1", **options)
         except ValueError as exc:
             self.set_status(400)
             self.write({"error": str(exc)})
@@ -3416,6 +3452,11 @@ class ChatSession:
         self.goal = None
         self.safety_buffering = None
         self.subagents = {}             # agentThreadId -> status shown in Subagents panel
+        self._subagent_reads = {}
+        self._subagent_read_slots = asyncio.Semaphore(4)
+        self._subagent_refresh_task = None
+        self._subagent_refresh_at = 0.0
+        self._subagent_refresh_cursor = 0
         self.transcript_meta = {}
         # live streaming token counters (ephemeral; pushed to the pill, never logged)
         self._tok_up = 0
@@ -3449,6 +3490,11 @@ class ChatSession:
                     tid = agent.get("threadId")
                     if tid:
                         self.subagents[tid] = {**self.subagents.get(tid, {}), **agent}
+                elif ev.get("kind") == "tool_use" and ev.get("tool") == "Agent":
+                    inp = ev.get("input") or {}
+                    for tid in inp.get("receiverThreadIds") or []:
+                        if _thread_ref_ok(tid) and tid not in self.subagents:
+                            self._upsert_subagent(tid, state="notLoaded", prompt=inp.get("prompt"), model=inp.get("model"))
 
     def title(self):
         if self.cc_id:
@@ -3658,7 +3704,7 @@ class ChatSession:
         return rows
 
     def _emit_subagents(self):
-        self._emit({"type": "events", "events": [{"kind": "subagents",
+        self._emit({"type": "events", "sessionId": self.id, "events": [{"kind": "subagents",
                     "subagents": self.subagents_snapshot()}]})
 
     def _upsert_subagent(self, thread_id, state=None, activity=None, **fields):
@@ -3668,7 +3714,7 @@ class ChatSession:
         now = time.time()
         rec = self.subagents.setdefault(
             thread_id, {"threadId": thread_id, "createdAt": now})
-        rec["updatedAt"] = now
+        before = dict(rec)
         if activity:
             rec["activity"] = activity
             if activity in ("started", "interacted"):
@@ -3677,17 +3723,34 @@ class ChatSession:
                 state = state or activity
         if state:
             state = _status_type(state)
+            terminal = rec.get("state") in {"completed", "interrupted", "errored", "shutdown"}
             rec["state"] = {
                 "active": "running",
-                "idle": rec.get("state") or "running",
-                "notLoaded": rec.get("state") or "notLoaded",
+                "idle": rec.get("state") if terminal else "idle",
+                "notLoaded": rec.get("state") if terminal else "notLoaded",
+                "failed": "errored",
             }.get(state, state)
         elif not rec.get("state"):
             rec["state"] = "running"
         for key, val in fields.items():
             if val is not None and val != "":
                 rec[key] = _cap(_txt(val), 1200) if isinstance(val, str) else val
+        if rec != before or "updatedAt" not in rec:
+            rec["updatedAt"] = now
+            rec["_revision"] = rec.get("_revision", 0) + 1
         return _subagent_public(rec)
+
+    def _subagent_message(self, tid, message):
+        if not message:
+            return
+        if message.get("role") == "tool":
+            text = _txt(message.get("txt"))
+            name = "Edit" if message.get("kind") == "fileChange" else text.split("\n", 1)[0].split(" ", 1)[0]
+            self._upsert_subagent(tid, currentTool={"itemId": message.get("itemId"), "name": name or message.get("kind"),
+                                                   "summary": _cap(text.split("\n", 1)[0], 300),
+                                                   "status": message.get("status") or "completed"})
+        elif message.get("role") == "assistant":
+            self._upsert_subagent(tid, message=message.get("txt"))
 
     def _update_subagents_from_collab(self, item):
         ids = list(item.get("receiverThreadIds") or [])
@@ -3733,25 +3796,58 @@ class ChatSession:
             self._upsert_subagent(tid, state=p.get("status"))
             self._emit_subagents()
             return True
+        if method in ("thread/closed", "thread/archived", "thread/deleted"):
+            state = "notFound" if method == "thread/deleted" else "shutdown" if method == "thread/archived" else "notLoaded"
+            self._upsert_subagent(tid, state=state)
+            self._emit_subagents()
+            return True
         if method in ("turn/completed", "turn/failed"):
             status = _status_type((p.get("turn") or {}).get("status"))
             state = "errored" if method == "turn/failed" or status == "failed" else "interrupted" if status == "interrupted" else "completed"
-            self._upsert_subagent(tid, state=state, message="turn " + state)
+            rec = self._upsert_subagent(tid, state=state, activity=state)
+            if rec.get("currentTool", {}).get("status") in ("running", "inProgress"):
+                self._upsert_subagent(tid, currentTool={**rec["currentTool"], "status": state})
             self._emit_subagents()
             return True
         item = (p or {}).get("item") if isinstance((p or {}).get("item"), dict) else {}
-        msg = ""
-        if item.get("type") == "agentMessage" and item.get("text"):
-            msg = item.get("text")
-        elif method.startswith("turn/"):
-            msg = method.replace("/", " ")
-        elif method.startswith("item/"):
-            msg = item.get("type") or method.replace("/", " ")
-        self._upsert_subagent(tid, state="running", message=msg)
+        starts = method in ("turn/started", "item/started")
+        self._upsert_subagent(tid, state="running" if starts else None)
+        if item:
+            message = _subagent_item_message({"item": item, "turnId": p.get("turnId")})
+            if message and not message.get("status"):
+                message["status"] = "running" if starts else "completed"
+            self._subagent_message(tid, message)
+        elif method == "item/agentMessage/delta" and isinstance(p.get("delta"), str):
+            rec = self.subagents[tid]
+            key = p.get("itemId")
+            previous = rec.get("_stream_text", "") if key == rec.get("_stream_item") else ""
+            rec["_stream_item"], rec["_stream_text"] = key, (previous + p["delta"])[-4000:]
+            self._upsert_subagent(tid, message=rec["_stream_text"])
         self._emit_subagents()
         return True
 
-    async def read_subagent_thread(self, thread_id, limit=160):
+    async def refresh_subagents(self):
+        if self._subagent_refresh_task and not self._subagent_refresh_task.done():
+            return await asyncio.shield(self._subagent_refresh_task)
+        if time.monotonic() - self._subagent_refresh_at < 2:
+            return {"ok": True, "subagents": self.subagents_snapshot()}
+        async def refresh():
+            active = [tid for tid, rec in self.subagents.items() if _subagent_public(rec)["active"]]
+            inactive = [tid for tid, rec in self.subagents.items()
+                        if not _subagent_public(rec)["active"] and time.time() - rec.get("checkedAt", 0) >= 30]
+            if (active or inactive) and self.proc and not self.ended:
+                start = self._subagent_refresh_cursor % len(active) if active else 0
+                selected = (active[start:] + active[:start])[:12]
+                self._subagent_refresh_cursor = start + len(selected)
+                inactive.sort(key=lambda tid: self.subagents[tid].get("checkedAt", 0))
+                selected += inactive[:12 - len(selected)]
+                await asyncio.gather(*(self.read_subagent_thread(tid, 20, overview=True) for tid in selected))
+            self._subagent_refresh_at = time.monotonic()
+            return {"ok": True, "subagents": self.subagents_snapshot()}
+        self._subagent_refresh_task = asyncio.create_task(refresh())
+        return await asyncio.shield(self._subagent_refresh_task)
+
+    async def read_subagent_thread(self, thread_id, limit=160, overview=False):
         thread_id = _txt(thread_id).strip()
         if not _thread_ref_ok(thread_id):
             return {"ok": False, "error": "invalid subagent thread id", "threadId": thread_id}
@@ -3765,38 +3861,63 @@ class ChatSession:
         except Exception:
             limit = 160
         limit = max(20, min(limit, 400))
+        key = (thread_id, limit, overview)
+        task = self._subagent_reads.get(key)
+        if task is None:
+            async def read():
+                async with self._subagent_read_slots:
+                    return await self._read_subagent_thread(thread_id, limit, overview)
+            task = asyncio.create_task(read())
+            self._subagent_reads[key] = task
+            task.add_done_callback(lambda done: self._subagent_reads.pop(key, None) if self._subagent_reads.get(key) is done else None)
+        return await asyncio.shield(task)
+
+    async def _read_subagent_thread(self, thread_id, limit, overview):
+        rec = self.subagents[thread_id]
+        revision = rec.get("_revision", 0)
         thread, entries, error = {}, [], ""
         try:
-            res = await self._request("thread/read", {"threadId": thread_id, "includeTurns": False})
+            res = await self._request("thread/read", {"threadId": thread_id, "includeTurns": False}, timeout=5)
             thread = (res or {}).get("thread") or {}
-            self._upsert_subagent(
-                thread_id, state=thread.get("status"), title=thread.get("name") or thread.get("preview"),
-                cwd=thread.get("cwd"), agentRole=thread.get("agentRole"),
-                agentNickname=thread.get("agentNickname"))
+            if rec.get("_revision", 0) == revision:
+                self._upsert_subagent(
+                    thread_id, state=thread.get("status"), title=thread.get("name") or thread.get("preview"),
+                    cwd=thread.get("cwd"), agentRole=thread.get("agentRole"), agentNickname=thread.get("agentNickname"))
+                revision = rec.get("_revision", 0)
         except Exception as ex:
             error = "thread/read failed: %r" % ex
         try:
             res = await self._request("thread/items/list", {
-                "threadId": thread_id, "limit": limit, "sortDirection": "desc"})
+                "threadId": thread_id, "limit": limit, "sortDirection": "desc"}, timeout=5)
             entries = list(reversed((res or {}).get("data") or []))
         except Exception as ex:
             if error:
                 error += "; "
             error += "thread/items/list failed: %r" % ex
-            try:
-                res = await self._request("thread/read", {"threadId": thread_id, "includeTurns": True})
-                thread = (res or {}).get("thread") or thread or {}
-                for turn in thread.get("turns") or []:
-                    for item in turn.get("items") or []:
-                        entries.append({"turnId": turn.get("id"), "item": item})
-            except Exception:
-                pass
+            if not overview:
+                try:
+                    res = await self._request("thread/read", {"threadId": thread_id, "includeTurns": True}, timeout=5)
+                    thread = (res or {}).get("thread") or thread or {}
+                    for turn in thread.get("turns") or []:
+                        for item in turn.get("items") or []:
+                            entries.append({"turnId": turn.get("id"), "item": item})
+                except Exception:
+                    pass
         messages = []
         for entry in entries[-limit:]:
             msg = _subagent_item_message(entry)
             if msg:
                 messages.append(msg)
+        if rec.get("_revision", 0) == revision:
+            # A read-only snapshot must not overwrite a newer live event.
+            for role in ("assistant", "tool"):
+                latest = next((msg for msg in reversed(messages) if msg.get("role") == role), None)
+                self._subagent_message(thread_id, latest)
+            revision = rec.get("_revision", 0)
+        rec["checkedAt"] = time.time()
+        rec["readError"] = _cap(error, 400) if error else ""
         return {"ok": not bool(error) or bool(messages), "error": error,
+                "readRevision": revision,
                 "threadId": thread_id, "subagent": _subagent_public(self.subagents.get(thread_id)),
                 "thread": {
                     "id": thread.get("id") or thread_id,
@@ -3859,7 +3980,7 @@ class ChatSession:
         if method == "thread/started":
             th = p.get("thread") or {}
             parent_id = th.get("parentThreadId")
-            if th.get("id") and parent_id and self.thread_id and parent_id == self.thread_id:
+            if th.get("id") and self.thread_id and th["id"] != self.thread_id:
                 self._upsert_subagent(
                     th["id"], state=th.get("status"), title=th.get("name") or th.get("preview"),
                     cwd=th.get("cwd"), agentRole=th.get("agentRole"),
@@ -4907,6 +5028,10 @@ class ChatSession:
 
     def terminate(self):
         self.ended = True
+        if self._subagent_refresh_task:
+            self._subagent_refresh_task.cancel()
+        for task in list(self._subagent_reads.values()):
+            task.cancel()
         self._dismiss_pending_requests()
         self._dismiss_async_questions()
         NOTIFY.session_gone(self)
@@ -5051,6 +5176,41 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
         except Exception:
             pass
 
+    def _schedule_subagent_read(self, msg, overview=False):
+        sess = self.session
+        if msg.get("sessionId") and msg["sessionId"] != sess.id:
+            return
+        rid = msg.get("requestId")
+        rid = rid if isinstance(rid, str) and len(rid) <= 120 else None
+        tid = _txt(msg.get("threadId"))
+        kind = "subagents_snapshot" if overview else "subagent_thread"
+        jobs = getattr(self, "_subagent_jobs", None)
+        if jobs is None:
+            jobs = self._subagent_jobs = {}
+        key = (sess.id, "overview" if overview else tid)
+        if key in jobs:
+            jobs[key]["requestId"] = rid
+            return
+        if len(jobs) >= 4:
+            self._say({"type": kind, "sessionId": sess.id, "threadId": tid, "requestId": rid,
+                       "ok": False, "error": "Subagent reads are busy; retry shortly"})
+            return
+        job = jobs[key] = {"requestId": rid}
+        async def read():
+            try:
+                if overview:
+                    result = await sess.refresh_subagents()
+                else:
+                    result = await sess.read_subagent_thread(tid, msg.get("limit") or 160)
+            except Exception:
+                result = {"ok": False, "threadId": tid, "error": "Unable to read subagent state"}
+            finally:
+                jobs.pop(key, None)
+            if self.session is sess:
+                self._say({"type": kind, "sessionId": sess.id, "requestId": job["requestId"], **result})
+        # Reading child history must not hold up chat messages on this WebSocket.
+        tornado.ioloop.IOLoop.current().spawn_callback(read)
+
     def _broadcast_favorites(self):
         favs = list_favorites()
         for ws in list(ChatSocket.clients):
@@ -5188,10 +5348,9 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                        "activity": sess.last_activity,
                        "subagents": sess.subagents_snapshot()})
         elif mt == "subagent_read" and self.session:
-            sess = self.session
-            res = await sess.read_subagent_thread(
-                msg.get("threadId"), msg.get("limit") or 160)
-            self._say({"type": "subagent_thread", "sessionId": sess.id, **res})
+            self._schedule_subagent_read(msg)
+        elif mt == "subagents_read" and self.session:
+            self._schedule_subagent_read(msg, overview=True)
         elif mt == "terminals_read" and self.session:
             sess = self.session
             res = await sess.background_terminals()
@@ -5454,6 +5613,16 @@ header select,header input{background:var(--bg3);color:var(--fg);border:1px soli
 .msg.user .b{background:var(--sel);border:1px solid var(--selln);border-radius:10px;padding:8px 12px;max-width:85%;white-space:pre-wrap}
 .msg.asst .b{color:var(--fg);text-wrap:pretty}
 .msg.asst.streaming .b{text-wrap:wrap}
+.inline-image{display:block;width:min(680px,100%);max-width:100%;margin:10px 0}
+.inline-image-preview{display:block;width:100%;max-width:100%;padding:0;border:0;background:transparent;text-align:left;cursor:zoom-in}
+.inline-image-preview img{display:block;max-width:100%;height:auto;max-height:480px;object-fit:contain}
+.inline-image:not(.ready) .inline-image-preview{min-height:100px;background:var(--bg2)}
+.inline-image-note{display:block;padding:16px;color:var(--mut);font:12px var(--fsans)}
+.inline-image-note[hidden],.inline-image.failed img{display:none}
+.inline-image figcaption{margin-top:5px;font-size:12px;line-height:1.4;overflow-wrap:anywhere}
+.inline-image figcaption a{color:var(--mut)}
+.inline-image figcaption a:hover{color:var(--acc)}
+.inline-image-preview:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
 .think{color:var(--think);font-style:italic;font-size:13px;border-left:2px solid var(--line);padding:3px 0 3px 10px;margin-bottom:12px;white-space:pre-wrap}
 .think.hide{display:none}
 .notice{color:var(--mut);font-size:11.5px;margin:6px 0}
@@ -5588,6 +5757,7 @@ pre code{background:none;border:none;padding:0}
 .attachment-action svg{width:18px;height:18px;pointer-events:none}
 .attachment-action:hover{background:var(--sel);color:var(--acc)}
 .attachment-action:disabled,.attachment-action[aria-disabled=true]{opacity:.4;cursor:default;pointer-events:none}
+.attachment-action[hidden]{display:none}
 .attachment-action:focus-visible,.attachment-preview:focus-visible{outline:2px solid var(--acc);outline-offset:-2px}
 .attachment-unavailable{padding:10px;color:var(--mut);font-size:12px}
 .attachment-dialog{width:min(1000px,calc(100vw - 24px));max-height:90vh;max-height:90dvh;margin:auto;padding:0;
@@ -5642,34 +5812,56 @@ pre code{background:none;border:none;padding:0}
 #drawer .dc{flex:1;overflow:auto;padding:10px}
 .gfile{font-family:var(--fmono);font-size:12px;padding:1px 0}.gfile .st{display:inline-block;width:24px;color:var(--tool);font-weight:700}
 .empty{color:var(--mut);padding:18px;text-align:center}
-#agentPanel{position:fixed;top:0;right:0;width:var(--agw,min(760px,96vw));height:100%;background:var(--bg);border-left:1px solid var(--line);
-  transform:translateX(100%);transition:transform .34s cubic-bezier(.32,.72,0,1);z-index:22;display:flex;flex-direction:column}
-#agentPanel.open{transform:none}
+#agentPanel{display:none;min-width:0;background:var(--bg);border-left:1px solid var(--line);flex-direction:column}
+#agentPanel.open{display:flex;position:absolute;top:0;right:0;width:var(--agw,420px);height:100%;z-index:22}
+#agentPanel.open.docked{position:relative;flex:0 0 var(--agw,420px);z-index:2}
+#agresize{position:absolute;left:-3px;top:0;width:6px;height:100%;cursor:col-resize;touch-action:none;z-index:3}
+#agresize:hover,#agresize.drag{background:var(--acc)}
 #agentPanel .agh{padding:8px 12px;background:var(--bg2);border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}
 #agentPanel .agh .agtit{font-size:13px;font-weight:700;color:var(--fg)}
-#agentPanel .agh .agmeta{font-size:11.5px;color:var(--mut);font-family:var(--fmono)}
+#agentPanel .agh .agmeta{font-size:11.5px;color:var(--mut);font-family:var(--fmono);min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #agentPanel .agh .grow{flex:1}
-#agentPanel .agbody{flex:1;min-height:0;display:flex}
-#agentList{width:260px;flex:0 0 auto;border-right:1px solid var(--line);overflow:auto;background:var(--bg2)}
-#agentDetail{flex:1;min-width:0;overflow:auto;background:var(--bg)}
-.agsec{font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--mut);padding:9px 10px 4px}
-.agrow{display:flex;gap:8px;align-items:flex-start;padding:8px 10px;border-left:2px solid transparent;cursor:pointer}
+#agentPanel .agbody{flex:1;min-height:0;display:flex;flex-direction:column}
+#agentList{flex:1;min-height:0;overflow:auto;background:var(--bg2)}
+#agentDetail{display:flex;flex:1;min-height:0;min-width:0;flex-direction:column;overflow:hidden;background:var(--bg)}
+#agentDetail[hidden]{display:none}
+#agentPanel .agbody.detail #agentList{flex:0 0 32%;min-height:100px;max-height:260px;border-bottom:1px solid var(--line)}
+.agcontext{display:flex;align-items:center;gap:8px;padding:6px 12px;border-bottom:1px solid var(--line);font-size:11px;color:var(--mut)}
+#agentSession{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#agentPollState{flex:none}
+.agfilters{display:flex;gap:2px;padding:5px 8px;border-bottom:1px solid var(--line)}
+.agfilters button{border:1px solid transparent;background:none;color:var(--mut);padding:4px 9px;border-radius:4px;font:inherit;font-size:11px;cursor:pointer}
+.agfilters button[aria-pressed=true]{background:var(--sel);color:var(--acc);border-color:var(--line)}
+.agcontrol{display:grid;place-items:center;width:28px;height:28px;border:0;border-radius:4px;background:none;color:var(--mut);cursor:pointer;flex:none}
+.agcontrol:hover{color:var(--fg);background:var(--bg3)}.agcontrol svg{width:16px;height:16px}
+#agentOverview svg,#agentLatest svg{transform:rotate(180deg)}
+.agrow{display:flex;gap:8px;align-items:flex-start;width:100%;padding:6px 10px;border:0;border-bottom:1px solid var(--line);border-left:2px solid transparent;background:none;text-align:left;font:inherit;cursor:pointer}
 .agrow:hover{background:var(--bg3)}
 .agrow.on{background:var(--sel);border-left-color:var(--acc)}
-.agrow.done{opacity:.72}
+.agrow.done{opacity:.85}
 .agdot{width:7px;height:7px;border-radius:50%;background:var(--mut);flex:0 0 auto;margin-top:5px}
 .agdot.run{background:var(--tool);box-shadow:0 0 5px var(--tool);animation:pulse 1s infinite}
 .agdot.ok{background:var(--add)}
 .agdot.bad{background:var(--del)}
-.agrow .agm{min-width:0;flex:1}
+.agrow .agm{display:block;min-width:0;flex:1}
+.agrow .agtop{display:flex;gap:8px;align-items:baseline}.agrow .agn{flex:1}
+.agrow .agstate{flex:none;font-size:10.5px;color:var(--mut)}
 .agrow .agn{font-size:12.5px;color:var(--fg);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.agrow .ags{font-size:11px;color:var(--mut);line-height:1.35;word-break:break-word;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.agrow .ags{font-size:11px;color:var(--mut);line-height:1.35;word-break:break-word;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}
+.agrow .agtask{display:block;color:var(--fg);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:3px}
+.agrow .agtoolline{display:block;color:var(--tool);font:11px var(--fmono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:3px 0}
+.agrow .agreaderror{color:var(--delfg);font-size:10.5px}
+.agrow [hidden]{display:none!important}
+.agdetailbar{display:flex;gap:5px;align-items:center;border-bottom:1px solid var(--line);padding:5px 8px;background:var(--bg2)}
+#agentDetailTitle{flex:1;min-width:0;font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#agentMessages{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain}
+#agentDetailStatus{font-size:11px;color:var(--mut);padding:6px 12px;overflow-wrap:anywhere;border-bottom:1px solid var(--line)}
 .aghead{padding:12px 14px;border-bottom:1px solid var(--line);background:var(--bg2)}
 .aghead .agt{font-size:13.5px;font-weight:700;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .aghead .agsub{font-size:11.5px;color:var(--mut);font-family:var(--fmono);line-height:1.45;word-break:break-word}
 .agmsgs{padding:6px 0 14px}
 .agmsg{padding:8px 14px;border-left:3px solid transparent}
-.agmsg .agr{font-size:10.5px;color:var(--dim);margin-bottom:2px;letter-spacing:.03em}
+.agmsg .agr{font-size:10.5px;color:var(--dim);margin-bottom:2px;letter-spacing:0}
 .agmsg .agtxt{font-size:12.5px;line-height:1.55;color:var(--fg);white-space:pre-wrap;word-break:break-word}
 .agmsg.user{border-left-color:var(--acc)}
 .agmsg.assistant{border-left-color:var(--line)}
@@ -5678,14 +5870,12 @@ pre code{background:none;border:none;padding:0}
 .agmsg.system,.agmsg.agent{border-left-color:var(--mut)}
 .agmsg.tool .agtxt{font-family:var(--fmono);font-size:11.5px;color:var(--dim)}
 .agmsg.tool pre{margin:0}
+.agtool{border:1px solid var(--line);border-radius:5px;overflow:hidden}.agtool summary{cursor:pointer;padding:6px 8px;overflow-wrap:anywhere;font-size:11.5px;color:var(--tool)}
+.agtool pre{padding:8px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto}
 .agmark{font-size:12px;color:var(--acc);background:var(--infobg);border:1px solid var(--infoln);border-radius:6px;
   padding:3px 9px;margin:2px 0 12px;display:inline-flex;gap:7px;cursor:pointer;font-family:var(--fmono);align-items:center}
 .agmark:hover{filter:brightness(1.18)}
 .agmark .mut{color:var(--mut)}
-.aginline{border:1px solid var(--line);border-radius:6px;margin:8px 0;background:var(--bg2);font-size:12px}
-.aginline summary{cursor:pointer;padding:8px;overflow-wrap:anywhere;color:var(--acc)}
-.aginline .agpreview{color:var(--mut);margin-left:8px}
-.aginline .agcontent{max-height:360px;overflow:auto;padding:8px;border-top:1px solid var(--line)}
 #terminalDialog{width:min(700px,94vw);max-height:80vh;margin:auto;padding:16px;box-sizing:border-box;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg)}
 #terminalDialog::backdrop{background:#0006}
 .terminal-head{display:flex;align-items:center;gap:8px;margin-bottom:12px}.terminal-head strong{flex:1}
@@ -5770,21 +5960,31 @@ pre code{background:none;border:none;padding:0}
 /* sessions sidebar + shell layout */
 .iconbtn{background:none;border:none;color:var(--fg);font-size:17px;cursor:pointer;padding:2px 5px;line-height:1}
 .curname{font-size:13px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0;max-width:46vw}
-.ctx{display:none;align-items:center;gap:6px;font-size:12.5px;font-weight:600;color:var(--fg);white-space:nowrap;font-family:var(--fmono)}
-.usage{display:none;align-items:center;gap:6px;font-size:12.5px;font-weight:600;color:var(--fg);white-space:nowrap;font-family:var(--fmono);
-  border-left:1px solid var(--line);padding-left:11px;margin-left:4px}
+.ctx,.usage{display:none;align-items:center;gap:4px;flex:none;font-size:12.5px;font-weight:600;color:var(--fg);white-space:nowrap;font-family:var(--fmono)}
+.usage{gap:9px;border-left:1px solid var(--line);padding-left:8px;margin-left:2px}
 .ctx .ulabel,.usage .ulabel{opacity:.7}
-.usage .useg{display:inline-flex;align-items:center;gap:5px}
-.usage .useg + .useg::before{content:"|";opacity:.3;font-weight:400}   /* divider between 5h | 7d */
-.agentbtn{display:none;align-items:center;gap:5px;font-size:13px;color:var(--mut);font-family:var(--fmono);
-  border-left:1px solid var(--line);padding-left:10px;margin-left:4px}
-.agentbtn.on{display:inline-flex;color:var(--acc)}
-.agentbtn .agentn{min-width:16px;height:16px;border-radius:8px;background:var(--bg3);border:1px solid var(--line);
-  display:inline-flex;align-items:center;justify-content:center;font-size:10px;color:var(--fg);padding:0 4px}
-.agentbtn.busy .agentn{border-color:var(--tool);color:var(--tool);box-shadow:0 0 5px var(--tool)}
-/* shared segmented meter: 5 cells × 20%, whole bar coloured by the total % (Context + Usage) */
-.cells{display:inline-flex;gap:2px;align-items:center}
-.cells .cell{width:7px;height:13px;border-radius:2px;background:var(--bg3);border:1px solid var(--line);box-sizing:border-box;transition:background .25s,box-shadow .25s}
+.ctx,.usage .useg{min-height:28px;padding:2px;border:0;background:none;cursor:pointer;border-radius:4px}
+.usage .useg{display:inline-flex;align-items:center;gap:4px;font:inherit;color:inherit}
+.ctx:hover,.usage .useg:hover{background:var(--bg3)}
+.meter-dialog{margin:auto;width:min(360px,calc(100% - 24px));max-height:calc(100dvh - 24px);overflow:auto;
+  padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--bg2);color:var(--fg);font:inherit}
+.meter-dialog::backdrop{background:rgba(0,0,0,.35)}
+.meter-heading{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+#meterTitle{flex:1;min-width:0;font-weight:650}
+#meterDetails{font-family:var(--fmono);line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere}
+.agentbtn{position:relative;display:inline-flex;align-items:center;justify-content:center;flex:none;
+  width:34px;height:30px;padding:0;color:var(--mut);border-radius:4px;margin-left:4px}
+.agentbtn.on{color:var(--acc)}
+.agentbtn:hover,.agentbtn[aria-expanded=true]{background:var(--bg3);color:var(--acc)}
+.agentbtn .agenticon{display:flex}.agentbtn svg{width:20px;height:20px}
+.agentbtn .agentn{position:absolute;top:-2px;right:-3px;min-width:18px;height:18px;border-radius:9px;
+  display:inline-flex;align-items:center;justify-content:center;background:var(--acc);color:var(--onacc);
+  border:2px solid var(--bg2);padding:0 3px;font:600 10px/1 var(--fsans);box-sizing:border-box;pointer-events:none}
+.agentbtn .agentn[hidden]{display:none}
+.meter-ring{display:inline-block;flex:0 0 18px;width:18px;height:18px;border-radius:50%;
+  background:conic-gradient(currentColor var(--used,0%),var(--line) 0);
+  -webkit-mask:radial-gradient(farthest-side,transparent calc(100% - 3px),#000 calc(100% - 2.5px));
+  mask:radial-gradient(farthest-side,transparent calc(100% - 3px),#000 calc(100% - 2.5px))}
 /* Meter signal ramp — FIXED hues, deliberately not the semantic tokens.
    green/amber/orange/red mean the same thing in every theme, and the semantic
    tokens are tuned for text: pushing them to a text contrast ratio turns the
@@ -5794,13 +5994,12 @@ pre code{background:none;border:none;padding:0}
 :root[data-theme="light"],:root[data-theme="solarized-light"],:root[data-theme="catppuccin-latte"],
 :root[data-theme="gruvbox-light"],:root[data-theme="rose-pine-dawn"],:root[data-theme="one-light"],
 :root[data-theme="ayu-light"]{--mg:#22a83f;--my:#d9a800;--mo:#f57c00;--mr:#ef3f31}
-.cells.lv-g{color:var(--mg)}.cells.lv-y{color:var(--my)}
-.cells.lv-o{color:var(--mo)}.cells.lv-r{color:var(--mr)}
-.cells .cell.on{background:currentColor;border-color:currentColor;box-shadow:0 0 4px currentColor}
-@media(max-width:680px){.usage{display:none!important}.agentbtn>span:first-child{display:none}.agentbtn{padding-left:6px}}
-@media(max-width:760px){
-  #agentPanel .agbody{flex-direction:column}
-  #agentList{width:auto;max-height:36vh;border-right:none;border-bottom:1px solid var(--line)}
+.meter-ring.lv-g{color:var(--mg)}.meter-ring.lv-y{color:var(--my)}
+.meter-ring.lv-o{color:var(--mo)}.meter-ring.lv-r{color:var(--mr)}
+@media(max-width:680px){
+  header{gap:4px;padding-left:8px;padding-right:8px;flex-wrap:nowrap}
+  .usage{padding-left:6px;margin-left:0}
+  .usage.has-weekly .useg-five{display:none}
 }
 #shell{flex:1;display:flex;min-height:0;position:relative}
 #mainCol{flex:1;display:flex;flex-direction:column;min-width:0}
@@ -6076,6 +6275,18 @@ pre code{background:none;border:none;padding:0}
 .session-dialog .path-row{display:flex;gap:6px;min-width:0;align-items:center}
 .session-dialog .path-row input{flex:1;width:0}
 .session-dialog .path-row select{flex:1;width:0}
+.cwd-combobox{position:relative;flex:1;min-width:0}
+.session-dialog .cwd-combobox #newCwd{width:100%}
+.cwd-suggestions{position:absolute;z-index:6;top:calc(100% + 3px);left:0;right:0;max-height:200px;overflow:auto;
+  overscroll-behavior:contain;background:var(--bg);border:1px solid var(--line);border-radius:5px;box-shadow:0 5px 14px rgba(0,0,0,.2)}
+.cwd-suggestions[hidden]{display:none}
+.cwd-suggestions.above{top:auto;bottom:calc(100% + 3px)}
+.cwd-option{display:flex;align-items:center;gap:8px;padding:8px;min-height:36px;color:var(--fg);cursor:pointer;font:12px var(--fmono)}
+.cwd-option + .cwd-option{border-top:1px solid var(--line)}
+.cwd-option:hover,.cwd-option[aria-selected=true]{background:var(--sel)}
+.cwd-option svg{width:16px;height:16px;flex:none;color:var(--tool)}
+.cwd-option span{min-width:0;overflow-wrap:anywhere;line-height:1.4}
+.cwd-status{padding:8px;color:var(--mut);font-size:12px;overflow-wrap:anywhere}
 .session-dialog .dialog-icon{display:grid;place-items:center;flex:none;width:36px;height:36px;padding:0;
   border:1px solid var(--line);border-radius:5px;background:var(--bg3);color:var(--fg);cursor:pointer}
 .session-dialog .dialog-icon svg,.session-dialog .folder-row svg{width:18px;height:18px;flex:none}
@@ -6103,6 +6314,8 @@ pre code{background:none;border:none;padding:0}
 @media(max-width:480px){.session-dialog{padding:14px}.session-dialog .dialog-settings{grid-template-columns:1fr}
   .session-dialog .dialog-icon{width:40px;height:40px}.session-dialog .dialog-actions button{min-height:40px}}
 @media(max-width:860px){
+  #terminalbtn{display:none}
+  .agentbtn{width:36px;height:32px;margin-right:3px}
   #jumpBottom{right:12px;width:44px;height:44px}
   #sidebar{position:fixed;left:0;top:0;bottom:0;z-index:40;transform:translateX(-100%);transition:transform .34s cubic-bezier(.32,.72,0,1);width:min(310px,86vw);box-shadow:2px 0 14px rgba(0,0,0,.5)}
   #sidebar.open{transform:none}
@@ -6137,11 +6350,15 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 <header>
   <button class="iconbtn" id="navtoggle" title="sessions">☰</button>
   <span class="curname" id="curname">— no session —</span>
-  <span class="ctx" id="ctx" title="context-window usage"></span>
-  <span class="usage" id="usage" title="usage limits (5h / 7d)"></span>
-  <button class="iconbtn agentbtn" id="agentbtn" title="subagents"><span>Agents</span><span class="agentn" id="agentN">0</span></button>
+  <button class="ctx meter-trigger" id="ctx" type="button" aria-label="Context usage" aria-haspopup="dialog" aria-controls="meterDialog" aria-expanded="false" title="context-window usage"></button>
+  <span class="usage" id="usage" title="usage limits"></span>
+  <button class="iconbtn agentbtn" id="agentbtn" type="button" title="Subagents" aria-label="Subagents" aria-controls="agentPanel" aria-expanded="false"><span class="agenticon" data-session-icon="bot"></span><span class="agentn" id="agentN" aria-hidden="true" hidden></span></button>
   <button class="iconbtn" id="terminalbtn" title="Background terminals" aria-label="Background terminals">▣</button>
 </header>
+<dialog id="meterDialog" class="meter-dialog" aria-labelledby="meterTitle">
+  <div class="meter-heading"><strong id="meterTitle"></strong><button id="meterClose" class="agcontrol" type="button" title="Close details" aria-label="Close details" data-session-icon="x"></button></div>
+  <div id="meterDetails"></div>
+</dialog>
 
 <div id="shell">
   <aside id="sidebar">
@@ -6263,6 +6480,22 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
       <button id="send" disabled>➤</button>
     </div></div>
   </div>
+  <aside id="agentPanel" aria-label="Subagents">
+    <div id="agresize" role="separator" aria-orientation="vertical" tabindex="0" title="Resize subagents panel" aria-label="Resize subagents panel"></div>
+    <div class="agh"><span class="agtit">Subagents</span><span class="agmeta" id="agentMeta"></span><span class="grow"></span>
+      <button id="agentRefresh" class="agcontrol" type="button" title="Refresh subagents" aria-label="Refresh subagents" data-session-icon="refresh"></button>
+      <button id="agentClose" class="agcontrol" type="button" title="Close subagents" aria-label="Close subagents" data-session-icon="x"></button></div>
+    <div class="agcontext"><span id="agentSession"></span><span id="agentPollState"></span></div>
+    <div class="agfilters" aria-label="Subagent filter"><button id="agentFilterAll" type="button" aria-pressed="true">All</button><button id="agentFilterActive" type="button" aria-pressed="false">Active</button></div>
+    <div class="agbody">
+      <div id="agentList"><div class="empty">No subagents in this session</div></div>
+      <div id="agentDetail" hidden>
+        <div class="agdetailbar"><button id="agentOverview" class="agcontrol" type="button" title="All agents" aria-label="All agents" data-session-icon="arrow-right"></button><span id="agentDetailTitle"></span>
+          <button id="agentLatest" class="agcontrol" type="button" title="Latest subagent message" aria-label="Latest subagent message" data-session-icon="arrow-up"></button></div>
+        <div id="agentDetailStatus"></div><div id="agentMessages"></div>
+      </div>
+    </div>
+  </aside>
 </div>
 
 <div id="drawer">
@@ -6270,13 +6503,6 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
   <div class="dh"><span class="tab on" id="tabEdits">Edits <span id="editN">0</span></span><span class="tab" id="tabGit">Git diff</span><span class="grow"></span><span class="btn" id="grefresh">↻</span><span class="btn" id="dclose">✕</span></div>
   <div class="dc" id="edits"><div class="empty">no file changes yet</div></div>
   <div class="dc" id="gitc" style="display:none"><div class="empty">—</div></div>
-</div>
-<div id="agentPanel">
-  <div class="agh"><span class="agtit">Subagents</span><span class="agmeta" id="agentMeta"></span><span class="grow"></span><span class="btn" id="agentClose">✕</span></div>
-  <div class="agbody">
-    <div id="agentList"><div class="empty">no subagents yet</div></div>
-    <div id="agentDetail"><div class="empty">select a subagent</div></div>
-  </div>
 </div>
 <dialog id="attachmentDialog" class="attachment-dialog" aria-labelledby="attachmentTitle">
   <div class="attachment-heading"><h2 id="attachmentTitle"></h2>
@@ -6294,7 +6520,10 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
       <div class="dialog-field"><label for="newName">Session name</label><input id="newName" autocomplete="off" maxlength="120" placeholder="Optional"></div>
       <div class="dialog-field"><label for="newRecent">Recent folders</label><select id="newRecent"></select></div>
       <div class="dialog-field"><label for="newCwd">Working directory</label><div class="path-row">
-        <input id="newCwd" class="path-input" autocomplete="off" spellcheck="false" placeholder="~/project" required>
+        <div class="cwd-combobox">
+          <input id="newCwd" class="path-input" autocomplete="off" spellcheck="false" placeholder="~/project" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="newCwdSuggestions" required>
+          <div id="newCwdSuggestions" class="cwd-suggestions" role="listbox" aria-label="Folder suggestions" hidden></div>
+        </div>
         <button id="newBrowse" class="dialog-icon" type="button" title="Browse folders" aria-label="Browse folders" data-session-icon="folder-open"></button>
       </div></div>
       <div class="dialog-field"><label for="newModel">Model</label><div class="path-row">
@@ -6423,6 +6652,42 @@ function cleanLinkTarget(raw){
 }
 function isLocalTarget(t){return t==='~'||t.startsWith('~/')||t.startsWith('/')||t.startsWith('file://');}
 function stripLineRef(t){return t.replace(/:(\d+)(?::\d+)?$/,'');}
+function markdownImageSource(raw,baseDir){
+  let target=unescHtml(raw||'').trim();if(!target||target.length>4096||target.startsWith('//'))return null;
+  try{
+    if(/^https?:\/\//i.test(target)){const url=new URL(target);if(url.origin!==location.origin)return null;target=url.pathname+url.search;}
+    if(/^\/?api\/attachments\/[a-f0-9]{32}$/.test(target)){
+      const src=target.replace(/^\//,'');return {src,download:src+'?download=1',href:src,path:'',name:'image'};}
+    const asset=new URL(target,location.href);
+    if(asset.origin===location.origin&&asset.pathname.startsWith('/static/')&&/\.(png|jpe?g|gif|webp)$/i.test(asset.pathname)){
+      return {src:asset.pathname+asset.search,download:asset.pathname+asset.search,href:asset.pathname+asset.search,path:'',name:decodeURIComponent(asset.pathname.split('/').pop())};}
+    if(/^file:\/\//i.test(target)){const url=new URL(target);if(url.hostname&&url.hostname!=='localhost')return null;target=url.pathname;}
+    else if(/^[a-z][a-z\d+.-]*:/i.test(target))return null;
+    try{target=decodeURIComponent(target);}catch(e){}
+  }catch(e){return null;}
+  if(!target.startsWith('/')&&!target.startsWith('~/')){
+    if(!baseDir||!baseDir.startsWith('/'))return null;target=baseDir.replace(/\/+$/,'')+'/'+target;}
+  if(!/\.(png|jpe?g|gif|webp)$/i.test(target))return null;
+  const src='api/inline-image?path='+encodeURIComponent(target);
+  return {src,download:src+'&download=1',href:webfmOpenUrl(target),path:target,name:target.split('/').pop()||'image'};
+}
+function protectMarkdownImages(h,images,baseDir){
+  return h.replace(/!\[((?:\\.|[^\]\\\n])*)\]\((?:&lt;([^\n]*?)&gt;|((?:\\.|[^()\s]|\([^()\n]*\))+))(?:\s+(?:"[^"\n]*"|'[^'\n]*'))?\)/g,(m,label,angle,bare)=>{
+    const raw=angle!=null?angle:bare,alt=unescHtml(label).replace(/\\([\\\[\]*_])/g,'$1');
+    const image=markdownImageSource(raw,baseDir);
+    if(!image){const target=cleanLinkTarget(raw),href=/^https?:\/\//i.test(target)?target:(isLocalTarget(target)?webfmOpenUrl(target):'');
+      images.push(href?'<a href="'+escAttr(href)+'" target="_blank" rel="noopener noreferrer">'+esc(alt||'Image')+'</a>':esc(alt||'Image'));
+    }else{
+      const name=alt||image.name;
+      images.push('<figure class="inline-image" data-image-src="'+escAttr(image.src)+'" data-image-download="'+escAttr(image.download)+'" data-image-path="'+escAttr(image.path)+'" data-image-name="'+escAttr(name)+'">'+
+        '<button class="inline-image-preview" type="button" aria-haspopup="dialog" aria-label="'+escAttr('Preview '+name)+'">'+
+        '<img loading="lazy" decoding="async" referrerpolicy="no-referrer" src="'+escAttr(image.src)+'" alt="'+escAttr(name)+'">'+
+        '<span class="inline-image-note" hidden>Image unavailable</span></button>'+
+        '<figcaption><a href="'+escAttr(image.href)+'" target="_blank" rel="noopener">'+esc(name)+'</a></figcaption></figure>');
+    }
+    return '%%IM'+(images.length-1)+'%%';
+  });
+}
 function protectMarkdownLinks(h,links){
   return h.replace(/\[([^\]\n]+)\]\((?:&lt;([^\n]*?)&gt;|([^)\s]+))\)/g,(m,label,angle,bare)=>{
     const target=cleanLinkTarget(angle!=null?angle:bare);
@@ -6455,8 +6720,8 @@ function mdTable(h){
   }
   return out.join('\n');
 }
-function md(src){
-  src=src||''; const bl=[], ml=[], il=[], ll=[];
+function md(src,baseDir=cwd){
+  src=src||''; const bl=[], ml=[], il=[], ll=[], images=[];
   src=src.replace(/```(\w*)\n?([\s\S]*?)```/g,(m,l,c)=>{
     const lang=(l||'').toLowerCase();
     if(lang==='math'){   /* fenced math (GitHub/Zulip ```math convention) → display equation */
@@ -6477,6 +6742,7 @@ function md(src){
   let h=esc(src);
   h=mdTable(h);
   h=h.replace(/`([^`\n]+)`/g,(m,c)=>{il.push('<code>'+c+'</code>');return '%%IC'+(il.length-1)+'%%';});
+  h=protectMarkdownImages(h,images,baseDir);
   h=protectMarkdownLinks(h,ll);
   h=linkLocalPaths(h);
   h=h.replace(/%%IC(\d+)%%/g,(m,i)=>il[+i]);
@@ -6490,8 +6756,25 @@ function md(src){
   h=h.replace(/\n/g,'<br>').replace(/<br>(<(?:pre|h2|h3|ul|ol|table)>)/g,'$1').replace(/(<\/(?:pre|h2|h3|ul|ol|table)>)<br>/g,'$1');
   h=h.replace(/%%CB(\d+)%%/g,(m,i)=>bl[+i]);
   h=h.replace(/%%MJ(\d+)%%/g,(m,i)=>'<span class="math'+(ml[+i].d?' display':'')+'" data-d="'+ml[+i].d+'">'+esc(ml[+i].t)+'</span>');
+  h=h.replace(/(?:<br>)*(%%IM(\d+)%%)(?:<br>)*/g,(m,token,i)=>
+    (images[+i]||'').startsWith('<figure')?images[+i]:m.replace(token,images[+i]||''));
   return h;
 }
+function renderMarkdownInto(root,text,baseDir=cwd){
+  const previous=new Map();root.querySelectorAll('.inline-image').forEach(node=>{
+    const key=node.dataset.imageSrc;if(!previous.has(key))previous.set(key,[]);previous.get(key).push(node);});
+  const template=document.createElement('template');template.innerHTML=md(text,baseDir);
+  template.content.querySelectorAll('.inline-image').forEach(node=>{
+    const old=previous.get(node.dataset.imageSrc)?.shift();if(!old)return;
+    const name=node.dataset.imageName;old.dataset.imageName=name;
+    old.querySelector('img').alt=name;old.querySelector('button').setAttribute('aria-label','Preview '+name);
+    old.querySelector('figcaption a').textContent=name;node.replaceWith(old);});
+  root.replaceChildren(template.content);
+  root.querySelectorAll('.inline-image img').forEach(img=>{if(img.complete)settleInlineImage(img);});
+}
+function settleInlineImage(img){const figure=img.closest('.inline-image');if(!figure)return;
+  const loaded=img.naturalWidth>0;figure.classList.toggle('ready',loaded);figure.classList.toggle('failed',!loaded);
+  figure.querySelector('.inline-image-note').hidden=loaded;}
 /* render protected LaTeX spans with KaTeX (textContent decodes the escaped TeX) */
 /* lazy KaTeX: defer typesetting until a math node scrolls near the viewport — a big
    win when replaying a long, math-heavy transcript on attach/switch (no up-front burst). */
@@ -6580,7 +6863,6 @@ function renderWindowMarker(){let marker=stream.querySelector(':scope > .window-
     '<button type="button" title="Search full session history" aria-label="Search full session history">🕘</button>';
   marker.querySelector('button').onclick=()=>{openSearch();$('#srchscope').value='session';$('#srchq').focus();};}
 function windowProtected(el){return el.matches('.streaming,.tool:not(.done),.approval:not(.done),.question:not(.done),.question-anchor')||
-  el.matches('.aginline:not(.done),.aginline[open]')||
   (el.classList.contains('toolgroup')&&!!el.querySelector('.tool:not(.done)'));}
 function sweepWindowRefs(){const edits=$('#edits'),kept=el=>el&&(stream.contains(el)||(edits&&edits.contains(el)));
   Object.keys(textItems).forEach(k=>{if(!kept(textItems[k]&&textItems[k].el))delete textItems[k];});
@@ -6621,13 +6903,14 @@ function addUser(text,nImg,files,attachments){const s=atBottom(),d=document.crea
       group.appendChild(card);}
     d.appendChild(group);}
   stream.appendChild(d);scroll();}
-function attachmentUrl(f,download){return 'api/attachments/'+f.id+(download?'?download=1':'');}
+function attachmentUrl(f,download){if(f.inlineSrc)return download?f.inlineDownload:f.inlineSrc;
+  return 'api/attachments/'+f.id+(download?'?download=1':'');}
 let attachmentPreview=null,attachmentAbort=null;
 async function openAttachment(f){const dialog=$('#attachmentDialog'),body=$('#attachmentBody');
   if(attachmentAbort)attachmentAbort.abort();attachmentAbort=new AbortController();const signal=attachmentAbort.signal;attachmentPreview=f;
-  $('#attachmentTitle').textContent=f.name;$('#attachmentFeedback').textContent=f.size===undefined?'':fmtFileBytes(f.size);
+  $('#attachmentTitle').textContent=f.name;$('#attachmentFeedback').textContent=f.sourcePath||(f.size===undefined?'':fmtFileBytes(f.size));
   const download=$('#attachmentDownload');download.href=attachmentUrl(f,true);download.download=f.name;
-  download.removeAttribute('aria-disabled');$('#attachmentSave').disabled=!!f.unavailable;body.replaceChildren();
+  download.removeAttribute('aria-disabled');$('#attachmentSave').disabled=!!f.unavailable;$('#attachmentSave').hidden=!!f.inlineSrc;body.replaceChildren();
   if(!dialog.open)dialog.showModal();
   if(f.unavailable){download.removeAttribute('href');download.setAttribute('aria-disabled','true');body.textContent='The saved copy is unavailable.';return;}
   if(f.kind==='image'){const img=document.createElement('img');img.alt=f.name;img.src=attachmentUrl(f);
@@ -6648,14 +6931,22 @@ function saveAttachmentCopy(f){const sourceSid=sid;
 $('#attachmentSave').onclick=()=>{if(attachmentPreview)saveAttachmentCopy(attachmentPreview);};
 $('#attachmentClose').onclick=()=>$('#attachmentDialog').close();
 $('#attachmentDialog').addEventListener('close',()=>{if(attachmentAbort)attachmentAbort.abort();attachmentPreview=null;$('#attachmentBody').replaceChildren();});
+document.addEventListener('click',e=>{const button=e.target.closest('.inline-image-preview');if(!button)return;
+  const figure=button.closest('.inline-image');openAttachment({kind:'image',name:figure.dataset.imageName,
+    inlineSrc:figure.dataset.imageSrc,inlineDownload:figure.dataset.imageDownload,sourcePath:figure.dataset.imagePath});});
+for(const type of ['load','error'])document.addEventListener(type,e=>{
+  const img=e.target;if(!img.matches?.('.inline-image img'))return;settleInlineImage(img);
+  if(stream.contains(img)&&atBottom())requestAnimationFrame(()=>{if(stream.contains(img)&&atBottom())scroll();});
+},true);
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!e.isComposing&&$('#attachmentDialog').open&&!$('#folderDialog').open){
   e.preventDefault();e.stopImmediatePropagation();$('#attachmentDialog').close();}},true);
 function addAsst(text){const s=atBottom();const d=document.createElement('div');d.className='msg asst';
-  d.innerHTML='<div class="b bubble">'+md(text)+'</div>';typesetMath(d,!replaying);stream.appendChild(d);if(s)scroll();}
+  d.innerHTML='<div class="b bubble"></div>';renderMarkdownInto(d.firstElementChild,text);
+  typesetMath(d,!replaying);stream.appendChild(d);if(s)scroll();}
 function addThink(text){const s=atBottom();const d=document.createElement('div');d.className='think'+(showThink?'':' hide');d.dataset.t=1;
   d.textContent=text;stream.appendChild(d);if(s)scroll();}
 function renderAsst(rec,final){const stick=!replaying&&(rec.stick||final)&&atBottom();
-  const b=rec.el.querySelector('.bubble');b.innerHTML=md(rec.text);rec.dirty=false;rec.stick=false;
+  const b=rec.el.querySelector('.bubble');renderMarkdownInto(b,rec.text);rec.dirty=false;rec.stick=false;
   if(final)typesetMath(rec.el,!replaying);if(final)rec.el.classList.remove('streaming');
   if(stick){scroll();if(final)requestAnimationFrame(scroll);}}
 function flushAsstRenders(final){if(asstRenderT){clearTimeout(asstRenderT);asstRenderT=0;}
@@ -6739,107 +7030,141 @@ function addStatus(ev){const s=atBottom(),st=ev.status||{},se=st.session||{},sv=
 function addRecap(t){const s=atBottom();const d=document.createElement('div');d.className='recap';
   d.innerHTML='<span class="rk">※ recap:</span> <span class="rt"></span>';
   d.querySelector('.rt').textContent=t;stream.appendChild(d);if(s)scroll();}
-const AGENT_DONE=new Set(['completed','interrupted','errored','shutdown','notfound']);
-function agentRows(){return Object.values(subagents).filter(a=>a&&a.threadId).sort((a,b)=>{
-  const aa=agentActive(a),bb=agentActive(b);
-  if(aa!==bb)return aa?-1:1;
-  return (b.updatedAt||0)-(a.updatedAt||0);});}
+const AGENT_DONE=new Set(['completed','interrupted','errored','shutdown','notfound','idle','notloaded','systemerror']);
+let subagentCache=new Map(),subagentDetailOpen=false,subagentFilter='all',subagentPending=new Map(),subagentSummaryPending=null;
+let subagentRequestSerial=0,subagentEpoch=0,subagentSummaryAt=0,subagentDockWidth=420;
+try{subagentDockWidth=Number(localStorage.getItem('al_agw'))||420;}catch(e){}
+function allAgentRows(){return Object.values(subagents).filter(a=>a&&a.threadId).sort((a,b)=>
+  (a.createdAt||0)-(b.createdAt||0)||(a.threadId||'').localeCompare(b.threadId||''));}
 function agentState(a){return (''+(a&&a.state||'running')).toLowerCase();}
+function agentStatusLabel(state){return ({inProgress:'running',pendingInit:'starting',notLoaded:'not loaded',systemError:'error',errored:'error'})[state]||state||'running';}
 function agentActive(a){return a&&a.active!==false&&!AGENT_DONE.has(agentState(a));}
+// Android 0.6.5 reads this list's length for its toolbar badge.
+function agentRows(){return allAgentRows().filter(agentActive);}
 function agentDot(a){const st=agentState(a);
   if(st==='completed')return 'ok';
-  if(st==='errored'||st==='notfound')return 'bad';
+  if(st==='errored'||st==='notfound'||st==='systemerror')return 'bad';
   return agentActive(a)?'run':'';}
-function agentMeta(a){const bits=[];
-  if(a.state)bits.push(a.state);
-  if(a.model)bits.push(a.model);
-  if(a.reasoningEffort)bits.push(a.reasoningEffort);
-  if(a.updatedAt)bits.push(reltime(a.updatedAt));
-  return bits.join(' · ');}
+function agentMeta(a){return [a.state,a.model,a.reasoningEffort].filter(Boolean).join(' · ');}
 function mergeSubagents(list,reset){
-  if(reset){subagents={};subagentCurrent='';}
-  (list||[]).forEach(a=>{if(a&&a.threadId)subagents[a.threadId]=Object.assign({},subagents[a.threadId]||{},a);});
-  const rows=agentRows();
+  if(reset){subagents={};subagentCurrent='';subagentCache=new Map();subagentDetailOpen=false;subagentFilter='all';resetSubagentReads();}
+  (list||[]).forEach(a=>{if(!a||!a.threadId)return;const old=subagents[a.threadId];
+    if(old&&Number(a.revision||0)<Number(old.revision||0))return;
+    subagents[a.threadId]=Object.assign({},old||{},a);});
   if(subagentCurrent&&!subagents[subagentCurrent])subagentCurrent='';
-  if(!subagentCurrent&&rows.length)subagentCurrent=rows[0].threadId;
-  renderSubagentBadge();renderSubagents();refreshInlineAgents();}
+  renderSubagentBadge();renderSubagents();}
 function renderSubagentBadge(){const btn=$('#agentbtn');if(!btn)return;
-  const rows=agentRows(),active=rows.filter(agentActive).length;
-  btn.classList.toggle('on',rows.length>0);btn.classList.toggle('busy',active>0);
-  $('#agentN').textContent=active||rows.length||0;
-  btn.title=rows.length?('subagents: '+active+' active / '+rows.length+' total'):'subagents';
-  if(!rows.length&&agentPanelOpen())closeSubagents();}
+  const rows=allAgentRows(),active=rows.filter(agentActive).length;
+  btn.classList.toggle('on',active>0);btn.classList.toggle('busy',active>0);
+  const badge=$('#agentN');badge.textContent=active>99?'99+':String(active);badge.hidden=active===0;
+  badge.dataset.activeCount=String(active);
+  btn.title=rows.length?('Subagents: '+active+' active / '+rows.length+' total'):'Subagents';
+  btn.setAttribute('aria-label',btn.title);
+  btn.setAttribute('aria-expanded',String(agentPanelOpen()));}
 function agentPanelOpen(){const p=$('#agentPanel');return p&&p.classList.contains('open');}
-function openSubagents(threadId){if(threadId)subagentCurrent=threadId;
+function layoutSubagentDock(){const p=$('#agentPanel');if(!p||!agentPanelOpen())return;
+  const sidebar=$('#sidebar'),style=getComputedStyle(sidebar);
+  const used=style.display!=='none'&&style.position!=='fixed'&&style.position!=='absolute'?sidebar.getBoundingClientRect().width+$('#sbresize').offsetWidth:0;
+  const available=$('#shell').clientWidth-used,docked=innerWidth>=900&&available>=760;
+  const width=docked?Math.max(300,Math.min(subagentDockWidth,640,available-420)):Math.min(subagentDockWidth,$('#shell').clientWidth);
+  p.classList.toggle('docked',docked);p.style.setProperty('--agw',Math.round(width)+'px');
+  $('#agresize').setAttribute('aria-valuenow',String(Math.round(width)));}
+function openSubagents(threadId){if(threadId){subagentCurrent=threadId;subagentDetailOpen=true;}
   const p=$('#agentPanel');if(!p)return;
   $('#drawer').classList.remove('open');
-  p.classList.add('open');renderSubagents();
-  if(subagentCurrent)loadSubagentThread(subagentCurrent);}
-function closeSubagents(){const p=$('#agentPanel');if(p)p.classList.remove('open');}
+  p.classList.add('open');try{localStorage.setItem('al_agents_open','1');}catch(e){}
+  layoutSubagentDock();renderSubagentBadge();renderSubagents();refreshSubagentPanel(true);}
+function closeSubagents(){saveSubagentScroll();$('#agentPanel').classList.remove('open');
+  try{localStorage.setItem('al_agents_open','0');}catch(e){}renderSubagentBadge();}
+function resetSubagentReads(){subagentEpoch++;subagentPending=new Map();subagentSummaryPending=null;subagentSummaryAt=0;}
+function agentText(node,text){text=String(text||'');if(node.textContent!==text)node.textContent=text;}
+function saveSubagentScroll(){const cache=subagentCache.get(subagentCurrent),host=$('#agentMessages');if(!cache||!host||host.dataset.tid!==subagentCurrent)return;
+  cache.top=host.scrollTop;cache.follow=host.scrollHeight-host.scrollTop-host.clientHeight<40;
+  cache.expanded=[...host.querySelectorAll('details[open]')].map(el=>el.dataset.key);
+  cache.toolScroll=Object.fromEntries([...host.querySelectorAll('details')].map(el=>[el.dataset.key,el.querySelector('pre')?.scrollTop||0]));}
+function selectSubagent(tid){saveSubagentScroll();subagentCurrent=tid;subagentDetailOpen=true;renderSubagents();loadSubagentThread(tid,true);}
 function renderSubagents(){
-  const list=$('#agentList'),detail=$('#agentDetail'),meta=$('#agentMeta');if(!list||!detail)return;
-  const rows=agentRows();if(!subagentCurrent&&rows.length)subagentCurrent=rows[0].threadId;
-  const active=rows.filter(agentActive),done=rows.filter(a=>!agentActive(a));
-  if(meta)meta.textContent=rows.length?(active.length+' active · '+rows.length+' total'):'';
-  if(!rows.length){list.innerHTML='<div class="empty">no subagents yet</div>';detail.innerHTML='<div class="empty">select a subagent</div>';return;}
-  const section=(title,items)=>items.length?('<div class="agsec">'+title+'</div>'+
-    items.map(a=>agentRowHTML(a)).join('')):'';
-  list.innerHTML=section('active',active)+section('done',done);
-  list.querySelectorAll('.agrow').forEach(el=>el.onclick=ev=>{ev.stopPropagation();subagentCurrent=el.dataset.tid;renderSubagents();loadSubagentThread(subagentCurrent);});
+  const list=$('#agentList'),detail=$('#agentDetail');if(!list||!detail)return;
+  const all=allAgentRows(),active=all.filter(agentActive),rows=subagentFilter==='active'?active:all;
+  agentText($('#agentMeta'),active.length+' active · '+all.length+' total');
+  agentText($('#agentSession'),$('#curname').textContent);$('#agentSession').title=$('#curname').textContent;
+  const connected=!!sid&&ws&&ws.readyState===1;
+  agentText($('#agentPollState'),!connected?'Disconnected':subagentSummaryPending?'Refreshing...':all.length?'Live':'');
+  $('#agentRefresh').disabled=!connected;
+  $('#agentFilterAll').setAttribute('aria-pressed',String(subagentFilter==='all'));$('#agentFilterActive').setAttribute('aria-pressed',String(subagentFilter==='active'));
+  const visible=new Set(rows.map(a=>a.threadId));
+  for(const el of [...list.children])if(!visible.has(el.dataset.tid))el.remove();
+  rows.forEach((a,index)=>{let el=[...list.children].find(n=>n.dataset.tid===a.threadId);
+    if(!el){el=document.createElement('button');el.type='button';el.className='agrow';el.dataset.tid=a.threadId;
+      el.innerHTML='<span class="agdot"></span><span class="agm"><span class="agtop"><span class="agn"></span><span class="agstate"></span></span><span class="agtask"></span><span class="agtoolline"></span><span class="ags"></span><span class="agreaderror"></span></span>';
+      el.onclick=()=>selectSubagent(a.threadId);}
+    el.classList.toggle('on',subagentDetailOpen&&subagentCurrent===a.threadId);el.classList.toggle('done',!agentActive(a));
+    el.setAttribute('aria-pressed',String(subagentDetailOpen&&subagentCurrent===a.threadId));
+    el.querySelector('.agdot').className='agdot '+agentDot(a);
+    agentText(el.querySelector('.agn'),a.label||'subagent');agentText(el.querySelector('.agstate'),agentStatusLabel(a.state));
+    const task=a.prompt||a.title||'',tool=a.currentTool,toolText=tool?[tool.summary||tool.name,agentStatusLabel(tool.status)].filter(Boolean).join(' · '):'';
+    for(const [cls,text] of [['.agtask',task],['.agtoolline',toolText],['.ags',a.message||''],['.agreaderror',a.readError?'Details unavailable':'']]){
+      const target=el.querySelector(cls);agentText(target,text);target.hidden=!text;target.title=String(text||'');}
+    el.title=[a.label,agentMeta(a),a.readError].filter(Boolean).join('\n');
+    if(list.children[index]!==el)list.insertBefore(el,list.children[index]||null);
+  });
+  if(!rows.length){const empty=document.createElement('div');empty.className='empty';empty.textContent=subagentFilter==='active'?'No active subagents':'No subagents in this session';list.appendChild(empty);}
+  const show=subagentDetailOpen&&!!subagents[subagentCurrent];detail.hidden=!show;$('#agentPanel .agbody').classList.toggle('detail',show);
+  if(show&&agentPanelOpen())renderSelectedSubagent();
+  else if(!show){$('#agentMessages').replaceChildren();$('#agentMessages').dataset.tid='';$('#agentMessages')._html='';}
 }
-function agentRowHTML(a){
-  const sub=a.message||a.prompt||a.title||a.threadId||'';
-  return '<div class="agrow '+(subagentCurrent===a.threadId?'on ':'')+(agentActive(a)?'':'done')+'" data-tid="'+escAttr(a.threadId)+'">'+
-    '<span class="agdot '+agentDot(a)+'"></span><div class="agm"><div class="agn">'+esc(a.label||'subagent')+'</div>'+
-    '<div class="ags">'+esc(agentMeta(a)+(sub?(' · '+sub):''))+'</div></div></div>';
-}
-function loadSubagentThread(threadId){
-  if(!threadId)return;
-  const d=$('#agentDetail');if(d)d.innerHTML='<div class="empty">loading subagent thread...</div>';
-  wsSend({type:'subagent_read',threadId:threadId,limit:160});}
+function refreshSubagentPanel(force=false){if(!agentPanelOpen()||document.visibilityState!=='visible'||!sid||!ws||ws.readyState!==1)return;
+  const now=Date.now();
+  if(subagentSummaryPending&&now-subagentSummaryPending.time>35000)subagentSummaryPending=null;
+  if(!subagentSummaryPending&&(force||now-subagentSummaryAt>=3000)){
+    const requestId='agents-'+subagentEpoch+'-'+(++subagentRequestSerial);subagentSummaryPending={requestId,time:now};subagentSummaryAt=now;
+    wsSend({type:'subagents_read',sessionId:sid,requestId});}
+  if(subagentDetailOpen&&subagentCurrent)loadSubagentThread(subagentCurrent,force);
+  renderSubagents();}
+function receiveSubagentSnapshot(m){if(m.sessionId!==sid||!subagentSummaryPending||m.requestId!==subagentSummaryPending.requestId)return;
+  subagentSummaryPending=null;if(m.ok)mergeSubagents(m.subagents||[]);else{renderSubagents();agentText($('#agentPollState'),m.error||'Refresh failed');}}
+function loadSubagentThread(threadId,force=false){
+  if(!threadId||!sid||!ws||ws.readyState!==1)return;
+  const pending=subagentPending.get(threadId),now=Date.now(),cached=subagentCache.get(threadId);
+  if(pending&&now-pending.time<35000)return;
+  if(!force&&cached&&now-cached.fetchedAt<3000)return;
+  const requestId='agent-'+subagentEpoch+'-'+(++subagentRequestSerial);subagentPending.set(threadId,{requestId,time:now});
+  wsSend({type:'subagent_read',sessionId:sid,requestId,threadId,limit:100});
+  if(threadId===subagentCurrent)renderSelectedSubagent();}
+function renderSelectedSubagent(){const tid=subagentCurrent,a=subagents[tid]||{},cached=subagentCache.get(tid),m=cached?.data;
+  const d=$('#agentMessages');if(!d)return;
+  agentText($('#agentDetailTitle'),a.label||'subagent');
+  agentText($('#agentDetailStatus'),[a.state,a.model,a.reasoningEffort,a.cwd,subagentPending.has(tid)?'Refreshing...':m?.error].filter(Boolean).join(' · '));
+  const msgs=m?.messages||[];
+  const html=msgs.length?msgs.map(agentMsgHTML).join(''):'<div class="empty">'+esc(m?.error||(m?'No visible messages yet':'Loading subagent thread...'))+'</div>';
+  if(d.dataset.tid===tid&&d._html===html)return;
+  const same=d.dataset.tid===tid,top=same?d.scrollTop:(cached?.top||0),stick=same?d.scrollHeight-d.scrollTop-d.clientHeight<40:cached?.follow!==false;
+  const expanded=new Set(same?[...d.querySelectorAll('details[open]')].map(el=>el.dataset.key):(cached?.expanded||[]));
+  const toolScroll=same?Object.fromEntries([...d.querySelectorAll('details')].map(el=>[el.dataset.key,el.querySelector('pre')?.scrollTop||0])):(cached?.toolScroll||{});
+  d.innerHTML=html;d._html=html;d.dataset.tid=tid;
+  for(const el of d.querySelectorAll('details')){if(expanded.has(el.dataset.key))el.open=true;const pre=el.querySelector('pre');if(pre)pre.scrollTop=toolScroll[el.dataset.key]||0;}
+  typesetMath(d);d.scrollTop=stick?d.scrollHeight:top;saveSubagentScroll();}
 function renderSubagentThread(m){
-  if(!m||!m.threadId)return;
-  if(m.sessionId&&m.sessionId!==sid)return;
-  for(const card of stream.querySelectorAll('.aginline')){if(card.dataset.tid!==m.threadId)continue;
-    card.dataset.loading='';
-    const body=card.querySelector('.agcontent'),html=m.ok?(m.messages||[]).map(agentMsgHTML).join('')||'No visible messages yet':esc(m.error||'Unable to load messages');
-    if(body._html!==html){const top=body.scrollTop,stick=body.scrollHeight-top-body.clientHeight<30;
-      body.innerHTML=html;body._html=html;if(card.open)typesetMath(body);body.scrollTop=stick?body.scrollHeight:top;}}
+  if(!m||m.sessionId!==sid||!m.threadId)return;
+  const request=subagentPending.get(m.threadId);if(!request||m.requestId!==request.requestId)return;
+  subagentPending.delete(m.threadId);
   if(m.subagent)mergeSubagents([m.subagent]);
-  if(subagentCurrent&&m.threadId!==subagentCurrent)return;
-  subagentCurrent=m.threadId;renderSubagents();
-  const d=$('#agentDetail');if(!d)return;
-  const a=subagents[m.threadId]||m.subagent||{},thread=m.thread||{},msgs=m.messages||[];
-  const title=a.label||thread.name||thread.preview||'subagent';
-  const bits=[a.state||thread.status,a.model,a.reasoningEffort,thread.cwd||a.cwd].filter(Boolean).join(' · ');
-  let h='<div class="aghead"><div class="agt">'+esc(title)+'</div><div class="agsub">'+esc(bits||m.threadId)+'</div></div>';
-  if(!m.ok&&m.error&&!msgs.length){d.innerHTML=h+'<div class="empty">'+esc(m.error)+'</div>';return;}
-  if(m.error)h+='<div class="errline">'+esc(m.error)+'</div>';
-  if(!msgs.length){d.innerHTML=h+'<div class="empty">no visible subagent messages yet</div>';return;}
-  h+='<div class="agmsgs">'+msgs.map(agentMsgHTML).join('')+'</div>';
-  d.innerHTML=h;typesetMath(d);d.scrollTop=d.scrollHeight;
-}
-function agentMsgHTML(x){
+  const current=subagents[m.threadId];
+  if(m.readRevision!=null&&Number(m.readRevision)<Number(current?.revision||0)){renderSubagents();return;}
+  if(m.threadId===subagentCurrent)saveSubagentScroll();
+  const old=subagentCache.get(m.threadId)||{};
+  const data=!m.ok&&old.data?.messages?.length?{...old.data,error:m.error}:m;
+  subagentCache.delete(m.threadId);subagentCache.set(m.threadId,{...old,data,fetchedAt:Date.now()});
+  while(subagentCache.size>4){const key=[...subagentCache.keys()].find(k=>k!==subagentCurrent);if(!key)break;subagentCache.delete(key);}
+  renderSubagents();}
+function agentMsgHTML(x,index=0){
   const role=(x.role||'tool').toLowerCase(),kind=x.kind?(' · '+x.kind):'',status=x.status?(' · '+x.status):'';
   const label=(role==='assistant'?'assistant':role)+kind+status;
   const body=(role==='tool')
-    ? '<pre><code>'+esc(x.txt||'')+'</code></pre>'
-    : md(x.txt||'');
+    ? '<details class="agtool" data-key="'+escAttr((x.turnId||'')+':'+(x.itemId||index))+'"><summary>'+esc((x.txt||'').split('\n')[0].slice(0,240)||x.kind||'Tool')+'</summary><pre><code>'+esc(x.txt||'')+'</code></pre></details>'
+    : md(x.txt||'',subagents[subagentCurrent]?.cwd||cwd);
   return '<div class="agmsg '+escAttr(role)+'"><div class="agr">'+esc(label)+'</div><div class="agtxt">'+body+'</div></div>';}
-function addSubagentMarker(ev){
-  const a=ev.subagent||{};if(a.threadId)mergeSubagents([a]);
-  if(!a.threadId)return;
-  if([...stream.querySelectorAll('.aginline')].some(c=>c.dataset.tid===a.threadId)){refreshInlineAgents();return;}
-  const s=atBottom(),d=document.createElement('details');d.className='aginline';d.dataset.tid=a.threadId;
-  d.innerHTML='<summary></summary><div class="agcontent">Loading...</div>';
-  d.addEventListener('toggle',()=>{if(d.open)loadInlineAgent(d);});
-  stream.appendChild(d);refreshInlineAgents();if(s)scroll();}
-function refreshInlineAgents(){for(const c of stream.querySelectorAll('.aginline')){const a=subagents[c.dataset.tid];if(!a)continue;
-  c.classList.toggle('done',!agentActive(a));c.querySelector('summary').innerHTML='Agent · '+esc(a.label||'subagent')+' · '+esc(a.state||'running')+
-    '<span class="agpreview">'+esc((a.message||a.prompt||'').slice(0,140))+'</span>';}}
-function loadInlineAgent(c){if(!ws||ws.readyState!==1)return;
-  if(Date.now()-Number(c.dataset.loading||0)<15000)return;
-  c.dataset.loading=Date.now();wsSend({type:'subagent_read',threadId:c.dataset.tid,limit:60});}
+function addSubagentMarker(ev){const a=ev.subagent||{};if(a.threadId)mergeSubagents([a]);}
 function requestTerminals(){if(!sid||!ready){$('#terminalList').textContent='No running session';return;}
   $('#terminalList').textContent='Loading...';wsSend({type:'terminals_read'});}
 function renderTerminals(m){if(m.sessionId!==sid)return;const host=$('#terminalList');host.innerHTML='';
@@ -7037,7 +7362,7 @@ function startThinking(wordSeed,elapsedMs){const el=$('#thinking');if(!el)return
 function stopThinking(){clearInterval(thinkTimer);thinkTimer=0;const el=$('#thinking');if(el)el.classList.remove('compacting');}
 function fmtSecs(ms){const s=Math.max(0,Math.round(ms/1000));if(s<60)return s+'s';const m=Math.floor(s/60);return m+'m '+(s%60)+'s';}
 function doInterrupt(){if(!running)return;wsSend({type:'interrupt'});addNotice('⏹ interrupt sent');}
-function clearUI(){returnDockedQuestion();stream.innerHTML='';refreshQuestionDock();$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
+function clearUI(){closeMeterDetails();returnDockedQuestion();stream.innerHTML='';refreshQuestionDock();$('#edits').innerHTML='<div class="empty">no file changes yet</div>';
   $('#gitc').innerHTML='<div class="empty">—</div>';tools={};editCount=0;updateEditBadge();renderCtx(null);ready=false;
   setComposerEnabled(false);
   if(asstRenderT){clearTimeout(asstRenderT);asstRenderT=0;}
@@ -7245,6 +7570,7 @@ function route(ev){const seq=Number(ev&&ev._seq||0),tab=sessionTabById(sid);
 function markEnded(msg){syncPendingQuestions([]);ready=false;setComposerEnabled(false);$('#dot').className='dot';statset('ended');
   localStorage.removeItem(SKEY);if(msg)addNotice(msg);}
 function onMsg(e){const m=JSON.parse(e.data);
+  if(m.sessionId&&m.sessionId!==sid&&['events','subagent_thread','subagents_snapshot'].includes(m.type))return;
   if(m.type==='hello'){if(m.stamp&&m.stamp!==PAGE_STAMP)$('#pageUpdate').hidden=false;return;}
   if(handleNewSessionReply(m))return;
   if(m.type==='started'||m.type==='attached'){activeTier=m.serviceTier||null;$('#terminalDialog').close();}
@@ -7254,15 +7580,20 @@ function onMsg(e){const m=JSON.parse(e.data);
     if(startedTab){startedTab.lastSeq=Number(m.event_seq||0);startedTab.serverSeq=startedTab.lastSeq;persistSessionTabs();}restoredViewId=m.id;
     mergeSubagents(m.subagents||[],true);syncPendingQuestions(m.pending_questions);
     addNotice('new session « '+(m.title||m.name||'')+' »'+(m.effort?' · '+m.effort+' effort':'')+' in '+m.cwd+' — type your first message to begin');
-    if(m.warning)addNotice(m.warning);reqList();loadTree();}
+    if(m.warning)addNotice(m.warning);resetSubagentReads();refreshSubagentPanel(true);reqList();loadTree();}
   else if(m.type==='attached'){const incremental=!!m.events_delta&&restoredViewId===m.id,stick=incremental&&atBottom();
+    const agentView=restoredViewId===m.id?{subagentCurrent,subagentCache,subagentDetailOpen,subagentFilter,subagentListTop:$('#agentList').scrollTop}:sessionViewCache.get(m.id);
     if(!incremental){clearUI();restoredViewId='';}pendingStart=false;sid=m.id;curCC=m.cc||null;localStorage.setItem(SKEY,sid);cwd=m.cwd;bindProject(m.cwd);
     activeModel=(m.model&&m.model!=='default'?m.model:(m.display_model||'default'));ready=!m.ended;setCurname((m.title||m.name||'session')+(m.ended?' · ended':''));setEffortPill(m.effort);renderCtx(m.ctx);renderUsage(m.usage);statset(m.ended?'ended':'ready');
     const attachedMeta=ensureSessionTab(m,true);planCollapsed=!!(attachedMeta&&attachedMeta.planCollapsed);
     if(!incremental&&m.events&&m.events.length)windowHidden=Math.max(0,Number(m.events[0]._seq||1)-1);
     replaying=true;m.events.forEach(route);syncPendingQuestions(m.pending_questions);replaying=false;flushAsstRenders(!m.busy);
     trimChatWindow(true);
-    mergeSubagents(m.subagents||[],incremental);
+    mergeSubagents(m.subagents||[]);
+    if(!incremental&&agentView&&subagents[agentView.subagentCurrent]){
+      subagentCurrent=agentView.subagentCurrent;subagentCache=agentView.subagentCache||new Map();subagentDetailOpen=!!agentView.subagentDetailOpen;
+      subagentFilter=agentView.subagentFilter||'all';renderSubagents();$('#agentList').scrollTop=agentView.subagentListTop||0;}
+    resetSubagentReads();refreshSubagentPanel(true);
     compacting=!!m.compacting;setBusy(!!m.busy,m.word,(m.turn_age||0)*1000);loadDraft(sid);
     if(m.ended){markEnded('— this session has ended (history shown · you can resume it from disk) —');}
     else{setComposerEnabled(true);if(!incremental)addNotice('— '+(m.resumed?'resumed':'reattached to')+' « '+(m.name||'')+' » ('+m.events.length+' events)'+(m.effort?' with '+m.effort+' effort':'')+' —');}
@@ -7292,6 +7623,7 @@ function onMsg(e){const m=JSON.parse(e.data);
   else if(m.type==='context')renderCtx(m.ctx);
   else if(m.type==='usage')renderUsage(m.usage);
   else if(m.type==='subagent_thread')renderSubagentThread(m);
+  else if(m.type==='subagents_snapshot')receiveSubagentSnapshot(m);
   else if(m.type==='terminals')renderTerminals(m);
   else if(m.type==='terminal_stopped'&&m.sessionId===sid){if(!m.ok)$('#terminalList').textContent=m.error||'Terminal already exited';else requestTerminals();}
   else if(m.type==='tokens'){tokUp=m.up||0;tokOut=m.out||0;tokShow=true;
@@ -7305,6 +7637,7 @@ function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
     if(cb)cb();else{const saved=localStorage.getItem(SKEY);if(saved&&!pendingStart){const req={type:'attach',id:saved},tab=sessionTabById(saved);
       if(restoredViewId===saved&&tab)req.after_seq=Number(tab.lastSeq||0);else statset('reattaching…');ws.send(JSON.stringify(req));}}};
   ws.onclose=()=>{$('#dot').className='dot';statset('disconnected');setComposerEnabled(false);
+    resetSubagentReads();renderSubagents();
     if(newSessionRequest){resetNewSessionRequest();$('#newSessionError').textContent='Connection lost. Check Live sessions before trying again.';}
     clearTimeout(reconnectT);reconnectT=setTimeout(()=>openWs(),1800);};
   ws.onmessage=onMsg;}
@@ -7312,11 +7645,12 @@ function wsSend(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}
 function reqList(){wsSend({type:'list'});}
 function reltime(ts){const s=(Date.now()/1000)-ts;if(s<60)return Math.round(s)+'s';
   if(s<3600)return Math.round(s/60)+'m';if(s<86400)return Math.round(s/3600)+'h';return Math.round(s/86400)+'d';}
-function setCurname(t){$('#curname').textContent=t||'— no session —';}
+function setCurname(t){$('#curname').textContent=t||'— no session —';agentText($('#agentSession'),$('#curname').textContent);}
 function sessionTabById(id){return sessionTabState.find(t=>t.id===id)||null;}
 function takeChildren(el){const f=document.createDocumentFragment();if(el)while(el.firstChild)f.appendChild(el.firstChild);return f;}
 function restoreChildren(el,frag){if(!el)return;el.innerHTML='';if(frag)el.appendChild(frag);}
 function stashSessionView(id){if(!id)return false;const t=sessionTabById(id);if(!t)return false;
+  saveSubagentScroll();
   const questionAid=$('#questionPanel').firstElementChild?.dataset.aid||'';closeQuestionPanel();
   flushAsstRenders(false);trimChatWindow(true);rememberActiveTabView();
   if(planHideT){clearTimeout(planHideT);planHideT=0;const rec=planItems['plan-current'];
@@ -7324,7 +7658,8 @@ function stashSessionView(id){if(!id)return false;const t=sessionTabById(id);if(
   sessionViewCache.set(id,{stream:takeChildren(stream),questionAid:questionAid,plan:takeChildren($('#planDock')),planHidden:$('#planDock').hidden,
     edits:takeChildren($('#edits')),git:takeChildren($('#gitc')),tools:tools,editCount:editCount,textItems:textItems,
     thinkItems:thinkItems,planItems:planItems,turnDiffCards:turnDiffCards,subagents:subagents,
-    subagentCurrent:subagentCurrent,queued:queued,ctx:currentCtx,cwd:cwd,cc:curCC,model:activeModel,
+    subagentCurrent:subagentCurrent,subagentCache:subagentCache,subagentDetailOpen:subagentDetailOpen,subagentFilter:subagentFilter,subagentListTop:$('#agentList').scrollTop,
+    queued:queued,ctx:currentCtx,cwd:cwd,cc:curCC,model:activeModel,
     effort:curEffort,serviceTier:activeTier,ready:ready,running:running,compacting:compacting,word:lastWordSeed,
     windowHidden:windowHidden,windowHiddenChars:windowHiddenChars,planCollapsed:planCollapsed,
     elapsed:running?Math.max(0,Date.now()-thinkStart):0,tokUp:tokUp,tokOut:tokOut,tokShow:tokShow,
@@ -7333,15 +7668,18 @@ function stashSessionView(id){if(!id)return false;const t=sessionTabById(id);if(
 function restoreSessionView(id){const v=sessionViewCache.get(id);if(!v)return false;
   returnDockedQuestion();
   restoreChildren(stream,v.stream);restoreChildren($('#planDock'),v.plan);$('#planDock').hidden=!!v.planHidden;
+  stream.querySelectorAll('.inline-image img').forEach(img=>{if(img.complete)settleInlineImage(img);});
   restoreChildren($('#edits'),v.edits);restoreChildren($('#gitc'),v.git);
   tools=v.tools||{};editCount=v.editCount||0;textItems=v.textItems||{};thinkItems=v.thinkItems||{};
   planItems=v.planItems||{};turnDiffCards=v.turnDiffCards||{};subagents=v.subagents||{};
-  subagentCurrent=v.subagentCurrent||'';queued=v.queued||{};cwd=v.cwd||'';curCC=v.cc||null;
+  subagentCurrent=v.subagentCurrent||'';subagentCache=v.subagentCache||new Map();subagentDetailOpen=!!v.subagentDetailOpen;subagentFilter=v.subagentFilter||'all';resetSubagentReads();
+  queued=v.queued||{};cwd=v.cwd||'';curCC=v.cc||null;
   windowHidden=Number(v.windowHidden||0);windowHiddenChars=Number(v.windowHiddenChars||0);
   planCollapsed=!!v.planCollapsed;
   activeModel=v.model||'default';activeTier=v.serviceTier||null;tokUp=v.tokUp||0;tokOut=v.tokOut||0;tokShow=!!v.tokShow;
   ready=!!v.ready;compacting=!!v.compacting;bindProject(cwd);setCurname(v.title);renderCtx(v.ctx);setEffortPill(v.effort);
   updateEditBadge();renderQueue();renderSubagentBadge();renderSubagents();running=false;setBusy(!!v.running,v.word,v.elapsed);
+  $('#agentList').scrollTop=v.subagentListTop||0;
   loadDraft(id);restoreSessionTabView(id);restoredViewId=id;refreshQuestionDock();if(v.questionAid)openQuestionPanel(v.questionAid);return true;}
 function persistSessionTabs(){try{localStorage.setItem(TABSKEY,JSON.stringify(sessionTabState));}catch(e){}}
 function renderSessionTabs(){const host=$('#sessionTabs');if(!host)return;
@@ -7402,38 +7740,54 @@ function fmtTok(n){if(n==null)return '?';
   if(n>=1e6)return (n/1e6).toFixed(1).replace(/\.0$/,'')+'M';
   if(n>=1000)return (n/1000).toFixed(n>=1e4?0:1)+'k';
   return ''+n;}
-/* shared segmented meter: 5 cells (20% each), whole bar coloured by the total % */
 function meterLvl(p){return p>80?'r':p>=60?'o':p>=40?'y':'g';}
-function cellBar(pct){const p=Math.max(0,Math.min(100,pct)),lit=Math.min(5,Math.ceil(p/20));
-  let s='<span class="cells lv-'+meterLvl(p)+'">';
-  for(let i=1;i<=5;i++)s+='<span class="cell'+(i<=lit?' on':'')+'"></span>';
-  return s+'</span>';}
+function usageRing(pct){const p=Math.max(0,Math.min(100,Number(pct)||0));
+  return '<span class="meter-ring lv-'+meterLvl(p)+'" style="--used:'+p+'%" aria-hidden="true"></span>';}
+function closeMeterDetails(){const dialog=$('#meterDialog');if(!dialog.open)return;
+  document.getElementById(dialog.dataset.anchor)?.setAttribute('aria-expanded','false');dialog.close();}
+function refreshMeterDetails(){const dialog=$('#meterDialog');if(!dialog.open)return;
+  const anchor=document.getElementById(dialog.dataset.anchor);
+  if(!anchor||!anchor.getClientRects().length){closeMeterDetails();return;}
+  const title=anchor.dataset.meterTitle,details=anchor.dataset.details||anchor.title;
+  if($('#meterTitle').textContent!==title)$('#meterTitle').textContent=title;
+  if($('#meterDetails').textContent!==details)$('#meterDetails').textContent=details;
+  anchor.setAttribute('aria-expanded','true');}
+function openMeterDetails(anchor){const dialog=$('#meterDialog');closeCardMenu();
+  dialog.dataset.anchor=anchor.id;dialog.showModal();refreshMeterDetails();}
 function renderCtx(c){currentCtx=c||null;const el=$('#ctx');
-  if(!c||c.percentage==null){el.style.display='none';return;}
+  if(!c||c.percentage==null||!Number.isFinite(Number(c.percentage))){el.style.display='none';refreshMeterDetails();return;}
   const pct=Math.round(c.percentage),approx=c.source!=='codex';
   el.className='ctx';el.style.display='inline-flex';
-  el.innerHTML='<span class="ulabel">Context</span>'+cellBar(pct)+'<span>'+(approx?'~':'')+pct+'%</span>';
+  el.innerHTML='<span class="ulabel">ctx</span>'+usageRing(c.percentage);
   let title=(approx?'Last request (Codex context estimate unavailable): ':'Codex context estimate: ')+
     (c.totalTokens??'?')+' / '+(c.maxTokens??'?')+' tokens ('+pct+'%)'+(c.model?' · '+c.model:'');
   if(!approx&&c.autoCompactLimit!=null){title+='\nAuto-compaction: '+(c.autoCompactTokens??c.totalTokens)+' / '+c.autoCompactLimit+' tokens';
     if(c.autoCompactScope&&c.autoCompactScope!=='Total')title+=' ('+c.autoCompactScope+')';}
   el.title=title;el.setAttribute('aria-label',title);
+  el.dataset.meterTitle='Context usage';
+  refreshMeterDetails();
   setResolvedModel(c.model, c.maxTokens);}
 function fmtDur(ms){if(ms==null||ms<=0)return '0m';const m=Math.floor(ms/60000),h=Math.floor(m/60);
   return h>0?(h+'h '+(m%60)+'m'):(m+'m');}
-/* rolling usage: 5h + weekly windows as "5h ▮▮ % | 7d ▮ %" inside one pill */
 function renderUsage(u){const el=$('#usage');const f=u&&u.five_hour,w=u&&u.seven_day;
-  if((!f||f.utilization==null)&&(!w||w.utilization==null)){el.style.display='none';return;}
-  function seg(o,lbl){if(!o||o.utilization==null)return '';
-    const pct=Math.round(o.utilization);
-    return '<span class="useg"><span class="ulabel">'+lbl+'</span>'+cellBar(pct)+'<span>'+pct+'%</span></span>';}
-  el.className='usage';el.style.display='inline-flex';
-  el.innerHTML='<span class="ulabel">Usage</span>'+seg(f,'5h')+seg(w,'7d');
-  let t='';
-  [['five_hour','5-hour'],['seven_day','weekly']].forEach(([k,lbl])=>{const o=u&&u[k];
-    if(o&&o.utilization!=null){const rem=o.resets_at?fmtDur(new Date(o.resets_at)-Date.now()):'';
-      t+=(t?'\n':'')+lbl+': '+Math.round(o.utilization)+'% used'+(rem?(' · resets in '+rem):'');}});
-  el.title=t;}
+  const valid=o=>o&&o.utilization!=null&&Number.isFinite(Number(o.utilization));
+  if(!valid(f)&&!valid(w)){el.style.display='none';refreshMeterDetails();return;}
+  function seg(o,lbl,kind){if(!valid(o))return '';
+    const pct=Math.round(o.utilization),rem=o.resets_at?fmtDur(new Date(o.resets_at)-Date.now()):'';
+    const title=(kind==='week'?'Weekly':'5-hour')+': '+pct+'% used'+(rem?(' · resets in '+rem):'');
+    const id=kind==='week'?'usageWeek':'usageFive';let button=document.getElementById(id);
+    if(!button){button=document.createElement('button');button.id=id;button.type='button';
+      button.className='useg useg-'+kind+' meter-trigger';button.setAttribute('aria-haspopup','dialog');
+      button.setAttribute('aria-controls','meterDialog');button.setAttribute('aria-expanded','false');
+      if(kind==='five')el.prepend(button);else el.appendChild(button);}
+    button.title=title;button.setAttribute('aria-label',title);button.dataset.meterTitle=kind==='week'?'Weekly usage':'5-hour usage';
+    const reset=o.resets_at?new Date(o.resets_at):null;
+    button.dataset.details=title+(reset&&Number.isFinite(reset.getTime())?('\nReset: '+reset.toLocaleString()):'');
+    button.innerHTML='<span class="ulabel">'+lbl+'</span>'+usageRing(o.utilization);}
+  el.className='usage'+(valid(w)?' has-weekly':'');el.style.display='inline-flex';
+  [['usageFive',f],['usageWeek',w]].forEach(([id,o])=>{if(!valid(o))document.getElementById(id)?.remove();});
+  seg(f,'5h','five');seg(w,'7d','week');
+  el.title=[...el.querySelectorAll('.useg')].map(s=>s.title).join('\n');refreshMeterDetails();}
 function loadUsage(){if(sid&&ready)return;
   fetch('api/usage').then(r=>r.json()).then(j=>renderUsage(j.usage)).catch(()=>{});}
 /* The installed Codex app-server is the model source of truth. Both model
@@ -8089,6 +8443,7 @@ function resumeSession(s){if(!s||!s.cc)return;stashSessionView(sid);saveDraft();
   if(window.innerWidth<=860)closeSidebar();}
 // Lucide icon paths; licenses are in static/icons/lucide-LICENSE.txt.
 const SESSION_ICON_PATHS={
+  bot:['M12 8V4H8','M18 8H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2Z','M2 14h2','M20 14h2','M9 13v2','M15 13v2'],
   'folder-plus':['M12 10v6','M9 13h6','M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z'],
   refresh:['M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8','M21 3v5h-5','M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16','M8 16H3v5'],
   x:['M18 6 6 18','m6 6 12 12'],
@@ -8105,12 +8460,58 @@ function sessionIcon(name){return '<svg viewBox="0 0 24 24" fill="none" stroke="
 document.querySelectorAll('[data-session-icon]').forEach(b=>b.innerHTML=sessionIcon(b.dataset.sessionIcon));
 let newSessionRequest=null,newSessionSerial=0,folderSerial=0,folderAbort=null,folderState=null,folderSelectHandler=null;
 let folderCreateRequest=null;
+let newCwdTimer=0,newCwdAbort=null,newCwdSerial=0,newCwdItems=[],newCwdIndex=-1,newCwdQuery='',newCwdPendingTab=false,newCwdComposing=false;
+function closeNewCwdSuggestions(){clearTimeout(newCwdTimer);newCwdTimer=0;newCwdSerial++;
+  if(newCwdAbort)newCwdAbort.abort();newCwdAbort=null;newCwdItems=[];newCwdIndex=-1;newCwdQuery='';newCwdPendingTab=false;
+  const input=$('#newCwd'),list=$('#newCwdSuggestions');list.hidden=true;list.replaceChildren();list.setAttribute('aria-busy','false');
+  input.setAttribute('aria-expanded','false');input.removeAttribute('aria-activedescendant');}
+function layoutNewCwdSuggestions(){const list=$('#newCwdSuggestions');if(list.hidden)return;
+  const input=$('#newCwd').getBoundingClientRect(),dialog=$('#newSessionDialog').getBoundingClientRect();
+  const top=Math.max(0,dialog.top)+8,bottom=Math.min(innerHeight,window.visualViewport?.height||innerHeight,dialog.bottom)-8;
+  if(input.bottom<=top||input.top>=bottom){closeNewCwdSuggestions();return;}
+  const below=bottom-input.bottom-3,above=input.top-top-3,up=below<96&&above>below;
+  list.classList.toggle('above',up);list.style.maxHeight=Math.max(32,Math.min(200,up?above:below))+'px';}
+function newCwdStatus(text){const list=$('#newCwdSuggestions'),status=document.createElement('div');
+  status.className='cwd-status';status.setAttribute('role','status');status.textContent=text;list.replaceChildren(status);
+  list.hidden=false;$('#newCwd').setAttribute('aria-expanded','true');layoutNewCwdSuggestions();}
+function markNewCwdOption(index){newCwdIndex=index;const input=$('#newCwd'),options=$('#newCwdSuggestions').querySelectorAll('[role=option]');
+  options.forEach((option,i)=>option.setAttribute('aria-selected',String(i===index)));
+  if(options[index]){const option=options[index],list=$('#newCwdSuggestions');input.setAttribute('aria-activedescendant',option.id);
+    if(option.offsetTop<list.scrollTop)list.scrollTop=option.offsetTop;
+    else if(option.offsetTop+option.offsetHeight>list.scrollTop+list.clientHeight)list.scrollTop=option.offsetTop+option.offsetHeight-list.clientHeight;}}
+function completeNewCwd(index){const input=$('#newCwd'),folder=newCwdItems[index];
+  if(!folder||newSessionRequest||newCwdQuery!==input.value||!$('#newSessionDialog').open)return;
+  const path=folder.path.replace(/\/+$/,'')+'/';closeNewCwdSuggestions();input.value=path;$('#newRecent').value='';
+  input.focus();input.setSelectionRange(path.length,path.length);queryNewCwdSuggestions();}
+function queryNewCwdSuggestions(){closeNewCwdSuggestions();const input=$('#newCwd');
+  if(newCwdComposing||newSessionRequest||!$('#newSessionDialog').open||$('#folderDialog').open||document.activeElement!==input)return;
+  const value=input.value,q=value.trim(),slash=q.lastIndexOf('/');
+  const parent=slash>=0?(q.slice(0,slash+1)||'/'):'~',prefix=slash>=0?q.slice(slash+1):(q==='~'?'':q);
+  const serial=newCwdSerial,abort=new AbortController();newCwdAbort=abort;newCwdQuery=value;
+  $('#newCwdSuggestions').setAttribute('aria-busy','true');newCwdStatus('Loading folders...');
+  if(serial!==newCwdSerial)return;
+  newCwdTimer=setTimeout(async()=>{newCwdTimer=0;
+    try{const data=await directoryData(parent,prefix.startsWith('.'),abort.signal,prefix);
+      if(serial!==newCwdSerial)return;
+      if(value!==input.value||document.activeElement!==input||!$('#newSessionDialog').open||newSessionRequest){closeNewCwdSuggestions();return;}
+      newCwdItems=data.folders.filter(f=>f&&typeof f.name==='string'&&typeof f.path==='string'&&f.path.startsWith('/')).slice(0,50);
+      const list=$('#newCwdSuggestions');list.replaceChildren();
+      if(!newCwdItems.length)newCwdStatus('No matching folders');
+      newCwdItems.forEach((folder,i)=>{const option=document.createElement('div');option.id='newCwdOption-'+serial+'-'+i;
+        option.className='cwd-option';option.setAttribute('role','option');option.setAttribute('aria-selected','false');option.tabIndex=-1;
+        option.innerHTML=sessionIcon('folder')+'<span></span>';option.querySelector('span').textContent=folder.name+'/';option.title=folder.path+'/';
+        option.onmousedown=e=>e.preventDefault();option.onclick=()=>{if(serial===newCwdSerial)completeNewCwd(i);};list.appendChild(option);});
+      if(data.truncated||data.folders.length>50){const more=document.createElement('div');more.className='cwd-status';more.textContent='More matches available';list.appendChild(more);}
+      layoutNewCwdSuggestions();if(newCwdPendingTab&&newCwdItems.length)completeNewCwd(0);
+    }catch(error){if(serial===newCwdSerial&&error.name!=='AbortError')newCwdStatus(error.message||'Could not load folders');
+    }finally{if(serial===newCwdSerial){newCwdAbort=null;newCwdPendingTab=false;$('#newCwdSuggestions').setAttribute('aria-busy','false');}}
+  },130);}
 function fillSelect(sel,options,value){sel.replaceChildren();options.forEach(([v,label])=>{
   const option=document.createElement('option');option.value=v;option.textContent=label;sel.appendChild(option);});sel.value=value;}
 function newEffortOptions(value){const model=$('#newModel').value;
   fillSelect($('#newEffort'),effortOptionsFor(model).map(v=>[v,v]),effortForModel(value,model));}
 function newSession(path){if($('#newSessionDialog').open)return;
-  closeCardMenu();
+  closeCardMenu();closeNewCwdSuggestions();newCwdComposing=false;
   const dir=(typeof path==='string'&&path)||currentFolder()||'~';
   $('#newName').value='';$('#newCwd').value=dir;$('#newSessionError').textContent='';
   const folders=new Map();if(cwd)folders.set(cwd,cwd);
@@ -8125,12 +8526,14 @@ function resetNewSessionRequest(){if(newSessionRequest&&newSessionRequest.abort)
   $('#newSessionFields').disabled=false;$('#newSessionSubmit').disabled=false;$('#newSessionSubmit').textContent='Start session';
   $('#newSessionCancel').disabled=false;$('#newSessionClose').disabled=false;}
 function closeNewSession(){if(folderCreateRequest||(newSessionRequest&&newSessionRequest.phase==='starting'))return;
-  resetNewSessionRequest();$('#folderDialog').close();$('#newSessionDialog').close();}
-async function directoryData(path,hidden,signal){const r=await fetch('api/directories?path='+encodeURIComponent(path)+'&hidden='+(hidden?'1':'0'),{signal});
+  closeNewCwdSuggestions();resetNewSessionRequest();$('#folderDialog').close();$('#newSessionDialog').close();}
+async function directoryData(path,hidden,signal,prefix){const suffix=prefix===undefined?'':'&prefix='+encodeURIComponent(prefix);
+  const r=await fetch('api/directories?path='+encodeURIComponent(path)+'&hidden='+(hidden?'1':'0')+suffix,{signal,cache:'no-store'});
   if(r.status===401)throw new Error('Authentication required. Reload after signing in.');
   const data=await r.json();if(!r.ok||data.error)throw new Error(data.error||'Could not read this directory');
   if(typeof data.path!=='string'||!Array.isArray(data.folders))throw new Error('Invalid directory response');return data;}
 async function submitNewSession(e){e.preventDefault();if(newSessionRequest)return;
+  closeNewCwdSuggestions();
   const path=$('#newCwd').value.trim();if(!path){$('#newSessionError').textContent='Choose a working directory';return;}
   if(!ws||ws.readyState!==1){$('#newSessionError').textContent='Not connected. Wait for the connection, then try again.';return;}
   const request={id:'new-'+Date.now()+'-'+(++newSessionSerial),phase:'validating',abort:new AbortController(),
@@ -8200,12 +8603,31 @@ $('#newSessionForm').onsubmit=submitNewSession;
 $('#newSessionCancel').onclick=$('#newSessionClose').onclick=closeNewSession;
 $('#newSessionDialog').addEventListener('cancel',e=>{e.preventDefault();closeNewSession();});
 document.addEventListener('keydown',e=>{if(e.key!=='Escape'||e.isComposing||!document.querySelector('.session-dialog[open]'))return;
-  e.preventDefault();e.stopImmediatePropagation();if($('#projectDialog').open)closeProjectDialog();else if($('#folderDialog').open)dismissFolderDialog();else closeNewSession();},true);
-$('#newRecent').onchange=()=>{if($('#newRecent').value)$('#newCwd').value=$('#newRecent').value;};
-$('#newCwd').oninput=()=>{$('#newRecent').value='';};
+  e.preventDefault();e.stopImmediatePropagation();if($('#projectDialog').open)closeProjectDialog();else if($('#folderDialog').open)dismissFolderDialog();
+  else if(document.activeElement===$('#newCwd')&&!$('#newCwdSuggestions').hidden)closeNewCwdSuggestions();else closeNewSession();},true);
+$('#newSessionDialog').addEventListener('close',()=>{if(!$('#newSessionDialog').open)closeNewCwdSuggestions();});
+$('#newRecent').onchange=()=>{closeNewCwdSuggestions();if($('#newRecent').value)$('#newCwd').value=$('#newRecent').value;};
+$('#newCwd').oninput=()=>{$('#newRecent').value='';queryNewCwdSuggestions();};
+$('#newCwd').onfocus=()=>{if(newCwdQuery!==$('#newCwd').value||$('#newCwdSuggestions').hidden)queryNewCwdSuggestions();};
+$('#newCwd').onblur=e=>{if(!$('#newCwdSuggestions').contains(e.relatedTarget))closeNewCwdSuggestions();};
+$('#newCwd').addEventListener('compositionstart',()=>{newCwdComposing=true;closeNewCwdSuggestions();});
+$('#newCwd').addEventListener('compositionend',()=>{newCwdComposing=false;queryNewCwdSuggestions();});
+$('#newCwd').addEventListener('keydown',e=>{if(e.isComposing||newCwdComposing||e.keyCode===229){if(e.key==='Enter')e.preventDefault();return;}
+  if(e.ctrlKey||e.metaKey||e.altKey)return;
+  if(e.key==='ArrowDown'||e.key==='ArrowUp'){
+    if($('#newCwdSuggestions').hidden){queryNewCwdSuggestions();e.preventDefault();return;}
+    e.preventDefault();if(newCwdItems.length)markNewCwdOption(newCwdIndex<0?(e.key==='ArrowDown'?0:newCwdItems.length-1):
+      Math.max(0,Math.min(newCwdItems.length-1,newCwdIndex+(e.key==='ArrowDown'?1:-1))));
+  }else if(e.key==='Tab'&&!e.shiftKey&&$('#newCwd').selectionStart===$('#newCwd').value.length&&$('#newCwd').selectionEnd===$('#newCwd').value.length){
+    if(newCwdItems.length){e.preventDefault();completeNewCwd(newCwdIndex<0?0:newCwdIndex);}
+    else if(newCwdAbort){e.preventDefault();newCwdPendingTab=true;}
+  }else if(e.key==='Enter'&&newCwdIndex>=0&&!$('#newCwdSuggestions').hidden){e.preventDefault();completeNewCwd(newCwdIndex);}});
+document.addEventListener('pointerdown',e=>{if(!$('#newCwdSuggestions').hidden&&!e.target.closest('.cwd-combobox'))closeNewCwdSuggestions();});
+$('#newSessionDialog').addEventListener('scroll',layoutNewCwdSuggestions);
+window.addEventListener('resize',layoutNewCwdSuggestions);window.visualViewport?.addEventListener('resize',layoutNewCwdSuggestions);
 $('#newModel').onchange=()=>newEffortOptions($('#newEffort').value);
-$('#newBrowse').onclick=()=>openFolderDialog($('#newCwd').value.trim()||currentFolder(),path=>{
-  $('#newCwd').value=path;$('#newRecent').value='';});
+$('#newBrowse').onclick=()=>{closeNewCwdSuggestions();openFolderDialog($('#newCwd').value.trim()||currentFolder(),path=>{
+  $('#newCwd').value=path;$('#newRecent').value='';});};
 $('#folderNew').onclick=()=>{if(!folderState||folderCreateRequest)return;
   $('#folderCreateForm').hidden=false;$('#folderCreateError').textContent='';$('#folderName').value='';$('#folderName').focus();};
 $('#folderCreateForm').onsubmit=createFolder;
@@ -8478,6 +8900,7 @@ function toggleSidebar(){const sb=$('#sidebar');
 function drawerOpen(){return $('#drawer').classList.contains('open');}
 function gitTab(){return $('#tabGit').classList.contains('on');}
 function showTab(w){const e=w==='edits';$('#tabEdits').classList.toggle('on',e);$('#tabGit').classList.toggle('on',!e);
+  if(agentPanelOpen())closeSubagents();
   $('#edits').style.display=e?'':'none';$('#gitc').style.display=e?'none':'';if(e){buildPendingEdits();showAllEdits();}else refreshGit();}
 /* clicking "see Changes" focuses the drawer on just that one file's edit;
    the Edits tab header (or "show all") brings the full list back */
@@ -8527,9 +8950,38 @@ function applyTheme(t){if(t&&t!=='dark')document.documentElement.setAttribute('d
   if(sel){sel.value=t;sel.onchange=()=>{const v=sel.value;localStorage.setItem('al_theme',v);applyTheme(v);};}
   applyTheme(t);})();
 $('#navtoggle').onclick=toggleSidebar;
+$('#ctx').onclick=e=>openMeterDetails(e.currentTarget);
+$('#usage').onclick=e=>{const button=e.target.closest('.useg');if(button)openMeterDetails(button);};
+$('#meterClose').onclick=closeMeterDetails;
+$('#meterDialog').addEventListener('close',()=>{const dialog=$('#meterDialog');if(dialog.open)return;
+  document.getElementById(dialog.dataset.anchor)?.setAttribute('aria-expanded','false');delete dialog.dataset.anchor;});
+$('#meterDialog').addEventListener('click',e=>{if(e.target!==e.currentTarget)return;
+  const r=e.currentTarget.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)closeMeterDetails();});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&$('#meterDialog').open){
+  e.preventDefault();e.stopImmediatePropagation();closeMeterDetails();}},true);
 $('#sb-backdrop').onclick=closeSidebar;
 $('#agentbtn').onclick=()=>agentPanelOpen()?closeSubagents():openSubagents();
 $('#agentClose').onclick=closeSubagents;
+$('#agentRefresh').onclick=()=>refreshSubagentPanel(true);
+$('#agentFilterAll').onclick=()=>{subagentFilter='all';renderSubagents();};
+$('#agentFilterActive').onclick=()=>{subagentFilter='active';renderSubagents();};
+$('#agentOverview').onclick=()=>{saveSubagentScroll();subagentDetailOpen=false;renderSubagents();};
+$('#agentLatest').onclick=()=>{const host=$('#agentMessages');host.scrollTop=host.scrollHeight;saveSubagentScroll();};
+$('#agentMessages').onscroll=saveSubagentScroll;
+(function(){const h=$('#agresize');let drag=null;
+  h.onpointerdown=e=>{if(e.button!==0)return;drag={x:e.clientX,width:$('#agentPanel').getBoundingClientRect().width,follow:atBottom()};
+    h.setPointerCapture(e.pointerId);h.classList.add('drag');e.preventDefault();};
+  h.onpointermove=e=>{if(!drag)return;subagentDockWidth=Math.max(300,Math.min(640,drag.width+drag.x-e.clientX));layoutSubagentDock();if(drag.follow)scroll();};
+  const end=()=>{if(!drag)return;drag=null;h.classList.remove('drag');localStorage.setItem('al_agw',String(subagentDockWidth));};
+  h.onpointerup=end;h.onpointercancel=end;
+  h.onkeydown=e=>{if(!['ArrowLeft','ArrowRight'].includes(e.key))return;e.preventDefault();subagentDockWidth=Math.max(300,Math.min(640,subagentDockWidth+(e.key==='ArrowLeft'?20:-20)));
+    localStorage.setItem('al_agw',String(subagentDockWidth));layoutSubagentDock();};
+  h.ondblclick=()=>{subagentDockWidth=420;localStorage.setItem('al_agw','420');layoutSubagentDock();};
+  new ResizeObserver(layoutSubagentDock).observe($('#shell'));new ResizeObserver(layoutSubagentDock).observe($('#sidebar'));
+})();
+window.addEventListener('resize',layoutSubagentDock);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshSubagentPanel(true);});
+try{if(localStorage.getItem('al_agents_open')==='1')openSubagents();}catch(e){}
 /* effort pill: model/list decides which depths this model supports. */
 $('#effort').onclick=ev=>{ev.stopPropagation();toggleCardMenu(ev.currentTarget,
   effortOptionsFor(currentEffortModel()).map(e=>({label:(e===curEffort?'● ':'○ ')+e,fn:()=>setEffort(e)})));};
@@ -8581,9 +9033,6 @@ $('#dclose').onclick=()=>$('#drawer').classList.remove('open');
    openers → excluded, else the opening click would immediately re-close it. */
 document.addEventListener('click',e=>{
   if(drawerOpen()&&!e.target.closest('#drawer')&&!e.target.closest('.emark'))$('#drawer').classList.remove('open');});
-document.addEventListener('click',e=>{
-  const path=e.composedPath?e.composedPath():[];
-  if(agentPanelOpen()&&!path.includes($('#agentPanel'))&&!e.target.closest('#agentbtn')&&!e.target.closest('.agmark'))closeSubagents();});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&drawerOpen())$('#drawer').classList.remove('open');});
 $('#grefresh').onclick=refreshGit;
 
@@ -8643,8 +9092,8 @@ $('#fimpq').addEventListener('keydown',e=>{
 }catch(e){}})();
 
 setInterval(()=>{reqList();if(!document.hidden&&sid&&ready){
-  for(const c of stream.querySelectorAll('.aginline[open]'))loadInlineAgent(c);
   if($('#terminalDialog').open)wsSend({type:'terminals_read'});}},8000);
+setInterval(()=>refreshSubagentPanel(),3000);
 setInterval(loadTree,30000);
 loadTree();
 loadUsage();
@@ -8709,6 +9158,7 @@ def make_application(extra_handlers=()):
         (r"/api/pinfolder", PinFolderHandler),
         (r"/api/dircomplete", DirCompleteHandler),
         (r"/api/directories", DirectoriesHandler),
+        (r"/api/inline-image", InlineImageHandler),
         (r"/api/attachments/([0-9a-f]{32})", AttachmentHandler),
         (r"/api/attachments/([0-9a-f]{32})/save", AttachmentSaveHandler),
         (r"/api/diff", DiffHandler),

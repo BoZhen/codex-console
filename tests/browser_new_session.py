@@ -36,6 +36,7 @@ async def verify(cdp,url,output):
           __imports.push({cwd:options.body.get('cwd'),name:options.body.get('file').name});
           return Promise.resolve(new Response(JSON.stringify({ok:true}),{status:200}));}
         if(u.pathname!='/api/directories')return realFetch(url,options);
+        if(u.searchParams.has('prefix'))return Promise.resolve(new Response(JSON.stringify({path:'/demo',folders:[],truncated:false}),{status:200}));
         if(options?.method==='POST'){
           const request=JSON.parse(options.body);__mkdir.push(request);
           const finish=()=>{

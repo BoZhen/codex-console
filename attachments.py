@@ -1,4 +1,4 @@
-"""Private, immutable copies of Console uploads, addressed by opaque IDs."""
+"""Private upload copies and bounded raster reads for the chat interface."""
 
 import base64
 from contextlib import contextmanager
@@ -10,6 +10,8 @@ import stat
 
 
 IMAGE_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
+IMAGE_EXTENSIONS = {ext: media_type for media_type, ext in IMAGE_TYPES.items()}
+IMAGE_EXTENSIONS[".jpeg"] = "image/jpeg"
 ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 MAX_BYTES = 5 * 1024 * 1024
 
@@ -21,6 +23,18 @@ def safe_name(value, fallback="attachment.txt"):
     return name if name and name not in (".", "..") else fallback
 
 
+def image_media_type(raw):
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 def image_bytes(image):
     mt = image.get("media_type")
     if mt not in IMAGE_TYPES:
@@ -29,13 +43,49 @@ def image_bytes(image):
         raw = base64.b64decode(image["data"], validate=True)
     except (ValueError, KeyError, TypeError) as exc:
         raise ValueError("Invalid image data") from exc
-    valid = {"image/png": raw.startswith(b"\x89PNG\r\n\x1a\n"),
-             "image/jpeg": raw.startswith(b"\xff\xd8\xff"),
-             "image/gif": raw[:6] in (b"GIF87a", b"GIF89a"),
-             "image/webp": raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"}
-    if not raw or len(raw) > MAX_BYTES or not valid[mt]:
+    if not raw or len(raw) > MAX_BYTES or image_media_type(raw) != mt:
         raise ValueError("Invalid or oversized image")
     return raw
+
+
+def read_local_image(path, home):
+    if (not isinstance(path, str) or not path or len(path) > 4096
+            or any(ord(c) < 32 or ord(c) == 127 for c in path)):
+        raise ValueError("Invalid image path")
+    home = os.path.realpath(home)
+    if path.startswith("~/"):
+        path = os.path.join(home, path[2:])
+    if not os.path.isabs(path):
+        raise ValueError("Use an absolute image path")
+    path = os.path.realpath(path)
+    if path == home or os.path.commonpath((home, path)) != home:
+        raise ValueError("Image is outside the home directory")
+    media_type = IMAGE_EXTENSIONS.get(os.path.splitext(path)[1].lower())
+    if not media_type:
+        raise ValueError("Unsupported image type")
+    # Resolve first, then walk from HOME without following components that can be swapped.
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(home, flags)
+    try:
+        parts = os.path.relpath(path, home).split(os.sep)
+        for part in parts[:-1]:
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        child = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        try:
+            info = os.fstat(child)
+            if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_BYTES:
+                raise ValueError("Invalid or oversized image")
+            with os.fdopen(child, "rb", closefd=False) as source:
+                raw = source.read(MAX_BYTES + 1)
+        finally:
+            os.close(child)
+    finally:
+        os.close(fd)
+    if len(raw) > MAX_BYTES or image_media_type(raw) != media_type:
+        raise ValueError("Invalid image data")
+    return {"name": safe_name(os.path.basename(path)), "media_type": media_type, "size": len(raw)}, raw
 
 
 class AttachmentStore:

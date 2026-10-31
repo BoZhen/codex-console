@@ -14,6 +14,8 @@ plans, file changes, and session state in one interface.
 ## Features
 
 - **Streaming chat** with rendered Markdown and KaTeX math.
+- **Inline result images** in assistant replies, with enlarged preview and download.
+  Supports PNG, JPEG, GIF, and WebP files up to 5 MiB under the server user's home directory.
 - **Tool activity cards** for shell commands, reads, searches, patches, MCP
   tools, and web searches. Consecutive calls of the same tool are grouped and
   can be expanded without losing individual inputs or outputs.
@@ -30,9 +32,8 @@ plans, file changes, and session state in one interface.
 - **History search, import, and export** for Codex rollout transcripts.
 - **Pinned Plan dock** that updates in place, supports collapse, and clears
   after all tasks complete.
-- **Subagents panel** with child-agent status and messages separated from the
-  main transcript.
-- **Expandable Agent cards** with current activity and recent child messages.
+- **Subagents side panel** with per-session status, tasks, recent tools and
+  expandable output. On wide windows it stays beside the main conversation.
 - **Background terminals** with a command list and individual stop controls.
 - **Approvals and questions** rendered as interactive controls, with a persistent pending-question panel for non-blocking questions.
 - **Queued messages and steering** while a turn is running.
