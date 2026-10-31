@@ -5425,7 +5425,11 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
                 self._broadcast_tree()
         elif mt == "proj_rename":
             # Sidebar ✎ on a project: label the folder. Empty name resets to basename.
-            if save_project_meta(msg.get("path"), name=msg.get("name") or ""):
+            path, name = msg.get("path"), msg.get("name", "")
+            ok = isinstance(path, str) and isinstance(name, str) and save_project_meta(path, name=name)
+            self._say({"type": "project_renamed", "requestId": msg.get("requestId"), "path": path,
+                       "ok": bool(ok), "error": "" if ok else "Could not save the folder label."})
+            if ok:
                 self._broadcast_tree()
         elif mt == "proj_unpin":
             # Drop an imported folder. Only removes the sidebar entry; a folder
@@ -5437,9 +5441,15 @@ class ChatSocket(AuthMixin, tornado.websocket.WebSocketHandler):
         elif mt == "rename":
             # Sidebar ✎: set/clear a custom label for a session (by codex thread id).
             cc = msg.get("cc")
-            ok = set_name(cc, msg.get("name") or "")
-            self._say({"type": "renamed", "cc": cc,
-                       "name": (msg.get("name") or "").strip()[:120], "ok": bool(ok)})
+            name = msg.get("name", "")
+            valid = isinstance(cc, str) and isinstance(name, str)
+            ok = valid and set_name(cc, name)
+            name = name.strip()[:120] if isinstance(name, str) else ""
+            live = next((s for s in CHAT_SESSIONS.values() if s.cc_id == cc), None) if ok else None
+            title = name or ((live.title() or live.name) if live else "")
+            self._say({"type": "renamed", "cc": cc, "requestId": msg.get("requestId"),
+                       "name": name, "title": title, "ok": bool(ok),
+                       "error": "" if ok else "Could not save the session name."})
             if ok:
                 self._broadcast_favorites()   # a renamed session may be starred → refresh every device's list
                 self._broadcast_tree(rescan=True)   # the session title shows in its project too
@@ -5768,6 +5778,15 @@ pre code{background:none;border:none;padding:0}
 .attachment-body{overflow:auto;max-height:65vh;max-height:65dvh;min-height:100px;padding:12px;text-align:center}
 .attachment-body img{display:block;max-width:100%;max-height:60vh;max-height:60dvh;object-fit:contain;margin:auto}
 .attachment-body pre{margin:0;text-align:left;white-space:pre;overflow:auto}
+.attachment-dialog.image-open[open]{display:flex;flex-direction:column;height:min(800px,90dvh);overflow:hidden}
+.image-open .attachment-heading{flex:none}
+.image-open .attachment-heading h2{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.attachment-body.image-view{position:relative;flex:1;min-height:100px;max-height:none;padding:0;overflow:hidden}
+.image-viewport{position:absolute;inset:12px;overflow:hidden;touch-action:none}
+.image-stage{display:flex;align-items:center;justify-content:center;width:100%;height:100%}
+.attachment-body .image-stage img{max-width:100%;max-height:100%;width:auto;height:auto;margin:0;flex:none;user-select:none;-webkit-user-drag:none}
+.image-open .attachment-feedback{flex:none;max-height:72px;overflow:auto}
+.image-viewport.dragging{cursor:grabbing!important}
 .attachment-feedback{padding:8px 12px;font-size:12px;overflow-wrap:anywhere;min-height:32px;color:var(--mut)}
 @media(pointer:coarse){.attachment-action{width:40px;height:40px}.sent-attachment{width:192px}}
 /* queued messages (typed while the agent is busy) */
@@ -6297,6 +6316,7 @@ pre code{background:none;border:none;padding:0}
 .session-dialog button:disabled{opacity:.45;cursor:default}
 .session-dialog .dialog-error{min-height:1.4em;margin:12px 0;color:var(--delfg);font-size:12px;overflow-wrap:anywhere}
 .session-dialog .dialog-actions{display:flex;justify-content:flex-end;align-items:center;gap:8px}
+#renameForm .dialog-actions{flex-wrap:wrap}
 .session-dialog .dialog-actions button{min-height:36px;padding:7px 14px}
 .session-dialog .dialog-actions .check-label{display:flex;gap:7px;align-items:center;margin:0 auto 0 0}
 .session-dialog .dialog-actions input{accent-color:var(--acc)}
@@ -6345,6 +6365,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 </style>
 <link rel="stylesheet" href="/static/katex/katex.min.css">
 <script src="/static/katex/katex.min.js"></script>
+<script src="/static/panzoom/panzoom.min.js"></script>
 </head>
 <body>
 <header>
@@ -6506,6 +6527,7 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
 </div>
 <dialog id="attachmentDialog" class="attachment-dialog" aria-labelledby="attachmentTitle">
   <div class="attachment-heading"><h2 id="attachmentTitle"></h2>
+    <button id="attachmentZoomReset" class="attachment-action" type="button" title="Fit image" aria-label="Fit image" data-session-icon="maximize" hidden></button>
     <a id="attachmentDownload" class="attachment-action" title="Download to this device" aria-label="Download to this device" data-session-icon="download"></a>
     <button id="attachmentSave" type="button" class="attachment-action" title="Save a copy on the server" aria-label="Save a copy on the server" data-session-icon="folder-input"></button>
     <button id="attachmentClose" type="button" class="attachment-action" title="Close preview" aria-label="Close preview" data-session-icon="x"></button>
@@ -6537,6 +6559,14 @@ a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--acc);outline-of
     </fieldset>
     <div id="newSessionError" class="dialog-error" role="alert"></div>
     <div class="dialog-actions"><button id="newSessionCancel" class="btn" type="button">Cancel</button><button id="newSessionSubmit" class="newbtn" type="submit">Start session</button></div>
+  </form>
+</dialog>
+<dialog id="renameDialog" class="session-dialog" aria-labelledby="renameTitle">
+  <form id="renameForm">
+    <div class="dialog-heading"><h2 id="renameTitle">Rename session</h2><button id="renameClose" class="dialog-icon" type="button" title="Close" aria-label="Close" data-session-icon="x"></button></div>
+    <div class="dialog-field"><label for="renameName">Name</label><input id="renameName" maxlength="120" autocomplete="off" placeholder="Automatic name"></div>
+    <div id="renameError" class="dialog-error" role="alert"></div>
+    <div class="dialog-actions"><button id="renameReset" class="btn" type="button">Reset name</button><button id="renameCancel" class="btn" type="button">Cancel</button><button id="renameSave" class="newbtn" type="submit">Save</button></div>
   </form>
 </dialog>
 <dialog id="projectDialog" class="session-dialog" aria-labelledby="projectDialogTitle">
@@ -6905,16 +6935,43 @@ function addUser(text,nImg,files,attachments){const s=atBottom(),d=document.crea
   stream.appendChild(d);scroll();}
 function attachmentUrl(f,download){if(f.inlineSrc)return download?f.inlineDownload:f.inlineSrc;
   return 'api/attachments/'+f.id+(download?'?download=1':'');}
-let attachmentPreview=null,attachmentAbort=null;
+let attachmentPreview=null,attachmentAbort=null,attachmentImageViewer=null,attachmentDismissGesture=null,attachmentSuppressClick=false;
+function destroyAttachmentImageViewer(){const view=attachmentImageViewer;attachmentImageViewer=null;
+  if(view){view.abort.abort();view.observer.disconnect();view.panzoom.destroy();view.panzoom.resetStyle();}
+  $('#attachmentDialog').classList.remove('image-open');$('#attachmentBody').classList.remove('image-view');
+  $('#attachmentZoomReset').hidden=true;attachmentDismissGesture=null;}
+function initAttachmentImageViewer(stage,viewport){if(typeof Panzoom!=='function')return;
+  const abort=new AbortController(),panzoom=Panzoom(stage,{canvas:true,minScale:1,maxScale:8,step:.5,
+    contain:'outside',panOnlyWhenZoomed:true,cursor:'default',handleStartEvent:e=>e.preventDefault()});
+  const observer=new ResizeObserver(()=>{if(attachmentImageViewer?.stage===stage)panzoom.reset({animate:false});});
+  attachmentImageViewer={stage,viewport,panzoom,observer,abort};observer.observe(viewport);
+  viewport.addEventListener('wheel',e=>{panzoom.zoomWithWheel(e);},{passive:false,signal:abort.signal});
+  viewport.addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey||e.altKey||e.isComposing)return;
+    if(e.key==='+'||e.key==='='){e.preventDefault();panzoom.zoomIn({animate:false});}
+    else if(e.key==='-'){e.preventDefault();panzoom.zoomOut({animate:false});}
+    else if(e.key==='0'||e.key==='Home'){e.preventDefault();panzoom.reset({animate:false});}},{signal:abort.signal});
+  stage.addEventListener('panzoomchange',e=>{viewport.style.cursor=e.detail.scale>1?'grab':'default';},{signal:abort.signal});
+  stage.addEventListener('panzoomstart',()=>{if(panzoom.getScale()>1)viewport.classList.add('dragging');},{signal:abort.signal});
+  stage.addEventListener('panzoomend',()=>viewport.classList.remove('dragging'),{signal:abort.signal});
+  $('#attachmentZoomReset').hidden=false;}
+function attachmentOutsideImage(e){const dialog=$('#attachmentDialog'),r=dialog.getBoundingClientRect();
+  if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)return true;
+  return dialog.classList.contains('image-open')&&(e.target===$('#attachmentBody')||e.target.classList?.contains('image-viewport')||e.target.classList?.contains('image-stage'));}
 async function openAttachment(f){const dialog=$('#attachmentDialog'),body=$('#attachmentBody');
+  destroyAttachmentImageViewer();
   if(attachmentAbort)attachmentAbort.abort();attachmentAbort=new AbortController();const signal=attachmentAbort.signal;attachmentPreview=f;
   $('#attachmentTitle').textContent=f.name;$('#attachmentFeedback').textContent=f.sourcePath||(f.size===undefined?'':fmtFileBytes(f.size));
   const download=$('#attachmentDownload');download.href=attachmentUrl(f,true);download.download=f.name;
   download.removeAttribute('aria-disabled');$('#attachmentSave').disabled=!!f.unavailable;$('#attachmentSave').hidden=!!f.inlineSrc;body.replaceChildren();
   if(!dialog.open)dialog.showModal();
   if(f.unavailable){download.removeAttribute('href');download.setAttribute('aria-disabled','true');body.textContent='The saved copy is unavailable.';return;}
-  if(f.kind==='image'){const img=document.createElement('img');img.alt=f.name;img.src=attachmentUrl(f);
-    img.onerror=()=>{if(attachmentPreview===f)body.textContent='Image unavailable. The saved copy may have been removed.';};body.appendChild(img);return;}
+  if(f.kind==='image'){dialog.classList.add('image-open');body.classList.add('image-view');
+    const viewport=document.createElement('div'),stage=document.createElement('div'),img=document.createElement('img');
+    viewport.className='image-viewport';viewport.tabIndex=0;viewport.setAttribute('aria-label','Image preview');stage.className='image-stage';
+    img.alt=f.name;img.draggable=false;stage.appendChild(img);viewport.appendChild(stage);body.appendChild(viewport);
+    img.onload=()=>{if(attachmentPreview===f&&dialog.open&&body.contains(img))initAttachmentImageViewer(stage,viewport);};
+    img.onerror=()=>{if(attachmentPreview===f&&body.contains(img)){destroyAttachmentImageViewer();body.textContent='Image unavailable. The saved copy may have been removed.';}};
+    img.src=attachmentUrl(f);return;}
   body.textContent='Loading...';
   try{const r=await fetch(attachmentUrl(f),{signal});if(!r.ok)throw new Error('Attachment unavailable (HTTP '+r.status+')');
     const text=await r.text();if(signal.aborted||attachmentPreview!==f)return;
@@ -6930,7 +6987,26 @@ function saveAttachmentCopy(f){const sourceSid=sid;
     if(sourceSid===sid)addNotice(message);}});}
 $('#attachmentSave').onclick=()=>{if(attachmentPreview)saveAttachmentCopy(attachmentPreview);};
 $('#attachmentClose').onclick=()=>$('#attachmentDialog').close();
-$('#attachmentDialog').addEventListener('close',()=>{if(attachmentAbort)attachmentAbort.abort();attachmentPreview=null;$('#attachmentBody').replaceChildren();});
+$('#attachmentZoomReset').onclick=()=>attachmentImageViewer?.panzoom.reset({animate:false});
+$('#attachmentDialog').addEventListener('close',()=>{if($('#attachmentDialog').open)return;
+  destroyAttachmentImageViewer();if(attachmentAbort)attachmentAbort.abort();attachmentPreview=null;$('#attachmentBody').replaceChildren();});
+$('#attachmentDialog').addEventListener('pointerdown',e=>{if(e.button!==0)return;
+  if(!attachmentDismissGesture?.pointers.size)attachmentDismissGesture={pointers:new Map(),outside:attachmentOutsideImage(e),moved:false};
+  const gesture=attachmentDismissGesture;gesture.pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+  if(gesture.pointers.size>1)gesture.moved=true;},true);
+document.addEventListener('pointerdown',()=>{attachmentSuppressClick=false;},true);
+document.addEventListener('click',e=>{if(!attachmentSuppressClick)return;attachmentSuppressClick=false;
+  if(e.detail>0){e.preventDefault();e.stopImmediatePropagation();}},true);
+document.addEventListener('pointermove',e=>{const gesture=attachmentDismissGesture,start=gesture?.pointers.get(e.pointerId);
+  if(start&&Math.hypot(e.clientX-start.x,e.clientY-start.y)>6)gesture.moved=true;},{capture:true,passive:true});
+for(const type of ['pointerup','pointercancel'])document.addEventListener(type,e=>{
+  const gesture=attachmentDismissGesture;if(!gesture?.pointers.has(e.pointerId))return;
+  const start=gesture.pointers.get(e.pointerId);
+  if(type==='pointercancel'||Math.hypot(e.clientX-start.x,e.clientY-start.y)>6)gesture.moved=true;
+  gesture.pointers.delete(e.pointerId);
+  if(type==='pointerup'&&gesture.outside&&!gesture.moved&&!gesture.pointers.size&&attachmentOutsideImage(e)){
+    e.preventDefault();attachmentSuppressClick=true;$('#attachmentDialog').close();}
+},{capture:true,passive:false});
 document.addEventListener('click',e=>{const button=e.target.closest('.inline-image-preview');if(!button)return;
   const figure=button.closest('.inline-image');openAttachment({kind:'image',name:figure.dataset.imageName,
     inlineSrc:figure.dataset.imageSrc,inlineDownload:figure.dataset.imageDownload,sourcePath:figure.dataset.imagePath});});
@@ -7618,7 +7694,10 @@ function onMsg(e){const m=JSON.parse(e.data);
           (pmanBatch.err.length?(' · '+pmanBatch.err.length+' failed: '+pmanBatch.err[0]):''));
         pmanBatch=null;reqList();loadTree();}}
     else{addNotice(m.ok?'🗑 session moved to trash':('delete failed: '+(m.error||'?')));loadTree();}}
-  else if(m.type==='renamed'){if(m.ok){if(m.cc&&m.cc===curCC&&m.name)setCurname(m.name);renameSessionTabs(m.cc,m.name);addNotice('✎ renamed');reqList();loadTree();}else addNotice('rename failed');}
+  else if(m.type==='renamed'){handleRenameReply(m);if(m.ok){const title=m.title||m.name;
+    if(m.cc&&m.cc===curCC&&title)setCurname(title);renameSessionTabs(m.cc,title);reqList();loadTree();
+  }else if(!$('#renameDialog').open)addNotice(m.error||'rename failed');}
+  else if(m.type==='project_renamed')handleRenameReply(m);
   else if(m.type==='sessions')renderLive(m.sessions);
   else if(m.type==='context')renderCtx(m.ctx);
   else if(m.type==='usage')renderUsage(m.usage);
@@ -7637,6 +7716,7 @@ function openWs(cb){const proto=location.protocol==='https:'?'wss:':'ws:';
     if(cb)cb();else{const saved=localStorage.getItem(SKEY);if(saved&&!pendingStart){const req={type:'attach',id:saved},tab=sessionTabById(saved);
       if(restoredViewId===saved&&tab)req.after_seq=Number(tab.lastSeq||0);else statset('reattaching…');ws.send(JSON.stringify(req));}}};
   ws.onclose=()=>{$('#dot').className='dot';statset('disconnected');setComposerEnabled(false);
+    if(renameState?.pending)renameFailure('Connection lost. Check the name before retrying.');
     resetSubagentReads();renderSubagents();
     if(newSessionRequest){resetNewSessionRequest();$('#newSessionError').textContent='Connection lost. Check Live sessions before trying again.';}
     clearTimeout(reconnectT);reconnectT=setTimeout(()=>openWs(),1800);};
@@ -8259,18 +8339,47 @@ $('#pmandel').onclick=pmanDelete;
 $('#pmanall').onclick=pmanToggleAll;
 $('#pman').addEventListener('mousedown',e=>{if(e.target.id==='pman')pmanClose();});
 
-function renameProject(p){
-  const nm=prompt('Rename project (leave empty to reset to the folder name):',p.renamed?p.name:'');
-  if(nm===null)return;
-  wsSend({type:'proj_rename',path:p.path,name:nm});}
+let renameState=null,renameSerial=0,renameTimer=0,renameComposing=false;
+function renameBusy(busy){if(renameState)renameState.pending=busy;
+  for(const id of ['renameName','renameSave','renameReset','renameCancel','renameClose'])$('#'+id).disabled=busy;
+  $('#renameSave').textContent=busy?'Saving...':'Save';}
+function renameFailure(message){clearTimeout(renameTimer);renameTimer=0;renameBusy(false);$('#renameError').textContent=message;}
+function closeRename(){if(renameState?.pending)return;$('#renameDialog').close();}
+function openRename(kind,target,name){if(renameState?.pending)return;closeCardMenu();clearTimeout(renameTimer);
+  renameState={kind,target,requestId:null,pending:false};renameComposing=false;renameBusy(false);
+  $('#renameTitle').textContent=kind==='session'?'Rename session':'Rename folder label';
+  $('#renameName').value=name||'';$('#renameError').textContent='';
+  if(!$('#renameDialog').open)$('#renameDialog').showModal();
+  if(!target){$('#renameError').textContent='This session is still starting. Try again in a moment.';
+    $('#renameName').disabled=true;$('#renameSave').disabled=true;$('#renameReset').disabled=true;
+  }else{$('#renameName').focus();$('#renameName').select();}}
+function submitRename(e){e.preventDefault();if(!renameState||renameState.pending||renameComposing)return;
+  if(!ws||ws.readyState!==1){renameFailure('Not connected. Wait for the connection, then try again.');return;}
+  if(!renameState.target)return;
+  const request=renameState;request.requestId='rename-'+Date.now()+'-'+(++renameSerial);
+  const message={type:request.kind==='session'?'rename':'proj_rename',name:$('#renameName').value.trim(),requestId:request.requestId};
+  message[request.kind==='session'?'cc':'path']=request.target;renameBusy(true);$('#renameError').textContent='';
+  try{ws.send(JSON.stringify(message));}catch(e){renameFailure('Could not send the name. Check the connection and retry.');return;}
+  renameTimer=setTimeout(()=>{if(renameState===request&&request.pending)renameFailure('No confirmation received. Check the name before retrying.');},10000);}
+function handleRenameReply(m){const request=renameState;
+  if(!request||!request.requestId||m.requestId!==request.requestId)return;
+  if(request.kind==='session'?(m.type!=='renamed'||m.cc!==request.target):(m.type!=='project_renamed'||m.path!==request.target))return;
+  if(!m.ok){renameFailure(m.error||'Could not save the name.');return;}
+  clearTimeout(renameTimer);renameBusy(false);$('#renameDialog').close();}
+function renameProject(p){openRename('folder',p.path,p.renamed?p.name:'');}
 
 function newSessionIn(path){newSession(path);}
 
-function renameSession(cc,cur){
-  if(!cc){alert('This session is still starting — try again in a moment.');return;}
-  const nm=prompt('Rename session (leave empty to reset to the auto name):',cur||'');
-  if(nm===null)return;
-  wsSend({type:'rename',cc:cc,name:nm});}
+function renameSession(cc,cur){openRename('session',cc,cur);}
+$('#renameForm').onsubmit=submitRename;
+$('#renameClose').onclick=$('#renameCancel').onclick=closeRename;
+$('#renameReset').onclick=()=>{$('#renameName').value='';$('#renameName').focus();};
+$('#renameDialog').addEventListener('cancel',e=>{e.preventDefault();closeRename();});
+$('#renameDialog').addEventListener('close',()=>{if($('#renameDialog').open)return;
+  clearTimeout(renameTimer);renameState=null;renameComposing=false;});
+$('#renameName').addEventListener('compositionstart',()=>{renameComposing=true;});
+$('#renameName').addEventListener('compositionend',()=>{renameComposing=false;});
+$('#renameName').addEventListener('keydown',e=>{if(e.key==='Enter'&&(e.isComposing||renameComposing||e.keyCode===229))e.preventDefault();});
 function delResumable(s){
   if(!confirm('Delete this session from disk?\n\n'+(s.title||s.name||s.cc||'session')+
     '\n\nIt is moved to the trash (recoverable), not permanently deleted.'))return;
@@ -8443,6 +8552,7 @@ function resumeSession(s){if(!s||!s.cc)return;stashSessionView(sid);saveDraft();
   if(window.innerWidth<=860)closeSidebar();}
 // Lucide icon paths; licenses are in static/icons/lucide-LICENSE.txt.
 const SESSION_ICON_PATHS={
+  maximize:['M8 3H5a2 2 0 0 0-2 2v3','M16 3h3a2 2 0 0 1 2 2v3','M21 16v3a2 2 0 0 1-2 2h-3','M8 21H5a2 2 0 0 1-2-2v-3'],
   bot:['M12 8V4H8','M18 8H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2Z','M2 14h2','M20 14h2','M9 13v2','M15 13v2'],
   'folder-plus':['M12 10v6','M9 13h6','M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z'],
   refresh:['M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8','M21 3v5h-5','M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16','M8 16H3v5'],
@@ -8603,7 +8713,7 @@ $('#newSessionForm').onsubmit=submitNewSession;
 $('#newSessionCancel').onclick=$('#newSessionClose').onclick=closeNewSession;
 $('#newSessionDialog').addEventListener('cancel',e=>{e.preventDefault();closeNewSession();});
 document.addEventListener('keydown',e=>{if(e.key!=='Escape'||e.isComposing||!document.querySelector('.session-dialog[open]'))return;
-  e.preventDefault();e.stopImmediatePropagation();if($('#projectDialog').open)closeProjectDialog();else if($('#folderDialog').open)dismissFolderDialog();
+  e.preventDefault();e.stopImmediatePropagation();if($('#renameDialog').open)closeRename();else if($('#projectDialog').open)closeProjectDialog();else if($('#folderDialog').open)dismissFolderDialog();
   else if(document.activeElement===$('#newCwd')&&!$('#newCwdSuggestions').hidden)closeNewCwdSuggestions();else closeNewSession();},true);
 $('#newSessionDialog').addEventListener('close',()=>{if(!$('#newSessionDialog').open)closeNewCwdSuggestions();});
 $('#newRecent').onchange=()=>{closeNewCwdSuggestions();if($('#newRecent').value)$('#newCwd').value=$('#newRecent').value;};

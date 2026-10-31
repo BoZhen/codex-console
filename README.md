@@ -14,7 +14,7 @@ plans, file changes, and session state in one interface.
 ## Features
 
 - **Streaming chat** with rendered Markdown and KaTeX math.
-- **Inline result images** in assistant replies, with enlarged preview and download.
+- **Inline result images** in assistant replies, with zoom, pan, and download.
   Supports PNG, JPEG, GIF, and WebP files up to 5 MiB under the server user's home directory.
 - **Tool activity cards** for shell commands, reads, searches, patches, MCP
   tools, and web searches. Consecutive calls of the same tool are grouped and
